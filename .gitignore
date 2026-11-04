@@ -1,0 +1,44 @@
+# Secrets (keep a committed .env.example as the template)
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Tests and tooling caches
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# App runtime data (downloaded tenders, decisions.json, analysis results, logs)
+downloads/
+logs/
+*.log
+*.tmp
+
+# Impeccable: keep config.json and design.json, ignore caches and generated output
+.impeccable/hook.cache.json
+.impeccable/critique/
+.impeccable/live/
+.impeccable/review/
+
+# Claude Code local settings
+.claude/settings.local.json
+
+# Editors and OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

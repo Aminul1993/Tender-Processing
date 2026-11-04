@@ -1,0 +1,950 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-02T12:26:57+00:00",
+  "title": "Design System: Tender Processing",
+  "extensions": {
+    "colorMeta": {
+      "accent": {
+        "role": "primary",
+        "displayName": "Ledger Blue",
+        "canonical": "oklch(0.55 0.14 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "accent-strong": {
+        "role": "primary",
+        "displayName": "Ledger Blue Deep",
+        "canonical": "oklch(0.48 0.14 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "accent-soft": {
+        "role": "primary",
+        "displayName": "Blue Mist",
+        "canonical": "oklch(0.95 0.03 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "accent-wash": {
+        "role": "primary",
+        "displayName": "Blue Breath",
+        "canonical": "oklch(0.975 0.015 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "eligible-bg": {
+        "role": "secondary",
+        "displayName": "Clear Green Wash",
+        "canonical": "oklch(0.95 0.04 150)",
+        "tonalRamp": [
+          "oklch(0.15 0.035 150)",
+          "oklch(0.25 0.059 150)",
+          "oklch(0.35 0.083 150)",
+          "oklch(0.45 0.106 150)",
+          "oklch(0.58 0.123 150)",
+          "oklch(0.72 0.090 150)",
+          "oklch(0.86 0.057 150)",
+          "oklch(0.95 0.035 150)"
+        ]
+      },
+      "eligible-fg": {
+        "role": "secondary",
+        "displayName": "Clear Green",
+        "canonical": "oklch(0.4 0.11 150)",
+        "tonalRamp": [
+          "oklch(0.15 0.035 150)",
+          "oklch(0.25 0.059 150)",
+          "oklch(0.35 0.083 150)",
+          "oklch(0.45 0.106 150)",
+          "oklch(0.58 0.123 150)",
+          "oklch(0.72 0.090 150)",
+          "oklch(0.86 0.057 150)",
+          "oklch(0.95 0.035 150)"
+        ]
+      },
+      "eligible-dot": {
+        "role": "secondary",
+        "displayName": "Clear Green Dot",
+        "canonical": "oklch(0.58 0.13 150)",
+        "tonalRamp": [
+          "oklch(0.15 0.035 150)",
+          "oklch(0.25 0.059 150)",
+          "oklch(0.35 0.083 150)",
+          "oklch(0.45 0.106 150)",
+          "oklch(0.58 0.123 150)",
+          "oklch(0.72 0.090 150)",
+          "oklch(0.86 0.057 150)",
+          "oklch(0.95 0.035 150)"
+        ]
+      },
+      "review-bg": {
+        "role": "secondary",
+        "displayName": "Caution Ochre Wash",
+        "canonical": "oklch(0.96 0.05 80)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 70)",
+          "oklch(0.25 0.064 70)",
+          "oklch(0.35 0.089 70)",
+          "oklch(0.45 0.115 70)",
+          "oklch(0.58 0.132 70)",
+          "oklch(0.72 0.097 70)",
+          "oklch(0.86 0.061 70)",
+          "oklch(0.95 0.038 70)"
+        ]
+      },
+      "review-fg": {
+        "role": "secondary",
+        "displayName": "Caution Ochre",
+        "canonical": "oklch(0.45 0.1 65)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 70)",
+          "oklch(0.25 0.064 70)",
+          "oklch(0.35 0.089 70)",
+          "oklch(0.45 0.115 70)",
+          "oklch(0.58 0.132 70)",
+          "oklch(0.72 0.097 70)",
+          "oklch(0.86 0.061 70)",
+          "oklch(0.95 0.038 70)"
+        ]
+      },
+      "review-dot": {
+        "role": "secondary",
+        "displayName": "Caution Ochre Dot",
+        "canonical": "oklch(0.68 0.14 70)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 70)",
+          "oklch(0.25 0.064 70)",
+          "oklch(0.35 0.089 70)",
+          "oklch(0.45 0.115 70)",
+          "oklch(0.58 0.132 70)",
+          "oklch(0.72 0.097 70)",
+          "oklch(0.86 0.061 70)",
+          "oklch(0.95 0.038 70)"
+        ]
+      },
+      "not-bg": {
+        "role": "secondary",
+        "displayName": "Brick Red Wash",
+        "canonical": "oklch(0.95 0.03 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.044 25)",
+          "oklch(0.25 0.073 25)",
+          "oklch(0.35 0.102 25)",
+          "oklch(0.45 0.131 25)",
+          "oklch(0.58 0.151 25)",
+          "oklch(0.72 0.111 25)",
+          "oklch(0.86 0.070 25)",
+          "oklch(0.95 0.044 25)"
+        ]
+      },
+      "not-fg": {
+        "role": "secondary",
+        "displayName": "Brick Red",
+        "canonical": "oklch(0.45 0.15 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.044 25)",
+          "oklch(0.25 0.073 25)",
+          "oklch(0.35 0.102 25)",
+          "oklch(0.45 0.131 25)",
+          "oklch(0.58 0.151 25)",
+          "oklch(0.72 0.111 25)",
+          "oklch(0.86 0.070 25)",
+          "oklch(0.95 0.044 25)"
+        ]
+      },
+      "not-dot": {
+        "role": "secondary",
+        "displayName": "Brick Red Dot",
+        "canonical": "oklch(0.58 0.16 25)",
+        "tonalRamp": [
+          "oklch(0.15 0.044 25)",
+          "oklch(0.25 0.073 25)",
+          "oklch(0.35 0.102 25)",
+          "oklch(0.45 0.131 25)",
+          "oklch(0.58 0.151 25)",
+          "oklch(0.72 0.111 25)",
+          "oklch(0.86 0.070 25)",
+          "oklch(0.95 0.044 25)"
+        ]
+      },
+      "failed-bg": {
+        "role": "secondary",
+        "displayName": "Slate Wash",
+        "canonical": "#EDEDEA",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.003 100)",
+          "oklch(0.35 0.004 100)",
+          "oklch(0.45 0.005 100)",
+          "oklch(0.58 0.006 100)",
+          "oklch(0.72 0.004 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "failed-fg": {
+        "role": "secondary",
+        "displayName": "Slate",
+        "canonical": "#3A3C42",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.005 270)",
+          "oklch(0.35 0.006 270)",
+          "oklch(0.45 0.008 270)",
+          "oklch(0.58 0.009 270)",
+          "oklch(0.72 0.007 270)",
+          "oklch(0.86 0.004 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "failed-dot": {
+        "role": "secondary",
+        "displayName": "Slate Dot",
+        "canonical": "#5E6066",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.005 270)",
+          "oklch(0.35 0.006 270)",
+          "oklch(0.45 0.008 270)",
+          "oklch(0.58 0.009 270)",
+          "oklch(0.72 0.007 270)",
+          "oklch(0.86 0.004 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "none-bg": {
+        "role": "secondary",
+        "displayName": "Unread Grey Wash",
+        "canonical": "#F1F1EE",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.003 100)",
+          "oklch(0.35 0.004 100)",
+          "oklch(0.45 0.005 100)",
+          "oklch(0.58 0.006 100)",
+          "oklch(0.72 0.004 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "none-fg": {
+        "role": "secondary",
+        "displayName": "Unread Grey",
+        "canonical": "#5E6066",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.005 270)",
+          "oklch(0.35 0.006 270)",
+          "oklch(0.45 0.008 270)",
+          "oklch(0.58 0.009 270)",
+          "oklch(0.72 0.007 270)",
+          "oklch(0.86 0.004 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "none-dot": {
+        "role": "secondary",
+        "displayName": "Unread Grey Dot",
+        "canonical": "#B0B2B6",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.005 270)",
+          "oklch(0.35 0.006 270)",
+          "oklch(0.45 0.008 270)",
+          "oklch(0.58 0.009 270)",
+          "oklch(0.72 0.007 270)",
+          "oklch(0.86 0.004 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "processing-fg": {
+        "role": "secondary",
+        "displayName": "Processing Blue",
+        "canonical": "oklch(0.45 0.14 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "processing-dot": {
+        "role": "secondary",
+        "displayName": "Processing Blue Dot (the design accent)",
+        "canonical": "oklch(0.6 0.14 255)",
+        "tonalRamp": [
+          "oklch(0.15 0.038 255)",
+          "oklch(0.25 0.064 255)",
+          "oklch(0.35 0.089 255)",
+          "oklch(0.45 0.115 255)",
+          "oklch(0.58 0.132 255)",
+          "oklch(0.72 0.097 255)",
+          "oklch(0.86 0.061 255)",
+          "oklch(0.95 0.038 255)"
+        ]
+      },
+      "bg": {
+        "role": "neutral",
+        "displayName": "Warm Paper",
+        "canonical": "#F5F5F2",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Sheet White",
+        "canonical": "#FFFFFF",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "surface-sunk": {
+        "role": "neutral",
+        "displayName": "Sunk Paper",
+        "canonical": "#FAFAF8",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "hover": {
+        "role": "neutral",
+        "displayName": "Row Hover",
+        "canonical": "#FBFBF9",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#1A1B1E",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "ink-2": {
+        "role": "neutral",
+        "displayName": "Ink 2",
+        "canonical": "#3A3C42",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "ink-3": {
+        "role": "neutral",
+        "displayName": "Ink 3",
+        "canonical": "#4A4C52",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Muted",
+        "canonical": "#5E6066",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "meta": {
+        "role": "neutral",
+        "displayName": "Meta",
+        "canonical": "#6A6C72",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "faint": {
+        "role": "neutral",
+        "displayName": "Faint",
+        "canonical": "#8A8C92",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Line",
+        "canonical": "#E4E4DF",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "line-2": {
+        "role": "neutral",
+        "displayName": "Line 2",
+        "canonical": "#EDEDE9",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "line-3": {
+        "role": "neutral",
+        "displayName": "Line 3",
+        "canonical": "#F0F0EC",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "control-line": {
+        "role": "neutral",
+        "displayName": "Control Line",
+        "canonical": "#DCDCD6",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "control-line-hover": {
+        "role": "neutral",
+        "displayName": "Control Line Hover",
+        "canonical": "#C9C9C3",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "check-line": {
+        "role": "neutral",
+        "displayName": "Check Line",
+        "canonical": "#C4C4BE",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "track": {
+        "role": "neutral",
+        "displayName": "Track",
+        "canonical": "#EAEAE6",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "disabled-bg": {
+        "role": "neutral",
+        "displayName": "Disabled",
+        "canonical": "#E6E6E1",
+        "tonalRamp": [
+          "oklch(0.15 0.003 100)",
+          "oklch(0.25 0.004 100)",
+          "oklch(0.35 0.005 100)",
+          "oklch(0.45 0.007 100)",
+          "oklch(0.58 0.008 100)",
+          "oklch(0.72 0.006 100)",
+          "oklch(0.86 0.003 100)",
+          "oklch(0.95 0.003 100)"
+        ]
+      },
+      "chrome": {
+        "role": "neutral",
+        "displayName": "Chrome",
+        "canonical": "#16171A",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "chrome-ink": {
+        "role": "neutral",
+        "displayName": "Chrome Ink",
+        "canonical": "#F3F3F0",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "chrome-muted": {
+        "role": "neutral",
+        "displayName": "Chrome Muted",
+        "canonical": "#9A9BA0",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      },
+      "chrome-link": {
+        "role": "neutral",
+        "displayName": "Chrome Link",
+        "canonical": "#B5B6BA",
+        "tonalRamp": [
+          "oklch(0.15 0.003 270)",
+          "oklch(0.25 0.004 270)",
+          "oklch(0.35 0.005 270)",
+          "oklch(0.45 0.007 270)",
+          "oklch(0.58 0.008 270)",
+          "oklch(0.72 0.006 270)",
+          "oklch(0.86 0.003 270)",
+          "oklch(0.95 0.003 270)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "headline": {
+        "displayName": "Headline",
+        "purpose": "The page title only."
+      },
+      "title-lg": {
+        "displayName": "Title Large",
+        "purpose": "Tender title in the details modal, unclamped."
+      },
+      "title": {
+        "displayName": "Title",
+        "purpose": "App bar name, run status, help toggle, analysis heading."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "Row titles, buttons, inputs, analysis text."
+      },
+      "body-sm": {
+        "displayName": "Body Small",
+        "purpose": "Organisation, help copy, footers, facts, tab labels."
+      },
+      "label": {
+        "displayName": "Label",
+        "purpose": "Column headers and the 12px meta line."
+      },
+      "section-label": {
+        "displayName": "Section Label",
+        "purpose": "Uppercase headings of help items and verdict-summary groups."
+      },
+      "pill": {
+        "displayName": "Pill",
+        "purpose": "Verdict and status pills."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "Tender value in crore, tabular mono."
+      },
+      "data-sm": {
+        "displayName": "Data Small",
+        "purpose": "TCNO, references, counts, file paths, kbd hints."
+      }
+    },
+    "shadows": [
+      {
+        "name": "tab-lift",
+        "value": "0 1px 2px rgba(20, 20, 25, .1)",
+        "purpose": "Active verdict tab on its track."
+      },
+      {
+        "name": "floating",
+        "value": "0 16px 40px rgba(20, 20, 25, .25)",
+        "purpose": "Selection bar and toasts."
+      },
+      {
+        "name": "floating-list",
+        "value": "0 12px 32px rgba(20, 20, 25, .14)",
+        "purpose": "A dropdown list open over the page (the organisation filter); lighter than chrome because it is white and sits close to its field."
+      },
+      {
+        "name": "modal",
+        "value": "0 24px 60px rgba(20, 20, 25, .18)",
+        "purpose": "Details modal, over a chrome backdrop at 45% opacity."
+      },
+      {
+        "name": "focus-glow",
+        "value": "0 0 0 3px oklch(0.6 0.14 255 / .15)",
+        "purpose": "A text field you type into (main search, the search box inside a dropdown list) while focused."
+      },
+      {
+        "name": "focus-outline",
+        "value": "outline: 2px solid var(--accent); outline-offset: 2px",
+        "purpose": "Every interactive element on :focus-visible; fields flush inside a grid inset it by 2px (outline-offset: -2px)."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-out",
+        "value": "cubic-bezier(.16, 1, .3, 1)",
+        "purpose": "The one easing curve for all transitions and entrances."
+      },
+      {
+        "name": "state",
+        "value": "0.12s to 0.18s",
+        "purpose": "Colour, border and shadow changes on hover and state."
+      },
+      {
+        "name": "progress",
+        "value": "width .6s ease-out",
+        "purpose": "Run progress bar."
+      },
+      {
+        "name": "processing-pulse",
+        "value": "opacity 1 to .35, 1s ease-in-out infinite",
+        "purpose": "Dot of a tender being processed."
+      },
+      {
+        "name": "verdict-landing",
+        "value": "row tint-drain 1.4s from accent-soft; verdict-uncover clip-path .45s",
+        "purpose": "A verdict arriving while the page is watched."
+      },
+      {
+        "name": "bar-in",
+        "value": "opacity 0 and 8px rise, .22s",
+        "purpose": "Selection bar entrance (wider than 767px)."
+      },
+      {
+        "name": "reduced-motion",
+        "value": "transition-duration 0s; animations removed",
+        "purpose": "prefers-reduced-motion keeps colour, drops movement."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "wide",
+        "value": "1200px",
+        "purpose": "Seven-column table."
+      },
+      {
+        "name": "medium",
+        "value": "768px",
+        "purpose": "768-1199.98px: Organisation folds into Tender; search on its own row."
+      },
+      {
+        "name": "narrow",
+        "value": "767.98px",
+        "purpose": "Below 768px: rows become cards; analysis table stacks; app bar wraps."
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "The one action per area (Check eligibility), with an optional mono count chip.",
+      "html": "<button class=\"ds-btn ds-btn-primary\">Check eligibility <span class=\"ds-btn-count\">3</span></button> <button class=\"ds-btn ds-btn-primary\" disabled>Check eligibility <span class=\"ds-btn-count\">0</span></button>",
+      "css": ".ds-btn{display:inline-flex;align-items:center;gap:8px;height:38px;padding:0 16px;border:1px solid transparent;border-radius:8px;font:600 14px/1 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-btn-primary{background:var(--accent, oklch(0.55 0.14 255));color:#fff}.ds-btn-primary:hover:not(:disabled){background:var(--accent-strong, oklch(0.48 0.14 255))}.ds-btn-primary:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}.ds-btn-primary:disabled{background:var(--disabled-bg, #E6E6E1);color:var(--faint, #8A8C92);cursor:default}.ds-btn-count{padding:1px 7px;border-radius:999px;background:rgba(255,255,255,.2);font:500 12px 'IBM Plex Mono',monospace}.ds-btn-primary:disabled .ds-btn-count{background:rgba(20,20,25,.06)}"
+    },
+    {
+      "name": "Secondary Button",
+      "kind": "button",
+      "refersTo": "button-secondary",
+      "description": "White bordered button for every non-primary action; pressed decisions take their verdict tone.",
+      "html": "<button class=\"ds-btn-secondary\">Copy text</button> <button class=\"ds-btn-secondary ds-pressed-ok\" aria-pressed=\"true\">Shortlist</button>",
+      "css": ".ds-btn-secondary{height:38px;padding:0 14px;border:1px solid var(--control-line, #DCDCD6);border-radius:8px;background:var(--surface, #fff);color:var(--ink, #1A1B1E);font:500 14px/1 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1),border-color .15s cubic-bezier(.16,1,.3,1)}.ds-btn-secondary:hover{border-color:var(--control-line-hover, #C9C9C3);background:var(--hover, #FBFBF9)}.ds-btn-secondary:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}.ds-pressed-ok{font-weight:600;border-color:color-mix(in oklch, oklch(0.58 0.13 150) 45%, white);background:oklch(0.95 0.04 150);color:oklch(0.4 0.11 150)}"
+    },
+    {
+      "name": "Search Field",
+      "kind": "input",
+      "refersTo": "input-search",
+      "description": "Toolbar search on sunk paper with a leading icon and a / hint; glows blue on focus.",
+      "html": "<label class=\"ds-search\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M11.742 10.344a6.5 6.5 0 1 0-1.397 1.398h-.001q.044.06.098.115l3.85 3.85a1 1 0 0 0 1.415-1.414l-3.85-3.85a1 1 0 0 0-.115-.1zM12 6.5a5.5 5.5 0 1 1-11 0 5.5 5.5 0 0 1 11 0\"/></svg><input type=\"search\" placeholder=\"Search TCNO, title, organisation\"><kbd class=\"ds-kbd\">/</kbd></label>",
+      "css": ".ds-search{display:flex;align-items:center;gap:10px;width:360px;height:38px;padding:0 12px;border:1px solid var(--control-line, #DCDCD6);border-radius:8px;background:var(--surface-sunk, #FAFAF8);color:#85878C;transition:border-color .15s cubic-bezier(.16,1,.3,1),background-color .15s cubic-bezier(.16,1,.3,1)}.ds-search:focus-within{border-color:var(--accent, oklch(0.55 0.14 255));background:#fff;box-shadow:0 0 0 3px oklch(0.6 0.14 255 / .15)}.ds-search input{flex:1;min-width:0;border:0;outline:0;background:transparent;color:var(--ink, #1A1B1E);font:400 14px 'IBM Plex Sans',system-ui,sans-serif}.ds-search input::placeholder{color:var(--meta, #6A6C72)}.ds-kbd{padding:1px 6px;border:1px solid var(--control-line, #DCDCD6);border-radius:4px;background:#fff;color:var(--meta, #6A6C72);font:11px 'IBM Plex Mono',monospace}"
+    },
+    {
+      "name": "Searchable Select",
+      "kind": "input",
+      "refersTo": "select",
+      "description": "The organisation filter: a white select-style field whose list opens with its own search box, select2-style, options kept alphabetical.",
+      "html": "<div class=\"ds-ss\"><button type=\"button\" class=\"ds-ss-field\" aria-expanded=\"true\"><span class=\"ds-ss-value\">All organisations</span><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708\"/></svg></button><div class=\"ds-ss-list\"><div class=\"ds-ss-search-wrap\"><input class=\"ds-ss-search\" value=\"rail\" aria-label=\"Search organisations\"></div><div class=\"ds-ss-opt\">North Western <mark>Rail</mark>way</div><div class=\"ds-ss-opt ds-ss-active\">Northeast Frontier <mark>Rail</mark>way</div><div class=\"ds-ss-opt ds-ss-chosen\">Southern <mark>Rail</mark>way</div><div class=\"ds-ss-opt\">Western <mark>Rail</mark>way</div></div></div>",
+      "css": ".ds-ss{position:relative;width:220px;padding-bottom:210px;font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-ss-field{display:flex;align-items:center;justify-content:space-between;gap:8px;width:100%;height:38px;padding:0 12px;border:1px solid var(--accent, oklch(0.55 0.14 255));border-radius:8px;background:var(--surface, #fff);color:var(--ink, #1A1B1E);font:400 14px 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:border-color .15s cubic-bezier(.16,1,.3,1)}.ds-ss-field svg{flex:none;color:var(--muted, #5E6066)}.ds-ss-field:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}.ds-ss-value{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ds-ss-list{position:absolute;top:42px;left:0;width:340px;overflow:hidden;border:1px solid var(--line, #E4E4DF);border-radius:10px;background:var(--surface, #fff);box-shadow:0 12px 32px rgba(20,20,25,.14);font-size:13px}.ds-ss-search-wrap{padding:8px;border-bottom:1px solid var(--line-2, #EDEDE9)}.ds-ss-search{box-sizing:border-box;width:100%;height:34px;padding:0 10px;border:1px solid var(--accent, oklch(0.55 0.14 255));border-radius:7px;background:var(--surface, #fff);color:var(--ink, #1A1B1E);font:400 14px 'IBM Plex Sans',system-ui,sans-serif;outline:0;box-shadow:0 0 0 3px oklch(0.6 0.14 255 / .15)}.ds-ss-opt{padding:8px 12px;color:var(--ink, #1A1B1E);line-height:1.35;cursor:pointer}.ds-ss-opt:hover,.ds-ss-active{background:var(--accent-wash, oklch(0.975 0.015 255))}.ds-ss-chosen{color:var(--accent-strong, oklch(0.48 0.14 255));font-weight:600}.ds-ss-opt mark{border-radius:2px;background:var(--accent-soft, oklch(0.95 0.03 255));color:inherit}"
+    },
+    {
+      "name": "Verdict Tabs",
+      "kind": "nav",
+      "refersTo": "tab-track",
+      "description": "Verdict filter: toggle buttons with a tone dot and mono count on a grey well.",
+      "html": "<div class=\"ds-tabs\" role=\"group\"><button class=\"ds-tab\" aria-pressed=\"true\"><span class=\"ds-dot\" style=\"--d:#1A1B1E\"></span>All <span class=\"ds-count\">8</span></button><button class=\"ds-tab\" aria-pressed=\"false\"><span class=\"ds-dot\" style=\"--d:oklch(0.58 0.13 150)\"></span>Eligible <span class=\"ds-count\">1</span></button><button class=\"ds-tab\" aria-pressed=\"false\"><span class=\"ds-dot\" style=\"--d:oklch(0.68 0.14 70)\"></span>Needs review <span class=\"ds-count\">1</span></button><button class=\"ds-tab\" aria-pressed=\"false\"><span class=\"ds-dot\" style=\"--d:oklch(0.58 0.16 25)\"></span>Not eligible <span class=\"ds-count\">2</span></button></div>",
+      "css": ".ds-tabs{display:inline-flex;gap:4px;padding:4px;border-radius:10px;background:var(--track, #EAEAE6)}.ds-tab{display:flex;align-items:center;gap:8px;padding:7px 12px;border:0;border-radius:7px;background:transparent;color:var(--ink-3, #4A4C52);font:500 13px 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1),box-shadow .15s cubic-bezier(.16,1,.3,1)}.ds-tab:hover{background:rgba(255,255,255,.55)}.ds-tab:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}.ds-tab[aria-pressed=true]{background:#fff;color:var(--ink, #1A1B1E);box-shadow:0 1px 2px rgba(20,20,25,.1)}.ds-dot{width:7px;height:7px;border-radius:50%;background:var(--d)}.ds-count{color:var(--muted, #5E6066);font:12px 'IBM Plex Mono',monospace}"
+    },
+    {
+      "name": "Verdict Pills",
+      "kind": "chip",
+      "refersTo": "pill-eligible",
+      "description": "One pill per verdict tone; a pill with a result is a button that opens the analysis.",
+      "html": "<button class=\"ds-pill-btn\"><span class=\"ds-pill ds-ok\"><span class=\"ds-pdot\"></span>Eligible</span><span class=\"ds-chev\"><svg width=\"11\" height=\"11\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708\"/></svg></span></button> <button class=\"ds-pill-btn\"><span class=\"ds-pill ds-rev\"><span class=\"ds-pdot\"></span>Needs review</span><span class=\"ds-chev\"><svg width=\"11\" height=\"11\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708\"/></svg></span></button> <button class=\"ds-pill-btn\"><span class=\"ds-pill ds-not\"><span class=\"ds-pdot\"></span>Not eligible</span><span class=\"ds-chev\"><svg width=\"11\" height=\"11\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708\"/></svg></span></button> <span class=\"ds-pill ds-fail\"><span class=\"ds-pdot\"></span>Failed</span> <span class=\"ds-pill\"><span class=\"ds-pdot\"></span>Not processed</span> <span class=\"ds-pill ds-proc\"><span class=\"ds-pdot\"></span>Processing</span>",
+      "css": ".ds-pill{--bg:#F1F1EE;--fg:#5E6066;--dt:#B0B2B6;display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;background:var(--bg);color:var(--fg);font:600 12px/1.2 'IBM Plex Sans',system-ui,sans-serif;white-space:nowrap;transition:box-shadow .15s cubic-bezier(.16,1,.3,1)}.ds-pdot{width:6px;height:6px;border-radius:50%;background:var(--dt)}.ds-ok{--bg:oklch(0.95 0.04 150);--fg:oklch(0.4 0.11 150);--dt:oklch(0.58 0.13 150)}.ds-rev{--bg:oklch(0.96 0.05 80);--fg:oklch(0.45 0.1 65);--dt:oklch(0.68 0.14 70)}.ds-not{--bg:oklch(0.95 0.03 25);--fg:oklch(0.45 0.15 25);--dt:oklch(0.58 0.16 25)}.ds-fail{--bg:#EDEDEA;--fg:#3A3C42;--dt:#5E6066}.ds-proc{--bg:oklch(0.95 0.03 255);--fg:oklch(0.45 0.14 255);--dt:oklch(0.6 0.14 255)}.ds-proc .ds-pdot{animation:ds-pulse 1s ease-in-out infinite}@keyframes ds-pulse{50%{opacity:.35}}.ds-pill-btn{display:inline-flex;align-items:center;gap:4px;padding:0;border:0;border-radius:999px;background:none;cursor:pointer}.ds-pill-btn:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}.ds-chev{display:inline-flex;color:var(--faint, #8A8C92);transition:transform .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-pill-btn:hover .ds-pill{box-shadow:inset 0 0 0 1px color-mix(in oklch, var(--fg) 35%, transparent)}.ds-pill-btn:hover .ds-chev{color:var(--ink, #1A1B1E);transform:translateX(2px)}@media (prefers-reduced-motion: reduce){.ds-proc .ds-pdot{animation:none}}"
+    },
+    {
+      "name": "Checkbox",
+      "kind": "input",
+      "refersTo": "",
+      "description": "A real checkbox input drawn by CSS; checked fills the accent with a white tick.",
+      "html": "<input type=\"checkbox\" class=\"ds-check\" aria-label=\"Select\"> <input type=\"checkbox\" class=\"ds-check\" aria-label=\"Select\" checked>",
+      "css": ".ds-check{appearance:none;display:inline-grid;place-content:center;width:17px;height:17px;margin:0;border:1.5px solid var(--check-line, #C4C4BE);border-radius:5px;background:#fff;cursor:pointer;transition:background-color .12s cubic-bezier(.16,1,.3,1),border-color .12s cubic-bezier(.16,1,.3,1)}.ds-check::after{content:'';width:9px;height:5px;border:solid #fff;border-width:0 0 2px 2px;opacity:0;transform:translateY(-1px) rotate(-45deg)}.ds-check:checked{border-color:var(--accent, oklch(0.55 0.14 255));background:var(--accent, oklch(0.55 0.14 255))}.ds-check:checked::after{opacity:1}.ds-check:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}"
+    },
+    {
+      "name": "Tender Row",
+      "kind": "custom",
+      "refersTo": "panel",
+      "description": "One tender: title, mono meta line, value in crore, closing date with days-left pill, verdict with its reason.",
+      "html": "<div class=\"ds-row\"><input type=\"checkbox\" class=\"ds-rcheck\" aria-label=\"Select tender\"><div class=\"ds-tender\"><div class=\"ds-ttl\">Construction of Road Over Bridge in lieu of LC No. 27 at km 412/8-10</div><div class=\"ds-meta\"><span class=\"ds-tc\">102309372</span><span class=\"ds-mono\">ECR-HJP-ROB-27-2026</span><span>Published 31 Oct 2026</span></div></div><div class=\"ds-val\">147.50<span class=\"ds-unit\"> Cr</span></div><div class=\"ds-closes\">08 Jan 2027<span class=\"ds-days\">67 days left</span></div><div class=\"ds-verd\"><span class=\"ds-vpill\"><span class=\"ds-vdot\"></span>Eligible</span><span class=\"ds-note\">Meets all 3 criteria</span></div></div>",
+      "css": ".ds-row{display:grid;grid-template-columns:36px minmax(0,1fr) 110px 140px 170px;align-items:center;gap:0 12px;padding:16px;border:1px solid var(--line, #E4E4DF);border-radius:14px;background:#fff;color:var(--ink, #1A1B1E);font-family:'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .12s cubic-bezier(.16,1,.3,1)}.ds-row:hover{background:var(--hover, #FBFBF9)}.ds-rcheck{width:17px;height:17px;align-self:start;accent-color:oklch(0.55 0.14 255)}.ds-tender{display:flex;flex-direction:column;gap:6px;padding-right:20px}.ds-ttl{font-size:14px;font-weight:500;line-height:1.4}.ds-meta{display:flex;flex-wrap:wrap;gap:4px 12px;color:var(--meta, #6A6C72);font-size:12px}.ds-tc{color:var(--ink-3, #4A4C52);font-family:'IBM Plex Mono',monospace}.ds-mono{font-family:'IBM Plex Mono',monospace}.ds-val{padding-right:16px;text-align:right;font:500 14px 'IBM Plex Mono',monospace;font-variant-numeric:tabular-nums}.ds-unit{color:var(--meta, #6A6C72);font-size:12px}.ds-closes{display:flex;flex-direction:column;align-items:flex-start;gap:5px;font-size:13px;font-variant-numeric:tabular-nums}.ds-days{padding:2px 7px;border-radius:999px;background:#F1F1EE;color:#5E6066;font-size:11px;font-weight:600}.ds-verd{display:flex;flex-direction:column;align-items:flex-start;gap:4px}.ds-vpill{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;background:oklch(0.95 0.04 150);color:oklch(0.4 0.11 150);font-size:12px;font-weight:600}.ds-vdot{width:6px;height:6px;border-radius:50%;background:oklch(0.58 0.13 150)}.ds-note{color:var(--meta, #6A6C72);font-size:12px}"
+    },
+    {
+      "name": "Verdict Summary",
+      "kind": "card",
+      "refersTo": "",
+      "description": "Head of the details modal: a panel tinted with the verdict tone, secondary text in the tone fg.",
+      "html": "<div class=\"ds-sum\"><div class=\"ds-sum-head\"><span class=\"ds-spill\"><span class=\"ds-sdot\"></span>Not eligible</span><span class=\"ds-sum-hl\">2 criteria not met</span></div><p class=\"ds-sum-c\">6 criteria: 2 met · 2 not met · 2 undetermined</p><h4 class=\"ds-sec\">Not met</h4><div class=\"ds-crit\">Annual turnover</div><dl class=\"ds-facts\"><dt>Requirement</dt><dd>Average of best 3 of last 3 FY ≥ 150% of estimated cost</dd><dt>Company</dt><dd>Average turnover ₹159.33 Cr</dd><dt>Source</dt><dd class=\"ds-src\">NIT/NIT_PGMS.pdf</dd></dl></div>",
+      "css": ".ds-sum{--fg:oklch(0.45 0.15 25);padding:16px 18px;border:1px solid color-mix(in oklch, oklch(0.58 0.16 25) 35%, white);border-radius:12px;background:oklch(0.95 0.03 25);color:var(--ink, #1A1B1E);font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-sum-head{display:flex;align-items:center;gap:8px 12px}.ds-spill{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;background:#fff;color:var(--fg);font-size:13px;font-weight:600}.ds-sdot{width:6px;height:6px;border-radius:50%;background:oklch(0.58 0.16 25)}.ds-sum-hl{font-size:16px;font-weight:600}.ds-sum-c{margin:6px 0 0;color:var(--fg);font-size:13px;font-variant-numeric:tabular-nums}.ds-sec{margin:20px 0 8px;color:var(--fg);font-size:12px;font-weight:600;letter-spacing:.04em;text-transform:uppercase}.ds-crit{font-size:14px;font-weight:600}.ds-facts{display:grid;grid-template-columns:max-content minmax(0,1fr);gap:2px 14px;margin:4px 0 0;font-size:13px}.ds-facts dt{color:var(--fg);font-weight:500}.ds-facts dd{margin:0}.ds-src{font-family:'IBM Plex Mono',monospace;font-size:12px}"
+    },
+    {
+      "name": "Profile Table",
+      "kind": "custom",
+      "refersTo": "profile-table",
+      "description": "A table of the company profile with every part editable: column names and cells are flush fields, rows and columns can be added or removed, and the table itself removed.",
+      "html": "<div class=\"ds-pt\"><div class=\"ds-pt-wrap\"><table class=\"ds-pt-table\"><thead><tr><th><div class=\"ds-pt-col\"><input class=\"ds-pt-colname\" value=\"Financial Year\" aria-label=\"Column 1 name\"><button type=\"button\" class=\"ds-pt-col-rm\" aria-label=\"Remove column\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z\"/></svg></button></div></th><th><div class=\"ds-pt-col\"><input class=\"ds-pt-colname\" value=\"Turnover\" aria-label=\"Column 2 name\"><button type=\"button\" class=\"ds-pt-col-rm\" aria-label=\"Remove column\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z\"/></svg></button></div></th><th class=\"ds-pt-rm-cell\"><span class=\"ds-vh\">Remove</span></th></tr></thead><tbody><tr><td><input class=\"ds-pt-cell ds-pt-key\" value=\"FY25\" aria-label=\"Financial Year, row 1\"></td><td><input class=\"ds-pt-cell\" value=\"1620000000\" aria-label=\"Turnover, row 1\"></td><td class=\"ds-pt-rm-cell\"><button type=\"button\" class=\"ds-pt-rm\" aria-label=\"Remove row 1: FY25\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z\"/></svg></button></td></tr><tr><td><input class=\"ds-pt-cell ds-pt-key\" value=\"FY26\" aria-label=\"Financial Year, row 2\"></td><td><input class=\"ds-pt-cell\" value=\"1710000000\" aria-label=\"Turnover, row 2\"></td><td class=\"ds-pt-rm-cell\"><button type=\"button\" class=\"ds-pt-rm\" aria-label=\"Remove row 2: FY26\"><svg width=\"14\" height=\"14\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M2.146 2.854a.5.5 0 1 1 .708-.708L8 7.293l5.146-5.147a.5.5 0 0 1 .708.708L8.707 8l5.147 5.146a.5.5 0 0 1-.708.708L8 8.707l-5.146 5.147a.5.5 0 0 1-.708-.708L7.293 8z\"/></svg></button></td></tr></tbody></table></div><div class=\"ds-pt-foot\"><button type=\"button\" class=\"ds-pt-link\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2\"/></svg> Add row</button><button type=\"button\" class=\"ds-pt-link\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M8 2a.5.5 0 0 1 .5.5v5h5a.5.5 0 0 1 0 1h-5v5a.5.5 0 0 1-1 0v-5h-5a.5.5 0 0 1 0-1h5v-5A.5.5 0 0 1 8 2\"/></svg> Add column</button><button type=\"button\" class=\"ds-pt-link ds-pt-link-quiet\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M6.5 1h3a.5.5 0 0 1 .5.5v1H6v-1a.5.5 0 0 1 .5-.5M11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3A1.5 1.5 0 0 0 5 1.5v1H1.5a.5.5 0 0 0 0 1h.538l.853 10.66A2 2 0 0 0 4.885 16h6.23a2 2 0 0 0 1.994-1.84l.853-10.66h.538a.5.5 0 0 0 0-1zm1.958 1-.846 10.58a1 1 0 0 1-.997.92h-6.23a1 1 0 0 1-.997-.92L3.042 3.5zm-7.487 1a.5.5 0 0 1 .528.47l.5 8.5a.5.5 0 0 1-.998.06L5 5.03a.5.5 0 0 1 .47-.53Zm5.058 0a.5.5 0 0 1 .47.53l-.5 8.5a.5.5 0 1 1-.998-.06l.5-8.5a.5.5 0 0 1 .528-.47M8 4.5a.5.5 0 0 1 .5.5v8.5a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5\"/></svg> Remove table</button></div></div>",
+      "css": ".ds-pt{width:520px;font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-pt-wrap{overflow-x:auto;border:1px solid var(--line, #E4E4DF);border-radius:10px;background:var(--surface, #fff)}.ds-pt-table{width:100%;border-collapse:collapse;font-size:13px}.ds-pt-table th{padding:0;border-bottom:1px solid var(--line, #E4E4DF);background:var(--surface-sunk, #FAFAF8);color:var(--muted, #5E6066);font-weight:500;text-align:left;white-space:nowrap}.ds-pt-table td{padding:0;border-top:1px solid var(--line-3, #F0F0EC)}.ds-pt-table tbody tr:first-child td{border-top:0}.ds-pt-table td+td:not(.ds-pt-rm-cell),.ds-pt-table th+th:not(.ds-pt-rm-cell){border-left:1px solid var(--line-3, #F0F0EC)}.ds-pt-col{display:flex;align-items:center}.ds-pt-colname{flex:1;min-width:100px;height:34px;padding:0 10px;border:0;background:transparent;color:var(--muted, #5E6066);font:500 13px 'IBM Plex Sans',system-ui,sans-serif;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-col-rm{display:grid;place-items:center;width:26px;height:26px;margin-right:4px;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--faint, #8A8C92);cursor:pointer;opacity:0;transition:opacity .15s cubic-bezier(.16,1,.3,1)}.ds-pt-table th:hover .ds-pt-col-rm,.ds-pt-table th:focus-within .ds-pt-col-rm{opacity:1}.ds-pt-cell{box-sizing:border-box;display:block;width:100%;min-width:130px;height:38px;padding:0 10px;border:0;background:transparent;color:var(--ink, #1A1B1E);font:400 13px 'IBM Plex Sans',system-ui,sans-serif;font-variant-numeric:tabular-nums;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-cell:hover,.ds-pt-colname:hover{background:var(--hover, #FBFBF9)}.ds-pt-cell:focus,.ds-pt-colname:focus{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:-2px;background:var(--surface, #fff)}.ds-pt-key{color:var(--ink-2, #3A3C42);font-weight:500}.ds-pt-rm-cell{width:40px;text-align:center}.ds-pt-rm{display:grid;place-items:center;width:32px;height:32px;margin:0 auto;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--faint, #8A8C92);cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1),border-color .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-rm:hover,.ds-pt-col-rm:hover{border-color:var(--control-line, #DCDCD6);background:var(--surface, #fff);color:var(--ink, #1A1B1E)}.ds-pt-rm:focus-visible,.ds-pt-col-rm:focus-visible,.ds-pt-link:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}.ds-pt-foot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin-top:8px}.ds-pt-link{display:inline-flex;align-items:center;gap:4px;padding:0;border:0;background:none;color:var(--accent, oklch(0.55 0.14 255));font:500 13px 'IBM Plex Sans',system-ui,sans-serif;text-decoration:underline;text-underline-offset:.2em;cursor:pointer}.ds-pt-link:hover{color:var(--accent-strong, oklch(0.48 0.14 255))}.ds-pt-link-quiet{margin-left:auto;color:var(--muted, #5E6066)}.ds-pt-link-quiet:hover{color:var(--ink, #1A1B1E)}.ds-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
+    },
+    {
+      "name": "App Bar",
+      "kind": "nav",
+      "refersTo": "appbar",
+      "description": "Near-black band with the product mark, the company every verdict is checked against, and a quiet Edit profile button that opens the company profile editor.",
+      "html": "<header class=\"ds-appbar\"><div class=\"ds-brand\"><span class=\"ds-mark\" aria-hidden=\"true\">TP</span><span class=\"ds-title\">Tender Processing</span></div><div class=\"ds-prof\"><span class=\"ds-lbl\">Checking against</span><span class=\"ds-co\">ABC Infrastructure Ltd.</span><button type=\"button\" class=\"ds-appbar-btn\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M15.502 1.94a.5.5 0 0 1 0 .706L14.459 3.69l-2-2L13.502.646a.5.5 0 0 1 .707 0l1.293 1.293zm-1.75 2.456-2-2L4.939 9.21a.5.5 0 0 0-.121.196l-.805 2.414a.25.25 0 0 0 .316.316l2.414-.805a.5.5 0 0 0 .196-.12l6.813-6.814z\"/><path fill-rule=\"evenodd\" d=\"M1 13.5A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-6a.5.5 0 0 0-1 0v6a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5H9a.5.5 0 0 0 0-1H2.5A1.5 1.5 0 0 0 1 2.5z\"/></svg> Edit profile</button></div></header>",
+      "css": ".ds-appbar{display:flex;align-items:center;justify-content:space-between;gap:16px;height:56px;padding:0 28px;background:var(--chrome, #16171A);color:var(--chrome-ink, #F3F3F0);font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-brand{display:flex;align-items:center;gap:12px}.ds-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:7px;background:oklch(0.55 0.14 255);color:#fff;font-size:13px;font-weight:700}.ds-title{font-size:15px;font-weight:600;letter-spacing:-0.01em}.ds-prof{display:flex;align-items:center;gap:10px;font-size:13px}.ds-lbl{color:var(--chrome-muted, #9A9BA0)}.ds-co{font-weight:600}.ds-appbar-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:transparent;color:var(--chrome-link, #B5B6BA);font:500 12px 'IBM Plex Sans',system-ui,sans-serif;white-space:nowrap;cursor:pointer;transition:border-color .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-appbar-btn:hover{border-color:rgba(255,255,255,.36);color:#fff}.ds-appbar-btn:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}"
+    },
+    {
+      "name": "Selection Bar",
+      "kind": "custom",
+      "refersTo": "selection-bar",
+      "description": "Floating chrome bar shown while tenders are selected; carries the floating shadow.",
+      "html": "<div class=\"ds-selbar\"><span class=\"ds-seltext\">3 selected · ₹1,100.56 Cr · about 20 min</span><button class=\"ds-barlink\">Clear</button><button class=\"ds-barbtn\">Check eligibility</button></div>",
+      "css": ".ds-selbar{display:inline-flex;align-items:center;gap:18px;padding:10px 10px 10px 18px;border-radius:12px;background:var(--chrome, #16171A);color:var(--chrome-ink, #F3F3F0);box-shadow:0 16px 40px rgba(20,20,25,.25);font:400 14px 'IBM Plex Sans',system-ui,sans-serif;white-space:nowrap}.ds-seltext{font-variant-numeric:tabular-nums}.ds-barlink{padding:0;border:0;border-radius:4px;background:transparent;color:var(--chrome-link, #B5B6BA);font-size:13px;cursor:pointer}.ds-barlink:hover{color:#fff}.ds-barlink:focus-visible,.ds-barbtn:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px;}.ds-barbtn{height:36px;padding:0 14px;border:0;border-radius:8px;background:oklch(0.55 0.14 255);color:#fff;font:600 14px/1 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-barbtn:hover{background:oklch(0.48 0.14 255)}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Screening Desk",
+    "overview": "A quiet, warm-grey working surface where every tender is one row and every row ends in a verdict. The page is built for a bid team that reads a list, decides, and moves on: the type is IBM Plex at office-document sizes (12 to 15px for nearly everything, 26px for the one page title), the surfaces are white panels on a faintly warm paper ground, and the only saturated colour on a resting screen is the verdict pills plus one blue for whatever the user can act on.\n\nDensity is deliberate. Rows carry a two-line title, a mono meta line (TCNO, reference, published date), the organisation, the value in crore, the closing date with a days-left pill, and the verdict with its one-line reason, all at a comfortable 16px vertical rhythm. A near-black app bar holds the product name, the company every verdict is checked against and a quiet control to edit that company's profile; the same near-black returns only for transient chrome that floats over the page (the selection bar, toasts), so \"dark\" always means \"about you, not about the data\".\n\nDepth is almost absent. Panels are separated by a 1px warm line and a 14px radius, not by shadow; shadow is reserved for things that hover over the page. Motion is short and purposeful: 0.12 to 0.18s colour transitions on one shared ease-out curve, a pulsing dot while a tender is processing, and a single reveal when a verdict lands in front of the user.",
+    "keyCharacteristics": [
+      "Warm-grey paper ground (#F5F5F2) with white bordered panels; no decorative imagery.",
+      "IBM Plex Sans for reading, IBM Plex Mono for identifiers and money, tabular figures everywhere numbers line up.",
+      "One blue accent for action and selection; five verdict tones that each own a bg / fg / dot triple.",
+      "Near-black chrome only for the app bar and floating transient bars.",
+      "Flat at rest; shadow only on things floating above the page.",
+      "Every narrow layout keeps the verdict on screen."
+    ],
+    "rules": [
+      {
+        "name": "The One Blue Rule",
+        "body": "Blue means \"you can act on this, or you have selected it\". It is never used to colour data, status or decoration, except the processing tone, which is the system acting on the user's behalf.",
+        "section": "colors"
+      },
+      {
+        "name": "The Verdict Owns Its Hue Rule",
+        "body": "Green, ochre and red belong to the verdicts and their direct echoes (criterion status, closing urgency, decisions). Nothing else on the page may borrow them.",
+        "section": "colors"
+      },
+      {
+        "name": "The Tinted Panel Speaks In Its Own Tone Rule",
+        "body": "Secondary text on a verdict-tinted panel (counts, criterion labels, section labels) takes that panel's `*-fg`, not grey. Grey on a tinted background reads as disabled and fails contrast.",
+        "section": "colors"
+      },
+      {
+        "name": "The Mono Means Compare Rule",
+        "body": "Mono is for identifiers, money, counts and file paths. It never sets prose, headings or labels.",
+        "section": "typography"
+      },
+      {
+        "name": "The Tabular Figures Rule",
+        "body": "Any line where numbers sit next to each other or update in place (summary lines, run stage, ETA, closing dates, footers) uses `font-variant-numeric: tabular-nums`.",
+        "section": "typography"
+      },
+      {
+        "name": "The Verdict Stays On Screen Rule",
+        "body": "At every width the verdict column is visible without horizontal scroll. Columns fold or stack before Eligibility is ever dropped.",
+        "section": "layout"
+      },
+      {
+        "name": "The Floating-Only Shadow Rule",
+        "body": "If it sits in the page flow it has no shadow; if it floats over the page it gets one of the floating shadows (chrome, list or modal).",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "**Do** keep the accent at oklch(0.55 0.14 255) wherever white text sits on it; use the lighter oklch(0.6 0.14 255) only for dots, tints and glows.",
+      "**Do** give every new status a full bg / fg / dot triple and apply it through the tone variables, never as one-off colours.",
+      "**Do** colour secondary text on a tinted verdict panel with that panel's `*-fg`.",
+      "**Do** show money as \"₹511.80 Cr\" in mono with tabular figures and a `meta` unit; show dates as \"02 Nov 2026\".",
+      "**Do** use Bootstrap Icons (aria-hidden) for every glyph and CSS-drawn controls on real inputs.",
+      "**Do** keep tabular data in a real `<table>` with ARIA roles, however it is laid out visually.",
+      "**Do** keep the verdict visible at every breakpoint: fold columns, then stack to cards.",
+      "**Do** honour `prefers-reduced-motion`: drop movement, keep meaningful colour change.",
+      "**Do** let people edit structured records as labelled fields (rows in a bordered grid), never as raw markup.",
+      "**Do** open dropdown lists and other pop-overs from `<body>` with the floating-list shadow, so a panel's rounded clipping never cuts them."
+    ],
+    "donts": [
+      "**Don't** use Unicode characters as icons.",
+      "**Don't** use the verdict greens, ochres or reds for anything that is not a verdict, criterion status, urgency or decision.",
+      "**Don't** set grey secondary text on a tinted panel.",
+      "**Don't** put shadows on in-flow panels or rows.",
+      "**Don't** use `faint` for readable text; it is for disabled states and quiet icons.",
+      "**Don't** show the API's \"Not Eligible\" or \"Requires Review\" in the interface; display \"Not eligible\" and \"Needs review\".",
+      "**Don't** use the near-black chrome for content panels; it is reserved for the app bar and floating bars."
+    ]
+  }
+}

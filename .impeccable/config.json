@@ -1,0 +1,14 @@
+{
+  "detector": {
+    "ignoreRules": [],
+    "ignoreFiles": [],
+    "ignoreValues": [
+      {
+        "rule": "design-system-font",
+        "value": "bootstrap-icons",
+        "createdAt": "2026-11-02T11:38:06.836Z",
+        "reason": "Icon font, not a text face: DESIGN.md Do's require Bootstrap Icons for every glyph; used for the organisation dropdown chevron"
+      }
+    ]
+  }
+}

@@ -1,0 +1,393 @@
+{% extends 'base.html' %}
+
+{% block styles %}
+<!-- Searchable organisation filter; style.css, loaded after, restyles it to the page -->
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/tom-select@2.4.3/dist/css/tom-select.min.css"
+      integrity="sha384-EIA8J01pb+PXiVYnDYseaCki0ke5k3Z/QNbhj0nU+Uso0kvSYdFnQB3G6ia7lU+Y" crossorigin="anonymous">
+{% endblock %}
+
+{% block content %}
+<div class="page-head">
+  <div class="page-title">
+    <h1>Tenders</h1>
+    <p class="page-summary" id="page-summary"></p>
+  </div>
+  <div class="tabs" role="group" aria-label="Show tenders by verdict" id="verdict-filters">
+    <button type="button" class="tab" data-verdict="" aria-pressed="true">
+      <span class="dot dot-all" aria-hidden="true"></span>All <span class="tab-count" data-count="all">0</span>
+    </button>
+    <button type="button" class="tab" data-verdict="Eligible" aria-pressed="false">
+      <span class="dot dot-eligible" aria-hidden="true"></span>Eligible <span class="tab-count" data-count="Eligible">0</span>
+    </button>
+    <button type="button" class="tab" data-verdict="Requires Review" aria-pressed="false">
+      <span class="dot dot-review" aria-hidden="true"></span>Needs review <span class="tab-count" data-count="Requires Review">0</span>
+    </button>
+    <button type="button" class="tab" data-verdict="Not Eligible" aria-pressed="false">
+      <span class="dot dot-not" aria-hidden="true"></span>Not eligible <span class="tab-count" data-count="Not Eligible">0</span>
+    </button>
+    <button type="button" class="tab" data-verdict="failed" aria-pressed="false">
+      <span class="dot dot-failed" aria-hidden="true"></span>Failed <span class="tab-count" data-count="failed">0</span>
+    </button>
+    <button type="button" class="tab" data-verdict="pending" aria-pressed="false">
+      <span class="dot dot-none" aria-hidden="true"></span>Not processed <span class="tab-count" data-count="pending">0</span>
+    </button>
+  </div>
+</div>
+
+<!-- Current or last run; shown once a job has run, until it is dismissed -->
+<section class="panel run-panel" id="run-panel" aria-labelledby="run-title" hidden>
+  <div class="run-head">
+    <div class="run-text">
+      <h2 class="run-title" id="run-title"></h2>
+      <p class="run-detail" id="run-detail"></p>
+      <p class="run-stage" id="run-stage"></p>
+    </div>
+    <div class="run-actions">
+      <span class="run-eta" id="run-eta"></span>
+      <button type="button" class="button button-secondary button-sm" id="notify-btn" aria-pressed="false" hidden>
+        <i class="bi bi-bell" aria-hidden="true"></i> <span>Notify me when done</span>
+      </button>
+      <button type="button" class="button button-secondary button-sm" id="stop-btn">Stop after this tender</button>
+    </div>
+    <button type="button" class="icon-button run-dismiss" id="run-dismiss" aria-label="Dismiss this summary" hidden>
+      <i class="bi bi-x-lg" aria-hidden="true"></i>
+    </button>
+  </div>
+  <div class="run-progress" role="progressbar" aria-labelledby="run-title" aria-valuemin="0" aria-valuemax="100"
+       aria-valuenow="0" id="run-progress">
+    <div class="run-bar" id="run-bar"></div>
+  </div>
+  <!-- Announces a new tender or the end of the run, not every elapsed-time tick -->
+  <div class="visually-hidden" aria-live="polite" id="run-announce"></div>
+</section>
+
+<section class="panel" id="tender-panel" aria-label="Tender list">
+  <div class="toolbar">
+    <label class="search">
+      <i class="bi bi-search" aria-hidden="true"></i>
+      <input type="search" id="search" placeholder="Search TCNO, title, organisation" aria-label="Search tenders"
+             aria-keyshortcuts="/">
+      <kbd aria-hidden="true">/</kbd>
+    </label>
+    <select class="select" id="filter-organisation" aria-label="Filter by organisation">
+      <option value="">All organisations</option>
+    </select>
+    <button type="button" class="button button-secondary" id="filters-btn" aria-expanded="false"
+            aria-controls="search-filters">
+      <i class="bi bi-funnel" aria-hidden="true"></i> Filters
+      <span class="filters-count" id="filters-count" hidden></span>
+    </button>
+    <button type="button" class="icon-button icon-button-bordered" id="refresh-btn" title="Reload tenders"
+            aria-label="Reload tenders">
+      <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
+    </button>
+    <button type="button" class="switch-button" id="hide-dropped" role="switch" aria-checked="false">
+      <span class="switch" aria-hidden="true"></span>
+      Hide dropped <span class="mono-count" data-count="dropped">0</span>
+    </button>
+    <button type="button" class="button button-primary" id="process-btn" disabled>
+      <span id="process-label">Check eligibility</span>
+      <span class="button-count" id="selected-count">0</span>
+    </button>
+  </div>
+
+  <!-- The filters of TenderTiger's search page: applying them loads the tenders TenderTiger finds with them -->
+  <form class="search-filters" id="search-filters" aria-labelledby="filters-title" hidden>
+    <div class="filters-head">
+      <h2 class="filters-title" id="filters-title">Search TenderTiger</h2>
+      <p class="filters-note">TenderTiger applies these, so the list holds only the tenders that match. The search
+        box and organisation list above then narrow that list further.</p>
+    </div>
+    <div class="filters-grid">
+      <label class="filter-field">
+        <span class="filter-label">Word search</span>
+        <input type="text" class="filter-input" name="word" autocomplete="off">
+      </label>
+      <label class="filter-field">
+        <span class="filter-label">Organisation name</span>
+        <input type="text" class="filter-input" name="organisation" autocomplete="off">
+      </label>
+      <label class="filter-field">
+        <span class="filter-label">Location</span>
+        <input type="text" class="filter-input" name="location" autocomplete="off">
+      </label>
+      <label class="filter-field">
+        <span class="filter-label">TID / tender number</span>
+        <input type="text" class="filter-input mono" name="tid" autocomplete="off">
+      </label>
+      <label class="filter-field">
+        <span class="filter-label">Company industry</span>
+        <input type="text" class="filter-input" name="industry" autocomplete="off">
+      </label>
+      <fieldset class="filter-field" data-amount="qty" data-label="Quantity">
+        <legend class="filter-label">Quantity</legend>
+        <div class="amount-row"></div>
+      </fieldset>
+      <fieldset class="filter-field" data-amount="value" data-label="Tender value in rupees">
+        <legend class="filter-label">Tender value (₹)</legend>
+        <div class="amount-row"></div>
+      </fieldset>
+      <fieldset class="filter-field" data-amount="emd" data-label="EMD in rupees">
+        <legend class="filter-label">EMD (₹)</legend>
+        <div class="amount-row"></div>
+      </fieldset>
+      <fieldset class="filter-field filter-dates">
+        <legend class="filter-label">Published</legend>
+        <div class="date-row">
+          <input type="date" class="filter-input" name="published_from" aria-label="Published from">
+          <span class="date-to" aria-hidden="true">to</span>
+          <input type="date" class="filter-input" name="published_to" aria-label="Published until">
+        </div>
+      </fieldset>
+      <fieldset class="filter-field filter-dates">
+        <legend class="filter-label">Closing</legend>
+        <div class="date-row">
+          <input type="date" class="filter-input" name="closing_from" aria-label="Closing from">
+          <span class="date-to" aria-hidden="true">to</span>
+          <input type="date" class="filter-input" name="closing_to" aria-label="Closing until">
+        </div>
+      </fieldset>
+    </div>
+    <div class="filters-choices">
+      <fieldset class="filter-choice">
+        <legend class="filter-label">GeM</legend>
+        <div class="segmented">
+          <label><input type="radio" name="gem" value="" checked><span>Any</span></label>
+          <label><input type="radio" name="gem" value="gem"><span>GeM</span></label>
+          <label><input type="radio" name="gem" value="non_gem"><span>Non GeM</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="filter-choice">
+        <legend class="filter-label">Bidding</legend>
+        <div class="segmented">
+          <label><input type="radio" name="bidding" value="" checked><span>Any</span></label>
+          <label><input type="radio" name="bidding" value="ncb"><span>NCB</span></label>
+          <label><input type="radio" name="bidding" value="icb"><span>ICB</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="filter-choice">
+        <legend class="filter-label">Funding</legend>
+        <div class="segmented">
+          <label><input type="radio" name="funding" value="" checked><span>Any</span></label>
+          <label><input type="radio" name="funding" value="funded"><span>Funded</span></label>
+          <label><input type="radio" name="funding" value="non_funded"><span>Non funded</span></label>
+        </div>
+      </fieldset>
+      <fieldset class="filter-choice">
+        <legend class="filter-label">Only tenders</legend>
+        <div class="filter-flags">
+          <label><input type="checkbox" class="check" name="msme" value="true"> For MSMEs</label>
+          <label><input type="checkbox" class="check" name="bid_doc" value="true"> With bid documents</label>
+          <label><input type="checkbox" class="check" name="startup" value="true"> Open to startups</label>
+        </div>
+      </fieldset>
+    </div>
+    <div class="filters-foot">
+      <button type="button" class="link-button" id="filters-clear">Clear filters</button>
+      <button type="submit" class="button button-primary button-sm" id="filters-apply">Apply filters</button>
+    </div>
+  </form>
+
+  <div class="table-wrap">
+    <table class="tender-table" id="tender-table" role="table">
+      <thead role="rowgroup">
+        <tr role="row">
+          <th scope="col" class="cell-check" role="columnheader">
+            <input type="checkbox" class="check" id="select-all" aria-label="Select all visible tenders">
+          </th>
+          <th scope="col" role="columnheader">Tender</th>
+          <th scope="col" class="cell-org" role="columnheader">Organisation</th>
+          <th scope="col" class="cell-value" role="columnheader" aria-sort="none">
+            <button type="button" class="sort-button" data-sort="value">Value <i class="bi sort-arrow" aria-hidden="true"></i></button>
+          </th>
+          <th scope="col" role="columnheader" aria-sort="ascending">
+            <button type="button" class="sort-button" data-sort="closing">Closes <i class="bi sort-arrow" aria-hidden="true"></i></button>
+          </th>
+          <th scope="col" role="columnheader">Eligibility</th>
+          <th scope="col" role="columnheader"><span class="visually-hidden">Drop</span></th>
+        </tr>
+      </thead>
+      <tbody id="tender-body" role="rowgroup">
+        <tr class="message-row" role="row">
+          <td colspan="7" role="cell">
+            <span class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span> Loading tenders…
+          </td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="panel-foot" id="table-foot" hidden>
+    <span id="table-summary"></span>
+    <div class="foot-controls">
+      <span id="table-hint">Select tenders, then run an eligibility check.</span>
+      <label class="page-size">
+        Per page
+        <select class="select" id="page-size" aria-label="Tenders per page">
+          <option value="20">20</option>
+          <option value="50">50</option>
+          <option value="100">100</option>
+          <option value="500">500</option>
+        </select>
+      </label>
+      <!-- TenderTiger gives no total, so the pages go one step at a time -->
+      <nav class="pager" id="pager" aria-label="Pages of the tender list" hidden>
+        <button type="button" class="button button-secondary button-sm" id="page-prev">
+          <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+        </button>
+        <span class="pager-status" id="page-status" aria-live="polite"></span>
+        <button type="button" class="button button-secondary button-sm" id="page-next">
+          Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+        </button>
+      </nav>
+    </div>
+  </div>
+</section>
+
+<section class="panel help" aria-labelledby="help-title">
+  <h2 class="help-heading" id="help-title">
+    <button type="button" class="help-toggle" id="help-toggle" aria-expanded="true" aria-controls="help-body">
+      How the eligibility check works
+      <span class="help-state" id="help-state">Hide</span>
+    </button>
+  </h2>
+  <div class="help-body" id="help-body">
+    <div class="help-item">
+      <h3>01 · Analysis</h3>
+      <p>Every document in a selected tender is downloaded and read, including files inside ZIP archives. Each
+        eligibility criterion is compared with the company profile. A tender usually takes a few minutes.</p>
+      <p>The criteria found are saved with the documents. Checking the tender again compares the profile with
+        them without reading the documents; switch on <strong>Regenerate criteria</strong> to read them again.</p>
+    </div>
+    <div class="help-item">
+      <h3>02 · Runs in background</h3>
+      <p>You can close this page while checks run on the server. <strong>Notify me when done</strong> sends a
+        browser notification (localhost and https only). Verdicts and shortlist and drop decisions are kept when
+        the server restarts.</p>
+    </div>
+    <div class="help-item">
+      <h3>03 · Verdicts</h3>
+      <ul class="help-verdicts">
+        <li><span class="dot dot-eligible" aria-hidden="true"></span><span><strong>Eligible</strong> — the company
+          meets every criterion.</span></li>
+        <li><span class="dot dot-not" aria-hidden="true"></span><span><strong>Not eligible</strong> — a criterion is
+          not met; the row names it.</span></li>
+        <li><span class="dot dot-review" aria-hidden="true"></span><span><strong>Needs review</strong> — a criterion
+          couldn't be determined, a file was unreadable, or no criteria were found. Open it before deciding.</span></li>
+      </ul>
+      <p>The verdict is for the company bidding alone. The line under it gives the outcome as lead member of a
+        joint venture (JV), when one may bid. The analysis compares the two criterion by criterion; a green row is
+        one the company misses alone but meets as JV lead member.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Appears while tenders are selected -->
+<div class="selection-bar" id="selection-bar" role="region" aria-label="Selected tenders" hidden>
+  <span class="selection-text" id="selection-text" aria-live="polite"></span>
+  <!-- Shown while a selected tender has saved criteria: read its documents again instead of re-checking them -->
+  <button type="button" class="switch-button bar-switch" id="regenerate-toggle" role="switch" aria-checked="false"
+          title="Read the documents again and save new criteria, instead of re-checking the saved ones" hidden>
+    <span class="switch" aria-hidden="true"></span>
+    Regenerate criteria
+  </button>
+  <button type="button" class="bar-link" id="clear-selection">Clear</button>
+  <button type="button" class="button button-primary button-bar" id="bar-process">Check eligibility</button>
+</div>
+
+<!-- Details modal -->
+<div class="modal fade" id="details-modal" tabindex="-1" aria-labelledby="details-title" aria-hidden="true">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable modal-fullscreen-lg-down">
+    <div class="modal-content">
+      <div class="modal-header align-items-start">
+        <div class="details-heading">
+          <h2 class="details-title" id="details-title">Tender analysis</h2>
+          <p class="details-facts" id="details-facts"></p>
+        </div>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div id="details-summary"></div>
+        <section id="analysis-section" aria-labelledby="analysis-title">
+          <h3 class="analysis-title" id="analysis-title">Full analysis</h3>
+          <div class="analysis" id="details-content"></div>
+        </section>
+        <div id="details-files"></div>
+        <div id="details-criteria"></div>
+        <p class="details-run" id="details-run"></p>
+      </div>
+      <div class="modal-footer">
+        <div class="footer-group" role="group" aria-label="Decision">
+          <button type="button" class="button button-secondary decision-button decision-shortlist" id="shortlist-btn"
+                  aria-pressed="false">
+            <i class="bi bi-bookmark-check" aria-hidden="true"></i> <span>Shortlist</span>
+          </button>
+          <button type="button" class="button button-secondary decision-button decision-drop" id="drop-btn"
+                  aria-pressed="false">
+            <i class="bi bi-x-circle" aria-hidden="true"></i> <span>Drop</span>
+          </button>
+        </div>
+        <div class="footer-group">
+          <button type="button" class="button button-secondary" id="copy-details">
+            <i class="bi bi-clipboard" aria-hidden="true"></i> Copy text
+          </button>
+          <button type="button" class="button button-secondary" id="prev-btn">
+            <i class="bi bi-chevron-left" aria-hidden="true"></i> Previous
+          </button>
+          <button type="button" class="button button-secondary" id="next-btn">
+            Next <i class="bi bi-chevron-right" aria-hidden="true"></i>
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Company profile editor. A click outside does not close it, so edits are not lost by accident. -->
+<div class="modal fade" id="company-modal" tabindex="-1" aria-labelledby="company-title" aria-hidden="true"
+     data-bs-backdrop="static">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable modal-fullscreen-lg-down">
+    <div class="modal-content">
+      <div class="modal-header align-items-start">
+        <div class="details-heading">
+          <h2 class="details-title" id="company-title">Company profile</h2>
+          <p class="details-facts" id="company-help">Every tender is checked against these details and nothing else. Keep figures
+            exact; a criterion whose figure is missing becomes Needs review.</p>
+        </div>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <!-- Filled by app.js from /api/company: the title, then each section's tables as rows of fields -->
+        <div class="profile-form" id="company-form"></div>
+      </div>
+      <div class="modal-footer">
+        <p class="company-note">Tenders checked from now on use the saved details. To update a verdict already
+          given, check that tender again.</p>
+        <div class="footer-group">
+          <button type="button" class="button button-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="button button-primary" id="company-save" aria-keyshortcuts="Control+S">
+            Save profile
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="toast-container position-fixed bottom-0 end-0 p-3" id="toasts"></div>
+{% endblock %}
+
+{% block scripts %}
+<!-- Markdown rendering for the analysis; without these the modal falls back to plain text -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"
+        integrity="sha384-/TQbtLCAerC3jgaim+N78RZSDYV7ryeoBCVqTuzRrFec2akfBkHS7ACQ3PQhvMVi" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3.1.6/dist/purify.min.js"
+        integrity="sha384-+VfUPEb0PdtChMwmBcBmykRMDd+v6D/oFmB3rZM/puCMDYcIvF968OimRh4KQY9a" crossorigin="anonymous"></script>
+<!-- Search inside the organisation filter, like select2; without it the filter is a plain select -->
+<script src="https://cdn.jsdelivr.net/npm/tom-select@2.4.3/dist/js/tom-select.complete.min.js"
+        integrity="sha384-A4TlP4zHVPP9oVIQ8pTVaV6MhvBkDx1sRpmEUfAlO5e7xpodrdr6uNmUV7alXAWW" crossorigin="anonymous"></script>
+<script src="{{ url_for('static', path='js/app.js') }}"></script>
+{% endblock %}

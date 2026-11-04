@@ -1,0 +1,2673 @@
+/*
+ * Tender Processing, from design/Tender Processing.dc.html: IBM Plex, warm greys, one blue accent and
+ * one colour per verdict. Two values are darker than the design so text passes WCAG AA:
+ * the accent (white on it is 4.9:1, not 4.0:1) and the 12px meta grey (#6A6C72, not #7A7C82).
+ */
+:root {
+  --bg: #F5F5F2;
+  --surface: #fff;
+  --surface-sunk: #FAFAF8;
+  --hover: #FBFBF9;
+  --ink: #1A1B1E;
+  --ink-2: #3A3C42;
+  --ink-3: #4A4C52;
+  --muted: #5E6066;
+  --meta: #6A6C72;
+  --faint: #8A8C92;
+  --line: #E4E4DF;
+  --line-2: #EDEDE9;
+  --line-3: #F0F0EC;
+  --control-line: #DCDCD6;
+  --control-line-hover: #C9C9C3;
+  --check-line: #C4C4BE;
+  --track: #EAEAE6;
+  --disabled-bg: #E6E6E1;
+
+  --chrome: #16171A;
+  --chrome-ink: #F3F3F0;
+  --chrome-muted: #9A9BA0;
+  --chrome-link: #B5B6BA;
+
+  --accent: oklch(0.55 0.14 255);
+  --accent-strong: oklch(0.48 0.14 255);
+  --accent-soft: oklch(0.95 0.03 255);
+  --accent-wash: oklch(0.975 0.015 255);
+
+  --eligible-bg: oklch(0.95 0.04 150);
+  --eligible-fg: oklch(0.4 0.11 150);
+  --eligible-dot: oklch(0.58 0.13 150);
+  --review-bg: oklch(0.96 0.05 80);
+  --review-fg: oklch(0.45 0.1 65);
+  --review-dot: oklch(0.68 0.14 70);
+  --not-bg: oklch(0.95 0.03 25);
+  --not-fg: oklch(0.45 0.15 25);
+  --not-dot: oklch(0.58 0.16 25);
+  --failed-bg: #EDEDEA;
+  --failed-fg: #3A3C42;
+  --failed-dot: #5E6066;
+  --none-bg: #F1F1EE;
+  --none-fg: #5E6066;
+  --none-dot: #B0B2B6;
+  --processing-bg: var(--accent-soft);
+  --processing-fg: oklch(0.45 0.14 255);
+  --processing-dot: oklch(0.6 0.14 255);
+
+  --font-sans: "IBM Plex Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "Cascadia Mono", Consolas, monospace;
+  --focus-outline: 2px solid var(--accent);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+
+  /* Bootstrap still draws the modal and toasts: give it the same type */
+  --bs-body-font-family: var(--font-sans);
+  --bs-font-monospace: var(--font-mono);
+  --bs-body-color: var(--ink);
+  --bs-border-color: var(--line);
+  --bs-secondary-color: var(--meta);
+}
+
+html,
+body {
+  background-color: var(--bg);
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbars (page, modal, sideways tables) and the text caret in the page's own colours */
+html {
+  scrollbar-color: var(--check-line) transparent;
+  caret-color: var(--accent);
+}
+
+body {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+::selection {
+  background-color: oklch(0.6 0.14 255 / .22);
+}
+
+::placeholder {
+  color: var(--meta);
+  opacity: 1;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: .2em;
+}
+
+kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--control-line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  box-shadow: none;
+}
+
+.mono {
+  font-family: var(--font-mono);
+}
+
+/* ---------- app bar ---------- */
+
+.appbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  height: 56px;
+  padding: 0 28px;
+  background: var(--chrome);
+  color: var(--chrome-ink);
+}
+
+.appbar-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.appbar-mark {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.appbar-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  white-space: nowrap;
+}
+
+.appbar-profile {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  font-size: 13px;
+}
+
+.appbar-label {
+  color: var(--chrome-muted);
+}
+
+.appbar-company {
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A quiet control on the chrome: it changes what every verdict is checked against, so it is easy to find, not loud */
+.appbar-button {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, .18);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--chrome-link);
+  font-size: 12px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color .15s var(--ease-out), color .15s var(--ease-out);
+}
+
+.appbar-button:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, .36);
+  color: #fff;
+}
+
+.appbar-button:disabled {
+  opacity: .6;
+  cursor: default;
+}
+
+/* ---------- page ---------- */
+
+.page {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  width: 100%;
+  max-width: 1480px;
+  margin: 0 auto;
+  padding: 28px 28px;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+}
+
+.page-title {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.page-title h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.page-summary {
+  margin: 0;
+  font-size: 14px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.panel {
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface);
+}
+
+/* ---------- verdict tabs ---------- */
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--track);
+}
+
+.tab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color .15s var(--ease-out), box-shadow .15s var(--ease-out);
+}
+
+.tab:hover {
+  background: rgba(255, 255, 255, .55);
+}
+
+.tab[aria-pressed="true"] {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(20, 20, 25, .1);
+}
+
+.tab-count {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--dot, var(--ink));
+}
+
+.dot-all { --dot: var(--ink); }
+.dot-eligible { --dot: var(--eligible-dot); }
+.dot-review { --dot: var(--review-dot); }
+.dot-not { --dot: var(--not-dot); }
+.dot-failed { --dot: var(--failed-dot); }
+.dot-none { --dot: var(--none-dot); }
+.dot-processing { --dot: var(--processing-dot); }
+
+/* ---------- controls ---------- */
+
+.button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color .15s var(--ease-out), border-color .15s var(--ease-out), color .15s var(--ease-out);
+}
+
+.button-primary {
+  padding: 0 16px;
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+
+.button-primary:hover {
+  background: var(--accent-strong);
+}
+
+.button-primary:disabled {
+  background: var(--disabled-bg);
+  color: var(--faint);
+  cursor: default;
+}
+
+.button-count {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, .2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.button-primary:disabled .button-count {
+  background: rgba(20, 20, 25, .06);
+}
+
+.button-secondary {
+  border-color: var(--control-line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.button-secondary:hover:not(:disabled) {
+  border-color: var(--control-line-hover);
+  background: var(--hover);
+}
+
+.button-secondary:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.button-sm {
+  height: 32px;
+  padding: 0 12px;
+  font-size: 13px;
+}
+
+.icon-button {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+  transition: background-color .15s var(--ease-out), border-color .15s var(--ease-out), color .15s var(--ease-out);
+}
+
+.icon-button:hover:not(:disabled) {
+  border-color: var(--control-line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+.icon-button-bordered {
+  width: 38px;
+  height: 38px;
+  border-color: var(--control-line);
+  background: var(--surface);
+}
+
+.icon-button:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
+.button:focus-visible,
+.appbar-button:focus-visible,
+.icon-button:focus-visible,
+.tab:focus-visible,
+.switch-button:focus-visible,
+.sort-button:focus-visible,
+.pill-button:focus-visible,
+.row-drop:focus-visible,
+.run-count:focus-visible,
+.bar-link:focus-visible,
+.help-toggle:focus-visible,
+.link-button:focus-visible,
+.check:focus-visible,
+.select:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.link-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: .2em;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  color: var(--accent-strong);
+}
+
+/* Checkbox drawn to the design; still a real input for keyboard and screen readers */
+.check {
+  appearance: none;
+  display: inline-grid;
+  place-content: center;
+  flex: none;
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  border: 1.5px solid var(--check-line);
+  border-radius: 5px;
+  background: var(--surface);
+  cursor: pointer;
+  transition: background-color .12s var(--ease-out), border-color .12s var(--ease-out);
+}
+
+.check::after {
+  content: "";
+  width: 9px;
+  height: 5px;
+  border: solid #fff;
+  border-width: 0 0 2px 2px;
+  opacity: 0;
+  transform: translateY(-1px) rotate(-45deg);
+}
+
+.check:checked,
+.check:indeterminate {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+
+.check:checked::after {
+  opacity: 1;
+}
+
+.check:indeterminate::after {
+  width: 8px;
+  height: 0;
+  border-width: 0 0 2px;
+  opacity: 1;
+  transform: none;
+}
+
+.check:disabled {
+  border-color: var(--line);
+  background: var(--surface-sunk);
+  cursor: not-allowed;
+}
+
+/* ---------- toolbar ---------- */
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line-2);
+}
+
+.search {
+  display: flex;
+  flex: 1 1 280px;
+  align-items: center;
+  gap: 10px;
+  height: 38px;
+  margin: 0;
+  padding: 0 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface-sunk);
+  color: var(--faint);
+  font-size: 15px;
+  transition: border-color .15s var(--ease-out), background-color .15s var(--ease-out);
+}
+
+.search:focus-within {
+  border-color: var(--accent);
+  background: var(--surface);
+  box-shadow: 0 0 0 3px oklch(0.6 0.14 255 / .15);
+}
+
+.search input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: 0;
+  background: transparent;
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.search input::-webkit-search-cancel-button {
+  cursor: pointer;
+}
+
+/* The "/" shortcut needs a keyboard: touch screens leave the hint out */
+@media (hover: none) {
+  .search kbd {
+    display: none;
+  }
+}
+
+/* A fixed width: a native select otherwise grows to its longest organisation name */
+.select {
+  flex: 0 1 220px;
+  height: 38px;
+  min-width: 160px;
+  max-width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+/* Native selects draw the page's chevron (Bootstrap Icons' chevron-down) in place of the browser's arrow */
+select.select,
+select.filter-input {
+  appearance: none;
+  padding-right: 34px;
+  background: var(--surface) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='%235E6066'%3E%3Cpath fill-rule='evenodd' d='M1.646 4.646a.5.5 0 0 1 .708 0L8 10.293l5.646-5.647a.5.5 0 0 1 .708.708l-6 6a.5.5 0 0 1-.708 0l-6-6a.5.5 0 0 1 0-.708'/%3E%3C/svg%3E") no-repeat right 12px center / 12px;
+}
+
+/*
+ * The organisation filter as a searchable dropdown (Tom Select, like select2). Tom Select copies .select onto
+ * its wrapper, so the wrapper keeps the toolbar width and the control inside it draws the field.
+ */
+.ts-wrapper.select {
+  height: auto;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+
+.ts-wrapper.select .ts-control {
+  flex-wrap: nowrap;
+  align-items: center;
+  height: 38px;
+  padding: 0 34px 0 12px !important;  /* Tom Select sets its own padding with !important */
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+  line-height: 1.2;
+  transition: border-color .15s var(--ease-out);
+}
+
+.ts-wrapper.select .ts-control:hover {
+  border-color: var(--control-line-hover);
+}
+
+.ts-wrapper.select .ts-control .item {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Bootstrap Icons' chevron-down, in place of Tom Select's triangle */
+.ts-wrapper.select.single .ts-control::after {
+  content: "\F282";
+  position: absolute;
+  top: 50%;
+  right: 12px;
+  width: auto;
+  height: auto;
+  margin: 0;
+  border: 0;
+  color: var(--muted);
+  font-family: "bootstrap-icons";
+  font-size: 12px;
+  line-height: 1;
+  transform: translateY(-50%);
+}
+
+.ts-wrapper.select .ts-control:focus-visible {
+  outline: var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.ts-wrapper.select.dropdown-active .ts-control {
+  border-color: var(--accent);
+}
+
+/* The list floats over the page from <body>, so the panel's rounded corners do not clip it */
+.org-dropdown {
+  min-width: min(340px, calc(100vw - 32px));
+  margin-top: 4px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 12px 32px rgba(20, 20, 25, .14);
+  font-size: 13px;
+  z-index: 1040;
+}
+
+.org-dropdown .dropdown-input-wrap {
+  padding: 8px;
+  border-bottom: 1px solid var(--line-2);
+}
+
+.org-dropdown .dropdown-input {
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--control-line);
+  border-radius: 7px;
+  background: var(--surface-sunk);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+.org-dropdown .dropdown-input:focus {
+  border-color: var(--accent);
+  outline: 0;
+  background: var(--surface);
+  box-shadow: 0 0 0 3px oklch(0.6 0.14 255 / .15);
+}
+
+.org-dropdown .ts-dropdown-content {
+  max-height: 300px;
+  padding: 4px 0;
+}
+
+.org-dropdown .option {
+  padding: 8px 12px;
+  line-height: 1.35;
+}
+
+.org-dropdown .option.active {
+  background: var(--accent-wash);
+  color: var(--ink);
+}
+
+.org-dropdown .option.selected {
+  color: var(--accent-strong);
+  font-weight: 600;
+}
+
+.org-dropdown .highlight {
+  border-radius: 2px;
+  background: var(--accent-soft);
+}
+
+.org-dropdown .no-results {
+  padding: 10px 12px;
+  color: var(--meta);
+}
+
+.switch-button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background-color .15s var(--ease-out);
+}
+
+.switch-button[aria-checked="true"] {
+  background: var(--accent-wash);
+}
+
+.switch {
+  position: relative;
+  display: block;
+  width: 28px;
+  height: 16px;
+  border-radius: 999px;
+  background: #CFCFCA;
+  transition: background-color .15s var(--ease-out);
+}
+
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform .18s var(--ease-out);
+}
+
+.switch-button[aria-checked="true"] .switch {
+  background: var(--accent);
+}
+
+.switch-button[aria-checked="true"] .switch::after {
+  transform: translateX(12px);
+}
+
+.mono-count {
+  color: var(--meta);
+  font-family: var(--font-mono);
+}
+
+/* ---------- TenderTiger search filters ---------- */
+
+#filters-btn[aria-expanded="true"] {
+  border-color: var(--control-line-hover);
+  background: var(--hover);
+}
+
+/* How many filters the list was loaded with: selected state, so blue */
+.filters-count {
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent-strong);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.filters-count[hidden] {
+  display: none;
+}
+
+/* A sunk band under the toolbar, in the page flow, so no shadow */
+.search-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--surface-sunk);
+}
+
+.search-filters[hidden] {
+  display: none;
+}
+
+.filters-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 12px;
+}
+
+.filters-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.filters-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-wrap: pretty;
+}
+
+.filters-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.filter-field,
+.filter-choice {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* Also a <legend>: Bootstrap's reboot floats legends and sets them large */
+.filter-label {
+  display: block;
+  float: none;
+  width: auto;
+  margin: 0 0 6px;
+  padding: 0;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.filter-input {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+  transition: border-color .15s var(--ease-out), box-shadow .15s var(--ease-out);
+}
+
+.filter-input:hover {
+  border-color: var(--control-line-hover);
+}
+
+.filter-input:focus {
+  outline: 0;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px oklch(0.6 0.14 255 / .15);
+}
+
+.filter-input.mono {
+  font-variant-numeric: tabular-nums;
+}
+
+/* An empty date field shows its format (dd-mm-yyyy) in placeholder grey, so it never reads as a date that is set */
+.filter-input[type="date"].is-empty:not(:focus) {
+  color: var(--meta);
+}
+
+.amount-row,
+.date-row,
+.amount-to {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.amount-row {
+  flex-wrap: wrap;
+}
+
+/* Wide enough for "Between" and the chevron */
+.amount-op {
+  flex: 0 0 98px;
+  padding: 0 26px 0 10px;
+  background-position: right 9px center;
+}
+
+.amount-row > .filter-input:not(.amount-op),
+.amount-to .filter-input,
+.date-row .filter-input {
+  flex: 1 1 0;
+}
+
+/* The second amount of a "between" range, on its own line */
+.amount-to {
+  flex: 1 1 100%;
+}
+
+.amount-to[hidden] {
+  display: none;
+}
+
+.date-to,
+.amount-and {
+  flex: none;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.amount-and {
+  width: 98px;
+  text-align: right;
+}
+
+.filters-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 20px;
+  padding-top: 14px;
+  border-top: 1px solid var(--line-2);
+}
+
+/* Any / one / the other, drawn like the verdict tabs; real radios underneath */
+.segmented {
+  display: flex;
+  gap: 4px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--track);
+}
+
+.segmented label {
+  position: relative;
+  margin: 0;
+}
+
+.segmented input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.segmented span {
+  display: block;
+  padding: 6px 12px;
+  border-radius: 7px;
+  color: var(--ink-3);
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color .15s var(--ease-out), box-shadow .15s var(--ease-out);
+}
+
+.segmented span:hover {
+  background: rgba(255, 255, 255, .55);
+}
+
+.segmented input:checked + span {
+  background: var(--surface);
+  color: var(--ink);
+  box-shadow: 0 1px 2px rgba(20, 20, 25, .1);
+}
+
+.segmented input:focus-visible + span {
+  outline: var(--focus-outline);
+  outline-offset: 2px;
+}
+
+.filter-flags {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+  min-height: 39px;
+}
+
+.filter-flags label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--ink);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.filters-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 16px;
+}
+
+/* Two date fields side by side need two columns once there are two */
+@media (min-width: 560px) {
+  .filter-dates {
+    grid-column: span 2;
+  }
+}
+
+/* ---------- tender table ---------- */
+
+/*
+ * A real table (for screen readers) laid out as grid rows. Wide: the design's seven columns. 768-1199px:
+ * Organisation folds into the Tender column so Eligibility stays on screen. Below 768px: one card per tender.
+ */
+.tender-table {
+  --cols: 52px minmax(0, 2.6fr) minmax(0, 1.5fr) 120px 150px 190px 44px;
+  display: block;
+  width: 100%;
+  margin: 0;
+}
+
+.tender-table thead,
+.tender-table tbody {
+  display: block;
+}
+
+.tender-table tr {
+  display: grid;
+  grid-template-columns: var(--cols);
+  align-items: center;
+  padding: 0 8px;
+}
+
+.tender-table th,
+.tender-table td {
+  min-width: 0;
+  padding: 0;
+  border: 0;
+}
+
+.tender-table thead tr {
+  height: 40px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--surface-sunk);
+}
+
+.tender-table th {
+  color: var(--meta);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  text-align: left;
+}
+
+.sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font: inherit;
+  letter-spacing: inherit;
+  cursor: pointer;
+}
+
+.sort-button:hover {
+  color: var(--ink);
+}
+
+.sort-arrow {
+  font-size: 13px;
+}
+
+/*
+ * Cells share the row's first line: title, organisation, value, closing date and verdict read across on one
+ * baseline, with the checkbox and drop button beside it, however tall the verdict or organisation runs.
+ */
+.tender-table tbody tr {
+  align-items: first baseline;
+  padding: 16px 8px;
+  border-bottom: 1px solid var(--line-3);
+  background: var(--surface);
+  cursor: pointer;
+  transition: background-color .12s var(--ease-out);
+}
+
+/* A tender that cannot be selected (closed, or nothing to check): clicking its row does nothing */
+.tender-table tbody tr.is-locked {
+  cursor: default;
+}
+
+.tender-table tbody tr:hover {
+  background: var(--hover);
+}
+
+.tender-table tbody tr.is-selected {
+  background: var(--accent-wash);
+}
+
+.tender-table tbody tr.is-dropped > td {
+  opacity: .5;
+}
+
+.tender-table tbody tr.is-dropped > .cell-drop,
+.tender-table tbody tr.is-dropped:focus-within > td {
+  opacity: 1;
+}
+
+.tender-table tbody tr.message-row {
+  display: block;
+  padding: 56px 16px;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+  cursor: default;
+}
+
+.tender-table tbody tr.message-row:hover {
+  background: var(--surface);
+}
+
+.message-row td {
+  display: block;
+}
+
+.message-error {
+  color: var(--not-fg);
+}
+
+.message-hint {
+  margin: 4px 0 14px;
+  color: var(--meta);
+  font-size: 13px;
+}
+
+.cell-check {
+  display: grid;
+  place-items: center;
+}
+
+tbody .cell-check {
+  align-self: start;
+  padding-top: 1px;
+}
+
+.cell-tender {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-right: 28px !important;
+}
+
+.tender-title {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  text-wrap: pretty;
+}
+
+/*
+ * TenderTiger often sends titles, organisations and places in lower case. A title gets a capital first letter
+ * here; organisations and places are title-cased in app.js (titleCase), which keeps "of", "and" and the like
+ * lower case. Only first letters are raised, so abbreviations already in capitals (NIT, PWD) stay as they are.
+ */
+.tender-title::first-letter,
+#details-title::first-letter {
+  text-transform: uppercase;
+}
+
+.tender-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.tender-meta .tcno {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+}
+
+.tender-meta .ref {
+  font-family: var(--font-mono);
+}
+
+.org-inline {
+  display: none;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.cell-org {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-right: 20px !important;
+}
+
+.org-name {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+}
+
+.org-loc {
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.cell-value {
+  padding-right: 20px !important;
+  text-align: right !important;
+  font-family: var(--font-mono);
+  font-size: 14px;
+  font-weight: 500;
+  line-height: 1.4;
+  font-variant-numeric: tabular-nums;
+}
+
+th.cell-value {
+  font-family: var(--font-sans);
+  font-size: 12px;
+}
+
+.unit {
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.cell-closes {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 5px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.days-pill {
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--none-bg);
+  color: var(--none-fg);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.days-urgent {
+  background: var(--not-bg);
+  color: var(--not-fg);
+}
+
+.days-near {
+  background: var(--review-bg);
+  color: var(--review-fg);
+}
+
+.verdict-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+  min-width: 0;
+}
+
+.cell-drop {
+  display: grid;
+  place-items: center;
+}
+
+/* Rows: checkbox and drop button sit on the first line with the title, not on a baseline of their own */
+tbody .cell-drop {
+  align-self: start;
+  margin-top: -4px;
+}
+
+.row-drop {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--faint);
+  font-size: 18px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background-color .12s var(--ease-out), border-color .12s var(--ease-out), color .12s var(--ease-out);
+}
+
+.row-drop .bi-arrow-counterclockwise {
+  font-size: 14px;
+}
+
+.row-drop:hover {
+  border-color: var(--control-line);
+  background: var(--surface);
+  color: var(--ink);
+}
+
+/* ---------- verdict pills ---------- */
+
+.pill {
+  --tone-bg: var(--none-bg);
+  --tone-fg: var(--none-fg);
+  --tone-dot: var(--none-dot);
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 4px 10px;
+  border-radius: 999px;
+  background: var(--tone-bg);
+  color: var(--tone-fg);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+  transition: box-shadow .15s var(--ease-out);
+}
+
+.pill-dot {
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tone-dot);
+}
+
+.tone-eligible { --tone-bg: var(--eligible-bg); --tone-fg: var(--eligible-fg); --tone-dot: var(--eligible-dot); }
+.tone-review { --tone-bg: var(--review-bg); --tone-fg: var(--review-fg); --tone-dot: var(--review-dot); }
+.tone-not { --tone-bg: var(--not-bg); --tone-fg: var(--not-fg); --tone-dot: var(--not-dot); }
+.tone-failed { --tone-bg: var(--failed-bg); --tone-fg: var(--failed-fg); --tone-dot: var(--failed-dot); }
+.tone-processing { --tone-bg: var(--processing-bg); --tone-fg: var(--processing-fg); --tone-dot: var(--processing-dot); }
+
+@keyframes tp-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: .35; }
+}
+
+.tone-processing .pill-dot {
+  animation: tp-pulse 1s ease-in-out infinite;
+}
+
+/* A pill with a result opens the analysis */
+.pill-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 0;
+  border: 0;
+  border-radius: 999px;
+  background: none;
+  cursor: pointer;
+}
+
+.pill-chevron {
+  color: var(--faint);
+  font-size: 11px;
+  transition: transform .15s var(--ease-out), color .15s var(--ease-out);
+}
+
+.pill-button:hover .pill {
+  box-shadow: inset 0 0 0 1px color-mix(in oklch, var(--tone-fg) 35%, transparent);
+}
+
+.pill-button:hover .pill-chevron {
+  color: var(--ink);
+  transform: translateX(2px);
+}
+
+.verdict-note {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  color: var(--meta);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+/* The JV line under a row's verdict reason */
+.jv-note .dot {
+  display: inline-block;
+  margin-right: 6px;
+  vertical-align: 1px;
+}
+
+.decision-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.decision-shortlisted {
+  color: var(--eligible-fg);
+}
+
+.decision-dropped {
+  color: var(--muted);
+}
+
+/*
+ * A verdict landing while the page is watched: a blue wash drains from the row and the verdict is
+ * uncovered left to right, in reading order. Only for tenders finishing in front of the user.
+ */
+@keyframes tint-drain {
+  from { background-color: var(--accent-soft); }
+}
+
+@keyframes verdict-uncover {
+  from { clip-path: inset(0 100% 0 0); }
+  to { clip-path: inset(0 0 0 0); }
+}
+
+.tender-table tbody tr.just-landed {
+  animation: tint-drain 1.4s var(--ease-out);
+}
+
+.just-landed .verdict-stack {
+  animation: verdict-uncover .45s var(--ease-out) both;
+}
+
+.panel-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--surface-sunk);
+  color: var(--meta);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.panel-foot[hidden] {
+  display: none;
+}
+
+/* The footer's right side: the hint (one page) or the pager, with the page size beside it */
+.foot-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 20px;
+  margin-left: auto;
+}
+
+.page-size {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  white-space: nowrap;
+}
+
+/* A compact select, as tall as the small buttons beside it */
+.page-size .select {
+  flex: none;
+  width: 76px;
+  min-width: 0;
+  height: 32px;
+  padding: 0 28px 0 10px;
+  background-position: right 9px center;
+  color: var(--ink);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  transition: border-color .15s var(--ease-out);
+}
+
+.page-size .select:hover {
+  border-color: var(--control-line-hover);
+}
+
+/* Pages of the list. TenderTiger gives no total, so it is Previous / Next around where the list is */
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pager[hidden] {
+  display: none;
+}
+
+/* Wide enough for "Loading page 12…", so the buttons stay put while it changes */
+.pager-status {
+  min-width: 10.5em;
+  color: var(--meta);
+  text-align: center;
+  white-space: nowrap;
+}
+
+.pager-status strong {
+  color: var(--ink);
+  font-weight: 500;
+}
+
+/* The page being replaced while the next one loads */
+.tender-table tbody {
+  transition: opacity .15s var(--ease-out);
+}
+
+.tender-table[aria-busy="true"] tbody {
+  opacity: .5;
+  pointer-events: none;
+}
+
+/* ---------- run panel ---------- */
+
+.run-panel {
+  position: relative;
+  padding: 16px 20px 18px;
+}
+
+.run-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 12px 20px;
+}
+
+.run-text {
+  flex: 1 1 22rem;
+  min-width: 0;
+  padding-right: 32px;
+}
+
+.run-title {
+  margin: 0 0 4px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.run-detail,
+.run-stage {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.run-detail {
+  font-size: 14px;
+}
+
+.run-detail .tcno {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.run-stage {
+  margin-top: 2px;
+  color: var(--meta);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+}
+
+.run-eta {
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.run-dismiss {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+}
+
+.run-progress {
+  height: 4px;
+  margin-top: 14px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--track);
+}
+
+.run-progress[hidden] {
+  display: none;
+}
+
+.run-bar {
+  width: 0;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width .6s var(--ease-out);
+}
+
+/* A finished run reads as the shortlist it produced: each count shows those tenders */
+.run-detail.run-outcome {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 20px;
+  margin: 6px 0 2px;
+  overflow: visible;
+  white-space: normal;
+}
+
+.run-count {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--ink);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: .25em;
+  cursor: pointer;
+  transition: text-decoration-color .15s var(--ease-out);
+}
+
+.run-count:hover {
+  text-decoration-color: currentColor;
+}
+
+.run-muted {
+  color: var(--meta);
+  font-size: 14px;
+}
+
+/* ---------- how it works ---------- */
+
+.help-heading {
+  margin: 0;
+}
+
+.help-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 16px 20px;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 600;
+  text-align: left;
+  cursor: pointer;
+}
+
+.help-state {
+  color: var(--meta);
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.help-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 28px;
+  padding: 20px 20px 24px;
+  border-top: 1px solid var(--line-3);
+}
+
+.help-body[hidden] {
+  display: none;
+}
+
+.help-item h3 {
+  margin: 0 0 8px;
+  color: var(--meta);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.help-item p {
+  margin: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.6;
+  text-wrap: pretty;
+}
+
+.help-item :is(p, ul) + p {
+  margin-top: 8px;
+}
+
+.help-verdicts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  color: var(--ink-2);
+  font-size: 13px;
+  line-height: 1.5;
+  list-style: none;
+}
+
+.help-verdicts li {
+  display: flex;
+  gap: 10px;
+}
+
+.help-verdicts .dot {
+  width: 8px;
+  height: 8px;
+  margin-top: 6px;
+}
+
+/* ---------- selection bar ---------- */
+
+@keyframes bar-in {
+  from { opacity: 0; transform: translate(-50%, 8px); }
+}
+
+.selection-bar {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  z-index: 1040;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 10px 10px 10px 18px;
+  border-radius: 12px;
+  background: var(--chrome);
+  color: var(--chrome-ink);
+  box-shadow: 0 16px 40px rgba(20, 20, 25, .25);
+  font-size: 14px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+  animation: bar-in .22s var(--ease-out);
+}
+
+.selection-bar[hidden] {
+  display: none;
+}
+
+.selection-text {
+  font-variant-numeric: tabular-nums;
+}
+
+.bar-link {
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--chrome-link);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.bar-link:hover {
+  color: #fff;
+}
+
+.button-bar {
+  height: 36px;
+  padding: 0 14px;
+}
+
+/* The Regenerate criteria switch, drawn for the dark bar */
+.bar-switch {
+  height: 36px;
+  border-color: rgba(255, 255, 255, .16);
+  background: transparent;
+  color: var(--chrome-link);
+}
+
+.bar-switch[hidden] {
+  display: none;
+}
+
+.bar-switch:hover,
+.bar-switch[aria-checked="true"] {
+  background: rgba(255, 255, 255, .08);
+  color: var(--chrome-ink);
+}
+
+.bar-switch .switch {
+  background: #4A4B50;
+}
+
+/* ---------- details modal ---------- */
+
+.modal {
+  --bs-modal-border-color: var(--line);
+  --bs-modal-border-radius: 14px;
+  --bs-modal-inner-border-radius: 13px;
+  --bs-modal-header-border-color: var(--line-2);
+  --bs-modal-footer-border-color: var(--line-2);
+  --bs-modal-box-shadow: 0 24px 60px rgba(20, 20, 25, .18);
+}
+
+.modal-backdrop {
+  --bs-backdrop-bg: #16171A;
+  --bs-backdrop-opacity: .45;
+}
+
+.modal-header {
+  gap: 12px;
+  padding: 18px 20px;
+}
+
+.modal-body {
+  padding: 20px;
+}
+
+.modal-footer {
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px 20px;
+  background: var(--surface-sunk);
+}
+
+.modal-footer > * {
+  margin: 0;
+}
+
+.footer-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.details-heading {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Not clamped: the modal is where the whole tender title gets read */
+.details-title {
+  margin: 0 0 6px;
+  font-size: 18px;
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+}
+
+.details-facts {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.details-facts .tcno {
+  color: var(--ink-3);
+  font-family: var(--font-mono);
+}
+
+.decision-button[aria-pressed="true"] {
+  font-weight: 600;
+}
+
+.decision-shortlist[aria-pressed="true"] {
+  border-color: color-mix(in oklch, var(--eligible-dot) 45%, white);
+  background: var(--eligible-bg);
+  color: var(--eligible-fg);
+}
+
+.decision-drop[aria-pressed="true"] {
+  border-color: color-mix(in oklch, var(--not-dot) 45%, white);
+  background: var(--not-bg);
+  color: var(--not-fg);
+}
+
+/* The decision first: verdict, then the criteria that decide it */
+/* Tinted by the verdict's tone-* class; falls back to neutral */
+.summary {
+  margin-bottom: 28px;
+  padding: 16px 18px;
+  border: 1px solid color-mix(in oklch, var(--tone-dot, var(--line)) 35%, white);
+  border-radius: 12px;
+  background: var(--tone-bg, var(--surface-sunk));
+}
+
+.summary.tone-failed {
+  border-color: var(--line);
+  background: var(--surface-sunk);
+}
+
+.summary-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+}
+
+.summary-head .pill {
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.summary-headline {
+  font-size: 16px;
+  font-weight: 600;
+}
+
+/* Secondary text on a tinted panel takes the panel's hue, not grey */
+.summary-counts {
+  margin: 6px 0 0;
+  color: var(--tone-fg, var(--muted));
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.summary-section-title {
+  margin: 20px 0 8px;
+  color: var(--tone-fg);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.summary-section-title.section-plain {
+  color: var(--ink-2);
+}
+
+.summary-action {
+  margin: 8px 0 12px;
+  font-size: 14px;
+}
+
+.criteria-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.criterion {
+  padding: 10px 0;
+  border-top: 1px solid rgba(20, 20, 25, .08);
+}
+
+.criterion:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+
+.criterion-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.criterion-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 14px;
+  margin: 4px 0 0;
+  font-size: 13px;
+}
+
+.criterion-facts dt {
+  color: var(--tone-fg, var(--muted));
+  font-weight: 500;
+}
+
+.criterion-facts dd {
+  margin: 0;
+  overflow-wrap: break-word;
+}
+
+.criterion-facts .source {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.technical-detail {
+  margin-top: 12px;
+  font-size: 13px;
+}
+
+.technical-detail summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.technical-detail code {
+  display: block;
+  margin-top: 6px;
+  color: var(--ink-2);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.analysis-title {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.analysis {
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: break-word;
+}
+
+.analysis h4, .analysis h5, .analysis h6 {
+  margin-top: 20px;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.analysis .table {
+  --bs-table-bg: var(--surface);
+  --bs-table-border-color: var(--line);
+  margin-bottom: 16px;
+  font-size: 13px;
+}
+
+.analysis th,
+.analysis td {
+  padding: 7px 10px;
+}
+
+.analysis th {
+  background: var(--surface-sunk);
+  color: var(--muted);
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.analysis tr.row-not-met > td {
+  --bs-table-bg: var(--not-bg);
+}
+
+/* The Source column names files: mono, like the source lines of the summary */
+.analysis td.cell-source {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.analysis .status-not-met { color: var(--not-fg); font-weight: 600; }
+.analysis .status-unknown { color: var(--review-fg); font-weight: 600; }
+.analysis .status-met { color: var(--eligible-fg); font-weight: 600; }
+
+/* A criterion of the route comparison that is not met alone but met as JV lead member */
+.analysis tr.row-jv-helps > td {
+  --bs-table-bg: var(--eligible-bg);
+}
+
+/* ---------- bidding alone vs as JV lead member ---------- */
+
+.route-compare .summary-section-title:first-child {
+  margin-top: 0;
+}
+
+.routes {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 12px;
+}
+
+.route {
+  padding: 12px 14px;
+  border: 1px solid color-mix(in oklch, var(--tone-dot) 35%, white);
+  border-radius: 10px;
+  background: var(--tone-bg);
+}
+
+.route.tone-none {
+  --tone-bg: var(--surface);
+  --tone-fg: var(--muted);
+  --tone-dot: var(--none-dot);
+}
+
+.route-label {
+  margin-bottom: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.route .pill {
+  background: var(--surface);
+  font-size: 13px;
+}
+
+.route-note {
+  margin: 8px 0 0;
+  color: var(--tone-fg);
+  font-size: 13px;
+}
+
+.compare-note {
+  margin: 16px 0 8px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.route-compare .analysis {
+  margin-top: 16px;
+}
+
+.compare-note + .analysis {
+  margin-top: 0;
+}
+
+.route-compare .analysis .table {
+  margin-bottom: 0;
+}
+
+.compare-status {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+}
+
+.compare-source {
+  display: block;
+  color: var(--meta);
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.compare-muted {
+  color: var(--meta);
+}
+
+.analysis pre {
+  padding: 12px;
+  border-radius: 8px;
+  background: var(--surface-sunk);
+  white-space: pre-wrap;
+}
+
+.analysis .plain-text {
+  font-family: var(--font-mono);
+  font-size: 13px;
+}
+
+.details-files {
+  margin-top: 20px;
+  font-size: 13px;
+}
+
+.details-files summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.details-files li {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.details-files .folder {
+  margin: 8px 0 0;
+  color: var(--meta);
+  overflow-wrap: anywhere;
+}
+
+.details-criteria {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px 12px;
+  margin-top: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.details-criteria p {
+  flex: 1 1 320px;
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.details-criteria .actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.details-run {
+  margin: 16px 0 0;
+  color: var(--meta);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---------- company profile editor ---------- */
+
+.profile-form {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.profile-label {
+  display: block;
+  margin-bottom: 6px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 500;
+}
+
+.profile-input {
+  display: block;
+  width: 100%;
+  padding: 0 12px;
+  border: 1px solid var(--control-line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 14px;
+}
+
+input.profile-input {
+  height: 38px;
+}
+
+.profile-text {
+  padding: 8px 12px;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.profile-heading-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Each numbered section starts on a divider, like the sections of the profile document */
+.profile-heading-row-2 {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-2);
+}
+
+.profile-heading-row-3 {
+  margin-top: 4px;
+}
+
+.profile-heading {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  font-weight: 600;
+}
+
+.profile-heading-2 {
+  font-size: 15px;
+}
+
+.profile-heading-3 {
+  color: var(--ink-3);
+  font-size: 13px;
+}
+
+/*
+ * A heading you can type into. At rest it reads as a heading; hover shows the field. The negative margin keeps
+ * its text aligned with the content below.
+ */
+.profile-heading-input {
+  display: block;
+  width: calc(100% + 9px);
+  height: 34px;
+  margin-left: -9px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  transition: border-color .15s var(--ease-out), background-color .15s var(--ease-out);
+}
+
+.profile-heading-input:hover {
+  border-color: var(--control-line);
+  background: var(--surface);
+}
+
+.profile-heading-input::placeholder {
+  color: var(--meta);
+  font-weight: 500;
+}
+
+.profile-remove-heading {
+  color: var(--faint);
+}
+
+/* Section-level actions: a step up from the tables' Add row link */
+.profile-section-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.profile-add-heading {
+  align-self: flex-start;
+}
+
+.profile-form-end {
+  margin-top: 12px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-2);
+}
+
+.profile-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.profile-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.profile-table th {
+  padding: 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface-sunk);
+  color: var(--muted);
+  font-weight: 500;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.profile-table td {
+  padding: 0;
+  border-top: 1px solid var(--line-3);
+}
+
+.profile-table tbody tr:first-child td {
+  border-top: 0;
+}
+
+.profile-table td + td:not(.profile-remove-cell),
+.profile-table th + th:not(.profile-remove-cell) {
+  border-left: 1px solid var(--line-3);
+}
+
+/* A column name you can type into, with its remove button */
+.profile-col {
+  display: flex;
+  align-items: center;
+}
+
+.profile-col-input {
+  flex: 1;
+  min-width: 100px;
+  height: 34px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font: inherit;
+  transition: background-color .15s var(--ease-out);
+}
+
+.profile-col-input:hover {
+  background: var(--hover);
+}
+
+.profile-col-input::placeholder {
+  color: var(--meta);
+}
+
+.profile-col-remove {
+  width: 26px;
+  height: 26px;
+  margin-right: 4px;
+  color: var(--faint);
+  font-size: 12px;
+}
+
+/* With a mouse, a column's remove button shows only on that column; touch screens always show it */
+@media (hover: hover) {
+  .profile-col-remove {
+    opacity: 0;
+    transition: opacity .15s var(--ease-out);
+  }
+
+  .profile-table th:hover .profile-col-remove,
+  .profile-table th:focus-within .profile-col-remove {
+    opacity: 1;
+  }
+}
+
+/* Fields sit flush in the grid; hover and focus show which one is being edited */
+.profile-cell {
+  display: block;
+  width: 100%;
+  min-width: 130px;
+  height: 38px;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+  transition: background-color .15s var(--ease-out);
+}
+
+.profile-cell:hover {
+  background: var(--hover);
+}
+
+/* The first column names the row (Company Name, FY24, Package A ...) */
+.profile-cell-key {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+.profile-input:focus,
+.profile-heading-input:focus,
+.profile-col-input:focus,
+.profile-cell:focus {
+  outline: var(--focus-outline);
+  outline-offset: -2px;
+  background: var(--surface);
+}
+
+.profile-remove-cell {
+  width: 40px;
+  text-align: center;
+}
+
+.profile-remove {
+  margin: 0 auto;
+  color: var(--faint);
+}
+
+.profile-table-foot {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  margin-top: 8px;
+}
+
+.profile-add,
+.profile-add-col,
+.profile-remove-table {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 13px;
+}
+
+/* Removing is quieter than adding: grey, and set apart on the right */
+.profile-remove-table {
+  margin-left: auto;
+  color: var(--muted);
+}
+
+.profile-remove-table:hover {
+  color: var(--ink);
+}
+
+.company-note {
+  flex: 1 1 280px;
+  color: var(--meta);
+  font-size: 13px;
+}
+
+/* ---------- toasts ---------- */
+
+.app-toast {
+  border: 0;
+  border-radius: 10px;
+  background: var(--chrome);
+  color: var(--chrome-ink);
+  box-shadow: 0 16px 40px rgba(20, 20, 25, .25);
+  font-size: 14px;
+}
+
+.app-toast .toast-body {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+
+.app-toast .dot {
+  transform: translateY(-1px);
+}
+
+/* ---------- narrower screens ---------- */
+
+@media (max-width: 1199.98px) {
+  .tender-table {
+    --cols: 44px minmax(0, 1fr) 112px 140px minmax(150px, 190px) 44px;
+  }
+
+  /* Search gets its own row, so its placeholder is never cut; the other controls share the next one */
+  .search {
+    flex-basis: 100%;
+  }
+
+  #process-btn {
+    margin-left: auto;
+  }
+
+  .cell-org {
+    display: none !important;
+  }
+
+  .org-inline {
+    display: block;
+  }
+}
+
+@media (max-width: 767.98px) {
+  /* The company line moves under the brand, so the whole name stays readable */
+  .appbar {
+    flex-wrap: wrap;
+    height: auto;
+    min-height: 56px;
+    padding: 12px 16px;
+    row-gap: 8px;
+  }
+
+  .appbar-profile {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+    row-gap: 4px;
+  }
+
+  .appbar-company {
+    overflow: visible;
+    white-space: normal;
+  }
+
+  /* The full analysis table becomes one block per criterion, each cell labelled with its column */
+  .analysis .table thead {
+    display: none;
+  }
+
+  .analysis .table,
+  .analysis .table tbody,
+  .analysis .table tr,
+  .analysis .table td {
+    display: block;
+    width: 100%;
+  }
+
+  .analysis .table tr {
+    margin-bottom: 10px;
+    padding: 8px 12px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+  }
+
+  .analysis .table tr.row-not-met {
+    border-color: color-mix(in oklch, var(--not-dot) 35%, white);
+    background: var(--not-bg);
+  }
+
+  .analysis .table tr.row-jv-helps {
+    border-color: color-mix(in oklch, var(--eligible-dot) 35%, white);
+    background: var(--eligible-bg);
+  }
+
+  .analysis .table td {
+    padding: 4px 0;
+    border-width: 0;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  .analysis .table td[data-label]::before {
+    content: attr(data-label);
+    display: block;
+    color: var(--muted);
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: .02em;
+  }
+
+  .page {
+    padding: 20px 16px;
+  }
+
+  .tender-table thead {
+    display: none;
+  }
+
+  .tender-table tbody tr {
+    grid-template-columns: 32px minmax(0, 1fr) auto;
+    grid-template-areas:
+      "check tender drop"
+      "check verdict verdict"
+      "check closes value";
+    gap: 12px 8px;
+    padding: 16px 12px;
+  }
+
+  .tender-table tbody .cell-check { grid-area: check; }
+  .tender-table tbody .cell-tender { grid-area: tender; padding-right: 0 !important; }
+  .tender-table tbody .cell-verdict { grid-area: verdict; }
+  .tender-table tbody .cell-closes { grid-area: closes; }
+  .tender-table tbody .cell-value { grid-area: value; align-self: end; padding-right: 0 !important; }
+  .tender-table tbody .cell-drop { grid-area: drop; align-self: start; }
+
+  .cell-closes::before,
+  .cell-value::before {
+    content: attr(data-label);
+    display: block;
+    margin-bottom: 2px;
+    color: var(--meta);
+    font-family: var(--font-sans);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .select {
+    flex: 1 1 200px;
+  }
+
+  .selection-bar {
+    right: 12px;
+    left: 12px;
+    flex-wrap: wrap;
+    gap: 10px 14px;
+    white-space: normal;
+    transform: none;
+    animation: none;
+  }
+
+  .selection-text {
+    flex: 1 1 100%;
+  }
+}
+
+/* Reduced motion keeps colour changes that carry meaning and drops movement */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0s !important;
+  }
+
+  .tone-processing .pill-dot,
+  .just-landed .verdict-stack,
+  .selection-bar {
+    animation: none;
+  }
+}
