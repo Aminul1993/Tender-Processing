@@ -1,5 +1,9 @@
 # Tender Processing
 
+[![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![Ollama](https://img.shields.io/badge/Ollama-000000?logo=ollama&logoColor=white)](https://ollama.com)
+[![Bootstrap 5](https://img.shields.io/badge/Bootstrap-5-7952B3?logo=bootstrap&logoColor=white)](https://getbootstrap.com)
+
 A FastAPI web app that lists your subscribed tenders, and for the ones you select: downloads the documents,
 unpacks every zip (nested zips too), reads each file, and checks the company's eligibility with the LLM
 pipeline in [ext.py](ext.py). Tenders are processed one at a time in the background while the page shows
