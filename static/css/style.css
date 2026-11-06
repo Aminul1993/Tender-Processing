@@ -1386,6 +1386,15 @@ tbody .cell-drop {
   line-height: 1.35;
 }
 
+/* Under a row's verdict reason when some of its statuses were marked by user */
+.user-note {
+  color: var(--ink-3);
+}
+
+.user-note .bi {
+  margin-right: 5px;
+}
+
 /* The JV line under a row's verdict reason */
 .jv-note .dot {
   display: inline-block;
@@ -1965,6 +1974,74 @@ tbody .cell-drop {
   font-weight: 600;
 }
 
+/* The criterion's name and its status, which the bid team can change; the status wraps under a long name */
+.criterion-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px 12px;
+}
+
+.criterion-head .criterion-name {
+  flex: 1 1 220px;
+  min-width: 0;
+}
+
+/* The compact 32px select, like the page size */
+select.select.status-select {
+  flex: none;
+  min-width: 0;
+  height: 32px;
+  padding: 0 30px 0 10px;
+  background-position: right 10px center;
+  font-size: 13px;
+}
+
+/* A status changed by hand: the tag, what the AI said, and Reset. Neutral, not blue: it is data, not an action;
+   on the tinted summary its text takes the panel's fg */
+.criterion-mark {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  margin-top: 6px;
+  color: var(--tone-fg, var(--muted));
+  font-size: 12px;
+}
+
+.user-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border: 1px solid color-mix(in oklch, var(--tone-dot, var(--line)) 35%, white);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-2);
+  font-weight: 600;
+}
+
+/* Under the files the AI could not read: why they matter, and the button recording that someone checked them */
+.unreadable-action {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 12px;
+  margin-top: 10px;
+}
+
+.unreadable-action p {
+  margin: 0;
+  color: var(--tone-fg, var(--muted));
+  font-size: 13px;
+}
+
+/* The Met criteria, folded under their heading */
+.met-criteria > summary {
+  cursor: pointer;
+}
+
 .criterion-facts {
   display: grid;
   grid-template-columns: max-content minmax(0, 1fr);
@@ -2012,6 +2089,13 @@ tbody .cell-drop {
   margin: 0 0 12px;
   font-size: 15px;
   font-weight: 600;
+}
+
+/* Over the AI's analysis once a status was marked by user, which it does not show */
+.analysis-note {
+  margin: 0 0 12px;
+  color: var(--muted);
+  font-size: 13px;
 }
 
 .analysis {
@@ -2171,6 +2255,11 @@ tbody .cell-drop {
   font-size: 12px;
 }
 
+/* A tender file that opens in a new tab; long names with no spaces still wrap */
+.file-link {
+  overflow-wrap: anywhere;
+}
+
 .details-files .folder {
   margin: 8px 0 0;
   color: var(--meta);
@@ -2208,6 +2297,245 @@ tbody .cell-drop {
   color: var(--meta);
   font-size: 12px;
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------- deep analysis ---------- */
+
+/* A second opinion between the verdict summary and the AI's full analysis */
+.deep {
+  margin-bottom: 28px;
+}
+
+.deep-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  margin-bottom: 12px;
+}
+
+.deep-head .analysis-title {
+  margin: 0;
+}
+
+.deep-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 16px;
+}
+
+.deep .details-criteria {
+  margin-top: 0;
+}
+
+.deep-meta {
+  margin: -6px 0 12px;
+  color: var(--meta);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.deep-intro {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* The result or profile changed since: a neutral note, not a verdict tone */
+.deep-stale {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 12px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-sunk);
+  color: var(--ink-2);
+  font-size: 13px;
+}
+
+.deep-stale .bi {
+  margin-top: 1px;
+  color: var(--muted);
+}
+
+/* The agents at work: done, running (the processing tone, as the system acts for the user) or waiting */
+.deep-run {
+  padding: 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  font-size: 13px;
+}
+
+.deep-stage {
+  margin: 0 0 12px;
+  color: var(--processing-fg);
+  font-weight: 500;
+}
+
+.deep-agents {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.deep-agent {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--meta);
+}
+
+.deep-agent .bi {
+  color: var(--faint);
+}
+
+.deep-agent.is-done {
+  color: var(--ink-2);
+}
+
+.deep-agent.is-done .bi {
+  color: var(--ink-3);
+}
+
+.deep-agent.is-running {
+  color: var(--processing-fg);
+  font-weight: 600;
+}
+
+.deep-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  margin: 0 3px;
+  border-radius: 50%;
+  background: var(--processing-dot);
+  animation: tp-pulse 1s ease-in-out infinite;
+}
+
+.deep-time {
+  margin: 12px 0 0;
+  color: var(--meta);
+  font-variant-numeric: tabular-nums;
+}
+
+.deep-verdict {
+  margin-bottom: 4px;
+}
+
+.deep-summary {
+  margin: 8px 0 0;
+  font-size: 14px;
+}
+
+.deep .summary-section-title.section-plain {
+  margin-top: 24px;
+}
+
+/* Under a status in the matrix: why, in the agent's words */
+.deep-note {
+  display: block;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.deep-conflict {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 4px;
+  color: var(--ink-3);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.deep-confidence {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+.deep-matrix td:last-child {
+  white-space: nowrap;
+}
+
+/* Bias risk is about the marks, not the tender: weight and ink, never the verdict hues */
+.deep-risk {
+  flex: none;
+  padding: 2px 8px;
+  border: 1px solid var(--control-line);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--ink-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.deep-risk.risk-high {
+  border-color: var(--ink-3);
+  color: var(--ink);
+}
+
+.deep-risk.risk-low,
+.deep-risk.risk-none {
+  color: var(--muted);
+  font-weight: 500;
+}
+
+.deep .criteria-list .criterion:first-child {
+  padding-top: 10px;
+  border-top: 1px solid var(--line-2);
+}
+
+.deep-list {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.deep-list li + li {
+  margin-top: 8px;
+}
+
+.deep-log {
+  margin-top: 24px;
+  font-size: 13px;
+}
+
+.deep-log summary {
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.deep-log ol {
+  margin: 8px 0 0;
+  padding-left: 22px;
+  line-height: 1.5;
+}
+
+.deep-log li + li {
+  margin-top: 4px;
+}
+
+.deep-log-meta {
+  color: var(--meta);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .deep-dot {
+    animation: none;
+  }
 }
 
 /* ---------- company profile editor ---------- */

@@ -131,7 +131,7 @@ ELIGIBILITY_TASK = """Find every eligibility criterion in the document summaries
 For each criterion:
 1. State the requirement exactly as written, with its source file. If several sources state the same criterion, list it once and name them all.
 2. If the required value depends on another figure (such as estimated cost), work it out and show the calculation. Bring both sides to the same unit before comparing (1 crore = 1,00,00,000 rupees = 10,000,000; 1 lakh = 1,00,000 rupees) and show the conversion.
-3. Compare it with the company details and mark it Met, Not met, or Cannot determine.
+3. Compare it with the company details and mark it Met, Not met, or Cannot determine. For similar work or experience, judge each of the company's projects by what it was (its name, client and kind of work) against this tender's definition of similar work. Ignore any "similar" label in the company details: what counts as similar differs from tender to tender.
 4. Briefly explain, quoting the company figures you used.
 
 Then check the joint venture (JV) or consortium terms:
@@ -139,7 +139,12 @@ Then check the joint venture (JV) or consortium terms:
 6. If a JV is allowed, take every criterion of the first table, with the same name and in the same order, and state what the lead member, each other member and the JV as a whole must meet, as written or worked out. Then add the requirements that apply only to a JV, such as the lead member's minimum share. Compare the company with what the lead member must meet and mark it Met, Not met, or Cannot determine.
 7. List the other JV conditions, such as the lead member's minimum share, a JV agreement, or members not bidding separately.
 
-Use only the company details given below and do not assume any value. If a criterion needs information that is not provided, mark it Cannot determine and say what is missing.
+Use only the company details given below. Mark each criterion by these rules, so that the same documents and company details always get the same result:
+- Met: the company details state what the criterion needs, and it satisfies the requirement.
+- Not met: the company details state it, and it falls short.
+- Cannot determine: the company details do not state it, or the documents do not give the required value (such as a turnover "as indicated in the bid document"). Say what is missing. Do not infer a fact the company details do not state, such as the company's country from its address, or its MSE category from a Udyam number.
+- An exemption or relaxation (for MSEs, startups and the like) is not a criterion of its own: apply it to the criterion it relaxes, and only when the company details state that the company qualifies for it.
+- Leave out terms that are not conditions for bidding, such as purchase preferences, price matching, and payment or delivery terms.
 
 Write plain text, not LaTeX: use symbols such as ≥, ≤ and × directly.
 
@@ -151,11 +156,26 @@ Finish with an overall verdict (Eligible, Not eligible, or Cannot determine) for
 Company details:
 {company_details}"""
 
-def make_model():
-    """Returns the chat model used to summarize documents and check eligibility, with retries."""
+# The ollama.com models of the two LLM steps. Of the free-plan models tried on real tenders, gemma4 summarises
+# fastest with the fewest tokens and keeps every figure. gpt-oss:120b checks the criteria at about 1k more tokens a
+# tender.
+SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', 'gemma4:31b-cloud')
+ASSESSMENT_MODEL = os.getenv('ASSESSMENT_MODEL', 'gpt-oss:120b-cloud')
+# The ollama.com model that reads the pages of a scanned PDF (markitdown-ocr); it must accept images ('vision')
+OCR_MODEL = os.getenv('OCR_MODEL', 'gemma4:31b-cloud')
+# The models of the LLM agents of a deep analysis (services/deep_analysis_service.py), each ASSESSMENT_MODEL unless
+# set: the profiler checks the company data, the audit matches it against every criterion, the status review
+# questions the statuses marked by user, and the supervisor settles their disagreements
+DEEP_PROFILER_MODEL = os.getenv('DEEP_PROFILER_MODEL', ASSESSMENT_MODEL)
+DEEP_AUDIT_MODEL = os.getenv('DEEP_AUDIT_MODEL', ASSESSMENT_MODEL)
+DEEP_STATUS_REVIEW_MODEL = os.getenv('DEEP_STATUS_REVIEW_MODEL', ASSESSMENT_MODEL)
+DEEP_SUPERVISOR_MODEL = os.getenv('DEEP_SUPERVISOR_MODEL', ASSESSMENT_MODEL)
+
+def make_model(model=SUMMARY_MODEL):
+    """Returns the ollama.com chat model named model, with retries."""
     return ChatOllama(
         base_url="https://ollama.com",
-        model="gemma4:31b-cloud",
+        model=model,
         validate_model_on_init=False,
         temperature=0,
         client_kwargs={"timeout": 120},

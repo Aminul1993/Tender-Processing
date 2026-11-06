@@ -1,5 +1,6 @@
 """JSON API used by the tender page. Every error response has the shape {"error": "<message>"}."""
 import logging
+import mimetypes
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
@@ -7,7 +8,7 @@ from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -15,8 +16,10 @@ from ext import company_details, save_company_details
 from services import tender_service
 from services.company_service import EMPTY_PROFILE, company_profile, parse_profile, render_profile, unnamed_part
 from services.decision_service import DecisionStore
-from services.processing_service import NoJobRunning, TenderProcessor
+from services.deep_analysis_service import DeepAnalysisRunner, DeepAnalysisRunning
+from services.processing_service import NoJobRunning, TenderBusy, TenderProcessor
 from services.tender_service import TenderServiceError
+from utils.files import safe_name
 
 log = logging.getLogger(__name__)
 
@@ -27,6 +30,8 @@ BODY_ERRORS = {
     'process_tenders': ('Send a JSON body like {"tcnos": ["100091540"]} with at least one TCNO, and optionally '
                         '"regenerate": true.'),
     'set_decision': 'Send a JSON body like {"decision": "dropped"}; use "shortlisted", "dropped" or null.',
+    'mark_criterion': 'Send a JSON body like {"status": "met"}; use "met", "not_met", "unknown" or null.',
+    'check_unreadable': 'Send a JSON body like {"checked": true}.',
     'save_company': 'Send a JSON body like {"blocks": [...]}, with the blocks GET /api/company returns.',
 }
 
@@ -46,9 +51,19 @@ def get_company_file(request: Request) -> Path:
     return request.app.state.company_file
 
 
+def get_deep_analyses(request: Request) -> DeepAnalysisRunner:
+    """The app's DeepAnalysisRunner, created in create_app()."""
+    return request.app.state.deep_analyses
+
+
+# Tender files of these types open in the browser. Any other is downloaded, so a web page or script among a
+# tender's files never runs as part of the app
+INLINE_TYPES = {'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'text/plain'}
+
 Processor = Annotated[TenderProcessor, Depends(get_processor)]
 Decisions = Annotated[DecisionStore, Depends(get_decisions)]
 CompanyFile = Annotated[Path, Depends(get_company_file)]
+DeepAnalyses = Annotated[DeepAnalysisRunner, Depends(get_deep_analyses)]
 
 
 Comparison = Literal['gt', 'gte', 'lt', 'lte', 'eq', 'between']
@@ -107,6 +122,14 @@ class ProcessRequest(BaseModel):
 
 class DecisionRequest(BaseModel):
     decision: Literal['shortlisted', 'dropped'] | None  # required; null clears the decision
+
+
+class StatusRequest(BaseModel):
+    status: Literal['met', 'not_met', 'unknown'] | None  # required; null goes back to the model's status
+
+
+class CheckedRequest(BaseModel):
+    checked: bool
 
 
 # The company profile as the editor's form blocks; see company_service.parse_profile()
@@ -207,6 +230,86 @@ def result(tcno: str, processor: Processor):
     if tender_result is None:
         raise HTTPException(404, f'No result for TCNO {tcno} yet.')
     return tender_result
+
+
+@api.get('/files/{tcno}/{name:path}')
+def tender_file(tcno: str, name: str, processor: Processor):
+    """
+    Returns one of the tender's downloaded documents, name being its path as the result's files list it. PDFs,
+    images and plain text open in the browser; other types (Word, Excel, zip, ...) are downloaded.
+    """
+    path = processor.tender_file(tcno, name)
+    if path is None:
+        raise HTTPException(404, f'Tender {tcno} has no file {name}. Its documents may have been downloaded again.')
+    media_type = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
+    return FileResponse(path, media_type=media_type, filename=path.name,
+                        content_disposition_type='inline' if media_type in INLINE_TYPES else 'attachment',
+                        headers={'X-Content-Type-Options': 'nosniff'})
+
+
+@api.put('/result/{tcno}/criteria/{index}')
+def mark_criterion(tcno: str, index: int, payload: StatusRequest, processor: Processor):
+    """
+    Sets the status of one criterion by hand, posted as {"status": "met" | "not_met" | "unknown" | null}, where
+    null goes back to the model's; index is its position in the result's criteria. The verdict then follows the
+    statuses. Returns the updated full result.
+    """
+    return _change_result(tcno, lambda: processor.mark_criterion(tcno, index, payload.status))
+
+
+@api.put('/result/{tcno}/unreadable-checked')
+def check_unreadable(tcno: str, payload: CheckedRequest, processor: Processor):
+    """
+    Records that the team checked the files the model could not read itself, posted as {"checked": true}, or
+    takes it back with false. Checked, they no longer keep the verdict from Eligible. Returns the updated result.
+    """
+    return _change_result(tcno, lambda: processor.check_unreadable(tcno, payload.checked))
+
+
+@api.post('/deep-analysis/{tcno}', status_code=202)
+def start_deep_analysis(tcno: str, deep: DeepAnalyses):
+    """
+    Starts a deep analysis of the tender's completed result: five agents review its criteria, the company profile,
+    the result and the statuses marked by hand, and the report is saved beside the result as deep_analysis.json.
+    One runs at a time; others wait their turn. Returns 202 with its state, as GET returns it.
+    """
+    try:
+        return deep.start(tcno)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except TenderBusy:
+        raise HTTPException(409, f'Tender {tcno} is being checked. Run the deep analysis once that is done.') from None
+    except DeepAnalysisRunning:
+        raise HTTPException(409, f'A deep analysis of tender {tcno} is already running.') from None
+
+
+@api.get('/deep-analysis/{tcno}')
+def deep_analysis(tcno: str, deep: DeepAnalyses):
+    """
+    The tender's deep analysis: whether one is queued, running, completed or failed (or none), the progress of a
+    running one, and the last saved report, with stale true when the result or company profile changed since.
+    """
+    return deep.state(tcno)
+
+
+@api.get('/deep-analysis/{tcno}/file')
+def deep_analysis_file(tcno: str, deep: DeepAnalyses):
+    """Downloads the tender's saved deep analysis report, deep_analysis.json."""
+    path = deep.path(tcno)
+    if not path.is_file():
+        raise HTTPException(404, f'Tender {tcno} has no deep analysis yet.')
+    return FileResponse(path, media_type='application/json', filename=f'deep_analysis_{safe_name(tcno)}.json',
+                        content_disposition_type='attachment', headers={'X-Content-Type-Options': 'nosniff'})
+
+
+def _change_result(tcno, change):
+    """Runs change, a hand edit of the tender's result, with its errors as HTTP errors."""
+    try:
+        return change()
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except TenderBusy:
+        raise HTTPException(409, f'Tender {tcno} is being checked. Change its result once that is done.') from None
 
 
 @api.put('/decision/{tcno}')

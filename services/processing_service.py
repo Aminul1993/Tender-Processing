@@ -16,8 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ext import COMPANY_DETAILS_FILE, TENDERTIGER_BLOCKED
-from services.analysis_service import (CRITERIA_FILE, RESULT_FILE, process_tender_files, recheck_saved_criteria,
-                                       tender_files)
+from services.analysis_service import (CRITERIA_FILE, RESULT_FILE, TokenUsage, criterion_key, jv_verdict,
+                                       process_tender_files, recheck_saved_criteria, statuses_verdict, tender_files)
 from services.download_service import DownloadError, download_tender_documents
 from services.tender_service import has_documents, prequalification_url
 from utils.files import safe_name
@@ -40,6 +40,10 @@ class NoJobRunning(Exception):
     """There is no running job to stop."""
 
 
+class TenderBusy(Exception):
+    """The tender is queued or being processed, so its result is about to be replaced."""
+
+
 class TenderProcessor:
     """
     Owns the processing job and the latest result of every processed tender.
@@ -51,10 +55,11 @@ class TenderProcessor:
     """
 
     def __init__(self, target_directory, download_timeout=120, max_download_bytes=500 * 1024 * 1024,
-                 company_file=COMPANY_DETAILS_FILE):
+                 max_file_chars=300_000, company_file=COMPANY_DETAILS_FILE):
         self.target_directory = Path(target_directory)
         self.download_timeout = download_timeout
         self.max_download_bytes = max_download_bytes
+        self.max_file_chars = max_file_chars
         self.company_file = company_file
         self._lock = threading.Lock()
         self._job = None
@@ -65,6 +70,14 @@ class TenderProcessor:
     def criteria_file(self, tcno):
         """Where the tender's eligibility criteria are saved: CRITERIA_FILE in its folder."""
         return self.target_directory / safe_name(tcno) / CRITERIA_FILE
+
+    def tender_file(self, tcno, name):
+        """
+        The tender's document called name, its path in the tender folder as result['files'] lists it, or None.
+        Only a listed document is found, so no name can reach outside the folder or the saved criteria and result.
+        """
+        folder = self.target_directory / safe_name(tcno)
+        return next((path for path in tender_files(folder) if path.relative_to(folder).as_posix() == name), None)
 
     def _load_results(self):
         """The results saved in the tender folders by earlier runs. A file that cannot be read is skipped."""
@@ -176,6 +189,97 @@ class TenderProcessor:
         with self._lock:
             return {tcno: _summary(result) for tcno, result in self._results.items()}
 
+    def mark_criterion(self, tcno, index, status):
+        """
+        Sets the status of the criterion at index in the tender's result by hand: 'met', 'not_met' or 'unknown',
+        or None for the model's status again. Saves the result and returns it, with the score, counts and verdict
+        worked out again (see _restatus()). A re-check keeps the marks: see _carry_marks().
+        Raises LookupError without a completed result or such a criterion, TenderBusy while it is queued or
+        being processed, and OSError when the result cannot be saved (then nothing changes).
+        """
+        def change(result):
+            if not 0 <= index < len(result['criteria']):
+                raise LookupError(f'Tender {tcno} has no criterion {index}.')
+            _mark(result['criteria'][index], status)
+            return f"criterion {result['criteria'][index]['criterion']!r} marked {status or 'as the model had it'}"
+        return self._change(tcno, change)
+
+    def check_unreadable(self, tcno, checked):
+        """
+        Records that the bid team checked the sources the model could not read (checked true), or takes that back.
+        Checked sources no longer keep a verdict worked out from the statuses from Eligible. Saves the result and
+        returns it; raises as mark_criterion() does, and LookupError when no source was unreadable.
+        """
+        def change(result):
+            unreadable = result.get('unreadable_files') or []
+            if not unreadable:
+                raise LookupError(f'Tender {tcno} has no unreadable files.')
+            if checked:
+                result['unreadable_checked'] = list(unreadable)
+            else:
+                result.pop('unreadable_checked', None)
+            return f"{len(unreadable)} unreadable source(s) {'checked' if checked else 'no longer checked'}"
+        return self._change(tcno, change)
+
+    def _change(self, tcno, change):
+        """
+        Applies change, a function editing a copy of the tender's completed result by hand and returning what it
+        did, works out again what follows from it (_restatus()), saves the result and returns it.
+        """
+        tcno = str(tcno)
+        with self._lock:
+            result = self._results.get(tcno)
+            if not result or result['status'] != 'completed':
+                raise LookupError(f'No completed result for TCNO {tcno}.')
+            items = self._job['items'] if self._job else []
+            if self._busy(tcno):
+                raise TenderBusy()
+            updated = copy.deepcopy(result)
+            done = change(updated)
+            _restatus(updated)
+            save_result(updated['folder'], updated)
+            self._results[tcno] = updated
+            # The job's item of this tender is what the page reads after a reload, so it shows the change too
+            for item in items:
+                if item['tcno'] == tcno and item['status'] == 'completed':
+                    item.update(_summary(updated))
+            log.info('Tender %s: %s by the user (now %s)', tcno, done, updated['verdict'])
+            return copy.deepcopy(updated)
+
+    def _carry_marks(self, tcno, result):
+        """
+        Marks again, on a new result, what the bid team marked by hand on the tender's last one: the statuses of
+        criteria with the same name, and the unreadable sources it checked that are still unreadable. Returns
+        True when anything was marked.
+        """
+        with self._lock:
+            last = self._results.get(tcno) or {}
+        marks = {criterion_key(criterion['criterion']): criterion['status']
+                 for criterion in last.get('criteria') or [] if criterion.get('marked_by_user')}
+        matched = 0
+        for criterion in result['criteria']:
+            status = marks.get(criterion_key(criterion['criterion']))
+            if status:
+                _mark(criterion, status)
+                matched += 1
+        if len(marks) > matched:
+            log.info('Tender %s: %d status(es) marked by the user match no criterion of the new result',
+                     tcno, len(marks) - matched)
+        checked = [source for source in last.get('unreadable_checked') or [] if source in result['unreadable_files']]
+        if checked:
+            result['unreadable_checked'] = checked
+        return bool(checked) or any(criterion.get('marked_by_user') for criterion in result['criteria'])
+
+    def busy(self, tcno):
+        """True while the tender is queued or being processed, so its result is about to be replaced."""
+        with self._lock:
+            return self._busy(str(tcno))
+
+    def _busy(self, tcno):
+        """busy() for the caller holding the lock."""
+        items = self._job['items'] if self._job else []
+        return any(item['tcno'] == tcno and item['status'] in ('queued', 'processing') for item in items)
+
     def _running(self):
         """True while a job is running. The caller holds the lock."""
         return bool(self._job and self._job['status'] == 'running')
@@ -243,11 +347,13 @@ class TenderProcessor:
     def _process(self, tender, regenerate=False):
         """
         Downloads, extracts and analyses one tender, or checks its saved criteria when it has them and
-        regenerate is false. Never raises: failures become a 'failed' result.
+        regenerate is false. Never raises: failures become a 'failed' result. Its 'tokens' are the LLM tokens
+        spent, failed or not: see TokenUsage.counts().
         """
         tcno = str(tender['tcno'])
         folder = self.target_directory / safe_name(tcno)
         criteria_file = self.criteria_file(tcno)
+        usage = TokenUsage()
 
         def set_stage(stage, step=None, steps=None):
             with self._lock:
@@ -266,9 +372,10 @@ class TenderProcessor:
             if result['rechecked']:
                 log.info('Tender %s: checking its saved criteria in %s', tcno, criteria_file)
                 result['files'] = [path.relative_to(folder).as_posix() for path in tender_files(folder)]
-                analysis = recheck_saved_criteria(folder, on_progress=set_stage, company_file=self.company_file)
+                analysis = recheck_saved_criteria(folder, on_progress=set_stage, company_file=self.company_file,
+                                                  usage=usage)
             else:
-                analysis = self._analyse_documents(tender, folder, result, set_stage)
+                analysis = self._analyse_documents(tender, folder, result, set_stage, usage)
             criteria = analysis.get('criteria') or []
             unreadable = analysis.get('unreadable_files') or []
             jv = analysis.get('jv')
@@ -276,6 +383,8 @@ class TenderProcessor:
             result.update(verdict=analysis['verdict'], details=analysis['details'], score=analysis['score'],
                           criteria=criteria, unreadable_files=unreadable, jv=jv, comparison=comparison,
                           checks=_checks(criteria, unreadable, jv, comparison))
+            if self._carry_marks(tcno, result):
+                _restatus(result)
             log.info('Tender %s: %s (score %s)', tcno, result['verdict'], result['score'])
         except Exception as exc:
             log.exception('Tender %s failed', tcno)
@@ -284,6 +393,10 @@ class TenderProcessor:
                           error_title=title, error_action=action)
         if criteria_file.is_file():
             result['criteria_file'] = str(criteria_file)
+        result['tokens'] = usage.counts()
+        log.info('Tender %s used %d LLM tokens: %d reading the criteria, %d for the result', tcno,
+                 result['tokens']['total']['total'], result['tokens']['criteria']['total'],
+                 result['tokens']['assessment']['total'])
         result['duration_seconds'] = round(time.monotonic() - started, 1)
         result['processed_at'] = _now()
         try:
@@ -292,8 +405,11 @@ class TenderProcessor:
             log.exception('Could not save the result of tender %s; it is lost on restart', tcno)
         return result
 
-    def _analyse_documents(self, tender, folder, result, set_stage):
-        """Downloads the tender's documents into folder (emptied first) and analyses them; sets result['files']."""
+    def _analyse_documents(self, tender, folder, result, set_stage, usage):
+        """
+        Downloads the tender's documents into folder (emptied first) and analyses them, counting the tokens in
+        usage; sets result['files'].
+        """
         tcno = str(tender['tcno'])
         prequalification_link = prequalification_url(tender)
         if has_documents(tender) or not prequalification_link:
@@ -311,7 +427,8 @@ class TenderProcessor:
             files = []
         result['files'] = [path.relative_to(folder).as_posix() for path in files]
         return process_tender_files(folder, on_progress=set_stage, company_file=self.company_file,
-                                    prequalification_link=prequalification_link)
+                                    prequalification_link=prequalification_link, usage=usage,
+                                    max_file_chars=self.max_file_chars)
 
 
 def save_result(folder, result):
@@ -376,11 +493,11 @@ def explain_error(exc):
     return ('The analysis failed', 'Retry. If it fails again, see logs/app.log.')
 
 
-def _checks(criteria, unreadable_files, jv=None, comparison=()):
+def _checks(criteria, unreadable_files, jv=None, comparison=(), unreadable_checked=()):
     """
     Counts and names that let the tender table explain a verdict without opening the analysis. jv holds whether a
     JV is allowed, its maximum members, the verdict for the company as JV lead member and, under lead, the same
-    counts for it, from the comparison rows.
+    counts for it, from the comparison rows. unreadable_checked are the unreadable sources the team checked.
     """
     def counts(rows):
         return {
@@ -394,10 +511,55 @@ def _checks(criteria, unreadable_files, jv=None, comparison=()):
     lead = [{'criterion': row['criterion'], 'status': row['lead_status']} for row in comparison if row['lead_status']]
     return {
         **counts(criteria),
+        'user_marked': sum(1 for row in criteria if row.get('marked_by_user')),
         'unreadable_files': len(unreadable_files),
+        'unreadable_checked': sum(1 for source in unreadable_files if source in unreadable_checked),
         'jv': {'allowed': jv['allowed'], 'max_members': jv['max_members'], 'verdict': jv.get('verdict'),
                'lead': counts(lead)},
     }
+
+
+def _mark(criterion, status):
+    """
+    Gives criterion the status marked by hand, keeping the model's as ai_status, with marked_by_user set. None, or
+    the model's own status, removes the mark.
+    """
+    ai_status = criterion.pop('ai_status', criterion['status'])
+    criterion.pop('marked_by_user', None)
+    if status is None or status == ai_status:
+        criterion['status'] = ai_status
+    else:
+        criterion.update(status=status, ai_status=ai_status, marked_by_user=True)
+
+
+def _restatus(result):
+    """
+    Works out again what follows from a completed result once the bid team marked criteria statuses or checked
+    the unreadable sources by hand: the score, the bidding-alone status of each comparison row, the verdict as JV
+    lead member, the checks, and the verdict. While anything is marked, the verdict follows the statuses
+    (statuses_verdict()), where only unreadable sources nobody checked keep it from Eligible, and the model's is
+    kept as ai_verdict; once nothing is, the model's verdict is back.
+    """
+    criteria = result['criteria']
+    unreadable = result.get('unreadable_files') or []
+    checked = result.get('unreadable_checked') or []
+    unchecked = [source for source in unreadable if source not in checked]
+    comparison = result.get('comparison') or []  # results saved before JV checking have none
+    if checked or any(criterion.get('marked_by_user') for criterion in criteria):
+        result.setdefault('ai_verdict', result['verdict'])
+        result['verdict'] = statuses_verdict([criterion['status'] for criterion in criteria], unchecked)
+    elif 'ai_verdict' in result:
+        result['verdict'] = result.pop('ai_verdict')
+    met = sum(1 for criterion in criteria if criterion['status'] == 'met')
+    result['score'] = round(100 * met / len(criteria)) if criteria else None
+    # compare_routes() lists the criteria first, in order
+    for row, criterion in zip(comparison, criteria):
+        if row['criterion'] == criterion['criterion']:
+            row['alone_status'] = criterion['status']
+    jv = result.get('jv')
+    if jv:
+        jv['verdict'] = jv_verdict(comparison, jv, unchecked)
+    result['checks'] = _checks(criteria, unreadable, jv, comparison, checked)
 
 
 def _summary(result):

@@ -94,6 +94,7 @@
     modalTitle: $('details-title'),
     modalFacts: $('details-facts'),
     modalSummary: $('details-summary'),
+    modalDeep: $('details-deep'),
     analysisSection: $('analysis-section'),
     modalContent: $('details-content'),
     modalFiles: $('details-files'),
@@ -162,6 +163,7 @@
     announced: '',
     selectionKey: '',         // what the selection bar shows, so the live region only speaks on change
     details: {tcno: null, text: '', order: []},  // the open modal: tender, copyable text, prev/next order
+    deep: {tcno: null, timer: null, status: null},  // the open tender's deep analysis, polled while it runs
     // The profile editor: the blocks being edited, and the saved blocks as JSON to spot unsaved edits
     company: {blocks: [], saved: '[]'},
     companyError: null,       // the editor's last save problem, closed again on the next save
@@ -606,6 +608,11 @@
       }, [pill(verdict.tone, verdict.label), icon('bi-chevron-right', 'pill-chevron')]);
       button.dataset.tcno = tcno;
       parts.push(button, note(evidence(result)));
+      const marked = !failed && result.checks ? result.checks.user_marked : 0;
+      if (marked) {
+        const text = `${marked} ${criteriaNoun(marked)} marked by user`;
+        parts.push(el('div', {cls: 'verdict-note user-note', attrs: {title: text}}, [icon('bi-person-check'), document.createTextNode(text)]));
+      }
       const jv = failed ? null : jvLine(result.checks && result.checks.jv);
       if (jv) parts.push(jv);
       if (failed) {
@@ -636,7 +643,12 @@
   function evidence(result) {
     if (result.status === 'failed') return result.error_title || 'Processing failed';
     const checks = result.checks;
-    const unreadable = checks && checks.unreadable_files ? `${plural(checks.unreadable_files, 'file')} unreadable` : '';
+    let unreadable = '';
+    if (checks && checks.unreadable_files) {
+      unreadable = checks.unreadable_checked >= checks.unreadable_files
+        ? `${plural(checks.unreadable_files, 'unreadable file')} checked by user`
+        : `${plural(checks.unreadable_files, 'file')} unreadable`;
+    }
     if (!checks || !checks.total) return ['No criteria found', unreadable].filter(Boolean).join(' · ');
     const parts = [];
     if (!checks.not_met.length && !checks.unknown.length) {
@@ -1300,6 +1312,9 @@
       document.createTextNode(' · '), el('span', {cls: wraps ? '' : 'text-nowrap', text}),
     ]));
     els.modalSummary.replaceChildren();
+    stopDeep();
+    els.modalDeep.hidden = true;
+    els.modalDeep.replaceChildren();
     els.analysisSection.hidden = false;
     els.modalContent.replaceChildren(el('div', {cls: 'text-center py-5', attrs: {style: 'color: var(--meta)'}}, [
       el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}),
@@ -1326,18 +1341,24 @@
   function renderDetails(result) {
     els.modalSummary.replaceChildren(decisionSummary(result));
     if (result.status !== 'failed' && result.jv) els.modalSummary.append(routeComparison(result));
+    if (result.status === 'completed') loadDeep(result.tcno);
     if (result.status === 'failed') {
       state.details.text = `${result.error_title || 'Processing failed'}. ${result.error_action || ''}\n\n${result.error || ''}`.trim();
       els.analysisSection.hidden = true;
     } else {
       state.details.text = result.details || '';
       els.modalContent.replaceChildren(renderMarkdown(state.details.text || 'No details were returned.'));
+      if (result.checks && result.checks.user_marked) {
+        els.modalContent.prepend(el('p', {
+          cls: 'analysis-note', text: 'The analysis as the AI wrote it, with its own statuses. Those marked by user above replace them.',
+        }));
+      }
     }
     els.copyBtn.disabled = !state.details.text;
     if (result.files && result.files.length) {
       els.modalFiles.replaceChildren(el('details', {cls: 'details-files'}, [
         el('summary', {text: `${plural(result.files.length, 'file')} in the tender`}),
-        el('ul', {cls: 'mt-2 mb-0'}, result.files.map((file) => el('li', {text: file}))),
+        el('ul', {cls: 'mt-2 mb-0'}, result.files.map((file) => el('li', {}, [fileLink(result.tcno, file)]))),
         el('p', {cls: 'folder', text: 'Result saved.'}),
       ]));
     }
@@ -1346,6 +1367,10 @@
     if (result.processed_at) run.push(`Processed ${formatDateTime(result.processed_at)}`);
     if (result.duration_seconds !== undefined) run.push(`took ${formatDuration(result.duration_seconds)}`);
     if (result.rechecked) run.push('checked against the saved criteria');
+    if (result.tokens) {
+      const count = (step) => result.tokens[step].total.toLocaleString('en-IN');
+      run.push(`${count('total')} LLM tokens (${count('criteria')} reading the criteria, ${count('assessment')} for the result)`);
+    }
     els.modalRun.textContent = run.join(' · ');
   }
 
@@ -1388,16 +1413,21 @@
       ]);
     }
 
-    const criteria = result.criteria || [];
+    // Each keeps its position in result.criteria, which is how a status changed by hand is saved
+    const criteria = (result.criteria || []).map((criterion, index) => ({...criterion, index}));
     const notMet = criteria.filter((c) => c.status === 'not_met');
     const unknown = criteria.filter((c) => c.status === 'unknown');
-    const met = criteria.length - notMet.length - unknown.length;
+    const metItems = criteria.filter((c) => c.status === 'met');
+    const met = metItems.length;
     const unreadable = result.unreadable_files || [];
+    const unread = unreadable.length && !unreadableChecked(result) ? unreadable.length : 0;
     const verdict = verdictOf(result.verdict);
 
     let headline;
     if (notMet.length) headline = `${notMet.length} ${criteriaNoun(notMet.length)} not met`;
     else if (unknown.length) headline = `${unknown.length} ${criteriaNoun(unknown.length)} could not be determined`;
+    // Why a tender meeting every criterion still needs review
+    else if (criteria.length && unread) headline = `${meetsAll(criteria.length)}, but ${plural(unread, 'file')} could not be read`;
     else if (criteria.length) headline = meetsAll(criteria.length);
     else headline = 'No criteria table in the analysis';
 
@@ -1409,22 +1439,69 @@
       const counts = [`${met} met`, `${notMet.length} not met`, `${unknown.length} undetermined`];
       children.push(el('p', {cls: 'summary-counts', text: `${criteria.length} ${criteriaNoun(criteria.length)}: ${counts.join(' · ')}`}));
     }
+    const list = (items) => el('ul', {cls: 'criteria-list'}, items.map((item) => criterionItem(item, result.tcno)));
     const section = (title, cls, items) => {
       if (!items.length) return;
       children.push(el('h3', {cls: `summary-section-title ${cls}`, text: title}));
-      children.push(el('ul', {cls: 'criteria-list'}, items.map(criterionItem)));
+      children.push(list(items));
     };
     section('Not met', 'tone-not', notMet);
     section('Could not be determined', 'tone-review', unknown);
-    if (unreadable.length) {
-      children.push(el('h3', {cls: 'summary-section-title section-plain', text: 'Not checked: files that could not be read'}));
-      children.push(el('ul', {cls: 'mb-0'}, unreadable.map((file) => el('li', {text: file}))));
+    // Folded away, as they decide nothing, but listed so a wrong Met can be changed too
+    if (metItems.length) {
+      children.push(el('details', {cls: 'met-criteria'}, [
+        el('summary', {cls: 'summary-section-title tone-eligible', text: `Met (${metItems.length})`}),
+        list(metItems),
+      ]));
     }
+    if (unreadable.length) children.push(...unreadableSection(result));
     if (!criteria.length) {
       children.push(el('p', {cls: 'summary-action mb-0', text: 'Read the full analysis below before deciding.'}));
     }
     return el('div', {cls: `summary tone-${verdict.tone}`}, children);
   }
+
+  const unreadableChecked = (result) => (result.unreadable_checked || []).length >= (result.unreadable_files || []).length;
+
+  /**
+   * The files the AI could not read. Until the bid team checks them itself, they keep the verdict from Eligible,
+   * so the section says so and offers to record the check, which is then tagged "Checked by user" with an Undo.
+   */
+  function unreadableSection(result) {
+    const checked = unreadableChecked(result);
+    const button = el('button', {
+      cls: `unreadable-toggle ${checked ? 'link-button' : 'button button-secondary button-sm'}`,
+      text: checked ? 'Undo' : 'I have checked these files',
+      attrs: {type: 'button'},
+    });
+    button.disabled = state.active.has(result.tcno);
+    button.addEventListener('click', () => checkUnreadable(result.tcno, !checked, button));
+    return [
+      el('h3', {
+        cls: 'summary-section-title section-plain',
+        text: checked ? 'Files the AI could not read' : 'Not checked: files that could not be read',
+      }),
+      // A file opens from here, to be checked by hand; the pre-qualification criteria or a note has no file
+      el('ul', {cls: 'mb-0'}, result.unreadable_files.map((file) => el('li', {},
+        [(result.files || []).includes(file) ? fileLink(result.tcno, file) : document.createTextNode(file)]))),
+      checked
+        ? el('div', {cls: 'criterion-mark'}, [userTag('Checked by user'), button])
+        : el('div', {cls: 'unreadable-action'}, [
+          el('p', {text: 'The verdict cannot be Eligible until someone checks these files by hand.'}), button,
+        ]),
+    ];
+  }
+
+  /** A tender file as a link opening it in a new tab: PDFs and images show there, Word and Excel files download. */
+  function fileLink(tcno, file) {
+    const path = file.split('/').map(encodeURIComponent).join('/');
+    return el('a', {
+      cls: 'file-link', text: file,
+      attrs: {href: `/api/files/${encodeURIComponent(tcno)}/${path}`, target: '_blank', rel: 'noopener', title: `Open ${file}`},
+    });
+  }
+
+  const userTag = (text) => el('span', {cls: 'user-tag'}, [icon('bi-person-check'), document.createTextNode(text)]);
 
   const STATUS_TEXT = {met: 'Met', not_met: 'Not met', unknown: 'Cannot determine'};
   const STATUS_CLASS = {met: 'status-met', not_met: 'status-not-met', unknown: 'status-unknown'};
@@ -1510,14 +1587,385 @@
     return el('div', {cls: 'analysis'}, [el('div', {cls: 'table-responsive'}, [table])]);
   }
 
-  function criterionItem(criterion) {
+  /**
+   * A criterion with its facts and its status, which the bid team can change when the AI got it wrong. A status
+   * changed by hand is tagged "Marked by user", with the AI's next to it and a Reset back to that.
+   */
+  function criterionItem(criterion, tcno) {
+    const busy = state.active.has(tcno);
+    const select = el('select', {
+      cls: 'select status-select', attrs: {'aria-label': `Status of ${criterion.criterion}`},
+    }, Object.entries(STATUS_TEXT).map(([value, text]) => el('option', {text, attrs: {value}})));
+    select.value = criterion.status;
+    select.disabled = busy;
+    select.dataset.index = criterion.index;
+    select.addEventListener('change', () => markCriterion(tcno, criterion, select.value, select));
+    const children = [el('div', {cls: 'criterion-head'}, [el('div', {cls: 'criterion-name', text: criterion.criterion}), select])];
+    if (criterion.marked_by_user) {
+      const reset = el('button', {
+        cls: 'link-button', text: 'Reset',
+        attrs: {type: 'button', 'aria-label': `Reset ${criterion.criterion} to the AI's status`},
+      });
+      reset.disabled = busy;
+      reset.addEventListener('click', () => markCriterion(tcno, criterion, null, select));
+      children.push(el('div', {cls: 'criterion-mark'}, [
+        userTag('Marked by user'),
+        el('span', {text: `AI said: ${STATUS_TEXT[criterion.ai_status] || criterion.ai_status}`}),
+        reset,
+      ]));
+    }
     return el('li', {cls: 'criterion'}, [
-      el('div', {cls: 'criterion-name', text: criterion.criterion}),
+      ...children,
       el('dl', {cls: 'criterion-facts'}, [
         el('dt', {text: 'Requirement'}), el('dd', {text: criterion.requirement || '—'}),
         el('dt', {text: 'Company'}), el('dd', {text: criterion.company || '—'}),
         el('dt', {text: 'Source'}), el('dd', {cls: 'source', text: criterion.source || '—'}),
       ]),
+    ]);
+  }
+
+  /**
+   * Saves a criterion's status changed by hand (null: back to the AI's), then redraws the analysis, where the
+   * criterion may move to another section, keeping focus on its status, and the tender's row with its new verdict.
+   */
+  async function markCriterion(tcno, criterion, status, select) {
+    select.disabled = true;
+    try {
+      const result = await api(`/api/result/${encodeURIComponent(tcno)}/criteria/${criterion.index}`, {
+        method: 'PUT', body: JSON.stringify({status}),
+      });
+      showChangedResult(result, `.status-select[data-index="${criterion.index}"]`);
+    } catch (error) {
+      toast(`Could not change the status of ${criterion.criterion}: ${error.message}`);
+      select.value = criterion.status;
+      select.disabled = false;
+    }
+  }
+
+  /** Records that the files the AI could not read were checked by hand (checked false takes that back). */
+  async function checkUnreadable(tcno, checked, button) {
+    button.disabled = true;
+    try {
+      const result = await api(`/api/result/${encodeURIComponent(tcno)}/unreadable-checked`, {
+        method: 'PUT', body: JSON.stringify({checked}),
+      });
+      showChangedResult(result, '.unreadable-toggle');
+    } catch (error) {
+      toast(`Could not record the check of the unreadable files: ${error.message}`);
+      button.disabled = false;
+    }
+  }
+
+  /**
+   * Shows a result changed by hand: the tender's row and the verdict filters, and the open analysis, with focus
+   * back on the control matching selector, unfolding the section it may have moved into.
+   */
+  function showChangedResult(result, selector) {
+    const tcno = result.tcno;
+    const summary = state.results.get(tcno);
+    if (summary) state.results.set(tcno, {...summary, verdict: result.verdict, score: result.score, checks: result.checks});
+    updateRow(tcno);
+    applyFilters();
+    if (state.details.tcno !== tcno) return;
+    renderDetails(result);
+    const control = els.modalSummary.querySelector(selector);
+    if (control) {
+      const folded = control.closest('details');
+      if (folded) folded.open = true;
+      control.focus();
+    }
+  }
+
+  /* ---------- deep analysis ---------- */
+
+  // The agents of a deep analysis, in the order they first run, by the keys /api/deep-analysis reports
+  const DEEP_AGENTS = [
+    ['ingestion', 'Ingestion & context'],
+    ['profiler', 'Company profiler'],
+    ['audit', 'Eligibility audit'],
+    ['status_review', 'Discrepancy & status review'],
+    ['supervisor', 'Supervisor / judge'],
+  ];
+  const DEEP_AGENT_NAMES = Object.fromEntries(DEEP_AGENTS);
+  const DEEP_POLL_MS = 2000;
+  const AUDIT_TEXT = {pass: 'Pass', fail: 'Fail', insufficient_data: 'Insufficient data', not_applicable: 'Not applicable'};
+  const AUDIT_CLASS = {pass: 'status-met', fail: 'status-not-met', insufficient_data: 'status-unknown'};
+  const FINAL_TEXT = {...STATUS_TEXT, not_applicable: 'Not applicable'};
+  const RISK_TEXT = {high: 'High bias risk', medium: 'Medium bias risk', low: 'Low bias risk', none: 'No bias risk'};
+  const ADVICE_TEXT = {keep: 'Keep the mark', revert: 'Go back to the AI\'s status', verify: 'Verify it before relying on it'};
+  const OVERRIDE_TEXT = {unreadable_checked: 'Unread files marked checked', decision: 'Shortlist or drop decision', verdict: 'Verdict'};
+  const ISSUE_TEXT = {missing: 'Missing', outdated: 'Outdated', mismatch: 'Inconsistent', expired: 'Expired', ambiguous: 'Unclear'};
+  const percent = (value) => (value === null || value === undefined ? '—' : `${Math.round(value * 100)}%`);
+
+  /** Loads the open tender's deep analysis and shows it. */
+  async function loadDeep(tcno) {
+    clearTimeout(state.deep.timer);
+    state.deep.tcno = tcno;
+    try {
+      const deep = await api(`/api/deep-analysis/${encodeURIComponent(tcno)}`);
+      if (state.deep.tcno === tcno) showDeep(deep);
+    } catch (error) {
+      if (state.deep.tcno !== tcno) return;
+      els.modalDeep.hidden = false;
+      els.modalDeep.replaceChildren(deepTitle(),
+        el('p', {cls: 'message-error', text: `Could not load the deep analysis: ${error.message}`}));
+    }
+  }
+
+  /** Shows a deep analysis state, polling again while it is queued or running, and says when it ends. */
+  function showDeep(deep) {
+    clearTimeout(state.deep.timer);
+    const was = state.deep.status;
+    state.deep.status = deep.status;
+    renderDeep(deep);
+    if (deep.status === 'queued' || deep.status === 'running') {
+      state.deep.timer = setTimeout(() => loadDeep(deep.tcno), DEEP_POLL_MS);
+    } else if (was === 'queued' || was === 'running') {
+      announce(deep.status === 'completed' ? 'The deep analysis is ready.' : 'The deep analysis failed.');
+    }
+  }
+
+  function stopDeep() {
+    clearTimeout(state.deep.timer);
+    state.deep = {tcno: null, timer: null, status: null};
+  }
+
+  async function startDeep(tcno, button) {
+    button.disabled = true;
+    try {
+      const deep = await api(`/api/deep-analysis/${encodeURIComponent(tcno)}`, {method: 'POST'});
+      if (state.deep.tcno !== tcno) return;
+      showDeep(deep);
+      // The button is gone: keep focus in the section, on its title
+      const title = $('deep-title');
+      if (title) title.focus();
+    } catch (error) {
+      toast(`Could not start the deep analysis: ${error.message}`);
+      button.disabled = false;
+    }
+  }
+
+  const deepTitle = () => el('h3', {cls: 'analysis-title', text: 'Deep analysis', attrs: {id: 'deep-title', tabindex: '-1'}});
+
+  function deepButton(tcno, text) {
+    const button = el('button', {cls: 'button button-secondary button-sm', text, attrs: {type: 'button'}});
+    if (state.active.has(tcno)) {
+      button.disabled = true;
+      button.title = 'Wait until the eligibility check of this tender finishes';
+    }
+    button.addEventListener('click', () => startDeep(tcno, button));
+    return button;
+  }
+
+  /**
+   * The deep analysis section: the offer to run one, the agents at work, why the last run failed, and the last
+   * report. Redrawn on every poll, keeping focus on the title if it was there.
+   */
+  function renderDeep(deep) {
+    const running = deep.status === 'queued' || deep.status === 'running';
+    const report = running ? null : deep.analysis;
+    const head = el('div', {cls: 'deep-head'}, [deepTitle()]);
+    if (report) {
+      head.append(el('div', {cls: 'deep-actions'}, [
+        el('a', {
+          cls: 'link-button', text: 'Download JSON',
+          attrs: {href: `/api/deep-analysis/${encodeURIComponent(deep.tcno)}/file`, download: ''},
+        }),
+        deepButton(deep.tcno, 'Run again'),
+      ]));
+    }
+    const children = [head];
+    if (running) children.push(deepProgress(deep));
+    else if (deep.status === 'failed') children.push(deepFailure(deep, !report));
+    else if (!report) children.push(deepOffer(deep.tcno));
+    if (report) children.push(...deepReport(deep, deep.status === 'failed'));
+    const refocus = document.activeElement && document.activeElement.id === 'deep-title';
+    els.modalDeep.hidden = false;
+    els.modalDeep.replaceChildren(...children);
+    if (refocus) $('deep-title').focus();
+  }
+
+  function deepOffer(tcno) {
+    return el('div', {cls: 'details-criteria'}, [
+      el('p', {text: 'Five AI agents review the criteria, the company profile, this result and the statuses marked by '
+        + 'user, settle where they disagree, and give a determination with confidence scores and data gaps. It takes a '
+        + 'few minutes and leaves the result above as it is.'}),
+      el('div', {cls: 'actions'}, [deepButton(tcno, 'Run deep analysis')]),
+    ]);
+  }
+
+  /** The five agents: done, running (with the processing dot) or waiting, under what the running one does. */
+  function deepProgress(deep) {
+    const progress = deep.progress || {};
+    const queued = deep.status === 'queued';
+    const done = new Set(progress.done || []);
+    const steps = DEEP_AGENTS.map(([key, label]) => {
+      const now = queued ? 'waiting' : (progress.agent === key && 'running') || (done.has(key) ? 'done' : 'waiting');
+      const mark = now === 'running'
+        ? el('span', {cls: 'deep-dot', attrs: {'aria-hidden': 'true'}})
+        : icon(now === 'done' ? 'bi-check-circle' : 'bi-circle');
+      const round = now === 'running' && progress.round ? ` · re-examination ${progress.round}` : '';
+      return el('li', {cls: `deep-agent is-${now}`}, [
+        mark, el('span', {text: `${label}${round}`}), el('span', {cls: 'visually-hidden', text: ` (${now})`}),
+      ]);
+    });
+    return el('div', {cls: 'deep-run'}, [
+      el('p', {cls: 'deep-stage', text: queued ? 'Queued: one deep analysis runs at a time.' : progress.stage || 'Starting'}),
+      el('ol', {cls: 'deep-agents'}, steps),
+      el('p', {cls: 'deep-time', text: queued ? 'It starts when the one before it finishes.'
+        : `Running for ${formatDuration(progress.elapsed_seconds || 0)}. You can close this window: the report is saved when it is done.`}),
+    ]);
+  }
+
+  function deepFailure(deep, withButton) {
+    return el('div', {cls: 'summary tone-failed'}, [
+      el('div', {cls: 'summary-head'}, [
+        pill('failed', 'Failed'), el('span', {cls: 'summary-headline', text: deep.error_title || 'The deep analysis failed'}),
+      ]),
+      el('p', {cls: 'summary-action', text: deep.error_action || 'Run it again.'}),
+      withButton ? deepButton(deep.tcno, 'Run deep analysis again') : null,
+      el('details', {cls: 'technical-detail'}, [
+        el('summary', {text: 'Technical detail'}), el('code', {text: deep.error || 'No error message.'}),
+      ]),
+    ]);
+  }
+
+  /** The report: the determination first, then each criterion through every agent, the marks, gaps and log. */
+  function deepReport(deep, failedSince) {
+    const report = deep.analysis;
+    const final = report.final || {};
+    const verdict = verdictOf(final.determination);
+    const meta = [formatDateTime(report.finished_at)];
+    if (report.duration_seconds !== undefined) meta.push(`took ${formatDuration(report.duration_seconds)}`);
+    if (report.rounds) meta.push(plural(report.rounds, 're-examination round'));
+    if (report.tokens && report.tokens.total.total) meta.push(`${report.tokens.total.total.toLocaleString('en-IN')} LLM tokens`);
+    const nodes = [el('p', {cls: 'deep-meta', text: meta.filter(Boolean).join(' · ')})];
+    if (failedSince) nodes.unshift(el('p', {cls: 'deep-intro', text: 'The last deep analysis that finished:'}));
+    if (deep.stale) {
+      nodes.push(el('p', {cls: 'deep-stale'}, [icon('bi-exclamation-circle'), el('span', {
+        text: 'The result or the company profile has changed since this deep analysis. Run it again to review them as they are now.',
+      })]));
+    }
+    const panel = [
+      el('div', {cls: 'summary-head'}, [
+        pill(verdict.tone, verdict.label),
+        el('span', {cls: 'summary-headline', text: final.confidence === null || final.confidence === undefined
+          ? 'Confidence not given' : `Confidence ${percent(final.confidence)}`}),
+      ]),
+      el('p', {cls: 'summary-counts', text: final.agrees_with_current
+        ? 'Agrees with the verdict above.' : `Differs from the verdict above: ${verdictOf(final.current_verdict).label}.`}),
+    ];
+    if (final.summary) panel.push(el('p', {cls: 'deep-summary', text: final.summary}));
+    if ((final.deciding_criteria || []).length) {
+      panel.push(el('p', {cls: 'summary-counts', text: `Decided by ${final.deciding_criteria.join(', ')}`}));
+    }
+    nodes.push(el('div', {cls: `summary tone-${verdict.tone} deep-verdict`}, panel));
+
+    const section = (title, children) => {
+      if (!children.length) return;
+      nodes.push(el('h4', {cls: 'summary-section-title section-plain', text: title}), ...children);
+    };
+    section('Criteria matrix', (report.criteria || []).length ? [deepMatrix(report.criteria)] : []);
+    section('Statuses marked by user', deepMarks(report.status_review || {}));
+    section('Data gaps', listOrEmpty(report.data_gaps, (gap) => [
+      el('strong', {text: gap.gap}),
+      deepNote([gap.needed_for && `For ${gap.needed_for}`, gap.severity && `${gap.severity} severity`].filter(Boolean).join(' · ')),
+      gap.how_to_close ? deepNote(`To close it: ${gap.how_to_close}`) : null,
+    ]));
+    section('Company profile checks', listOrEmpty(report.profile_flags, (flag) => [
+      el('strong', {text: `${ISSUE_TEXT[flag.issue] || flag.issue}: ${flag.field}`}),
+      document.createTextNode(` ${flag.detail}`),
+      deepNote([flag.needed_for && `Needed for ${flag.needed_for}`, flag.severity && `${flag.severity} severity`,
+        flag.verify_with && `verify with ${flag.verify_with}`].filter(Boolean).join(' · ')),
+    ]));
+    nodes.push(deepLog(report.audit_log || []));
+    return nodes;
+  }
+
+  const deepNote = (text) => (text ? el('span', {cls: 'deep-note', text}) : null);
+
+  /** A list of items, each drawn by item(), or nothing when there are none. */
+  const listOrEmpty = (items, item) => ((items || []).length
+    ? [el('ul', {cls: 'deep-list'}, items.map((entry) => el('li', {}, item(entry))))] : []);
+
+  /** One row per criterion: its status in this result, the audit's result, and the supervisor's final status. */
+  function deepMatrix(rows) {
+    const labels = ['Criterion', 'This result', 'Audit', 'Final', 'Confidence'];
+    const cell = (index, children) => el('td', {attrs: {'data-label': labels[index]}}, children);
+    const status = (cls, text) => el('span', {cls: `compare-status ${cls || ''}`.trim(), text});
+    const body = el('tbody', {}, rows.map((row) => {
+      const current = row.current_status
+        ? [status(STATUS_CLASS[row.current_status], STATUS_TEXT[row.current_status]),
+          row.marked_by_user ? deepNote(`Marked by user · AI said ${STATUS_TEXT[row.ai_status] || row.ai_status}`) : null]
+        : [el('span', {cls: 'compare-muted', text: 'Found by the audit only'})];
+      const tr = el('tr', {}, [
+        cell(0, [
+          el('strong', {text: row.criterion}),
+          row.source ? el('span', {cls: 'compare-source', text: row.source}) : null,
+          row.conflict ? el('span', {cls: 'deep-conflict'}, [icon('bi-arrow-left-right'), document.createTextNode('Agents disagreed')]) : null,
+        ]),
+        cell(1, current),
+        cell(2, row.audit_result
+          ? [status(AUDIT_CLASS[row.audit_result], AUDIT_TEXT[row.audit_result]), deepNote(row.audit_reason)]
+          : [el('span', {cls: 'compare-muted', text: 'Not assessed'})]),
+        cell(3, [status(STATUS_CLASS[row.final_status], FINAL_TEXT[row.final_status] || row.final_status),
+          deepNote(row.resolution || row.basis)]),
+        cell(4, [el('span', {cls: 'deep-confidence', text: percent(row.confidence)})]),
+      ]);
+      if (row.final_status === 'not_met') tr.classList.add('row-not-met');
+      return tr;
+    }));
+    const table = el('table', {cls: 'table table-sm table-bordered align-top deep-matrix'}, [
+      el('thead', {}, [el('tr', {}, labels.map((text) => el('th', {attrs: {scope: 'col'}, text})))]),
+      body,
+    ]);
+    return el('div', {cls: 'analysis'}, [el('div', {cls: 'table-responsive'}, [table])]);
+  }
+
+  /** What the status review agent found in the statuses marked by user and the other overrides. */
+  function deepMarks(review) {
+    const nodes = [];
+    if (review.summary) nodes.push(el('p', {cls: 'deep-intro', text: review.summary}));
+    const fact = (term, text) => (text ? [el('dt', {text: term}), el('dd', {text})] : []);
+    const head = (name, risk) => el('div', {cls: 'criterion-head'}, [
+      el('div', {cls: 'criterion-name', text: name}),
+      el('span', {cls: `deep-risk risk-${risk}`, text: RISK_TEXT[risk] || risk}),
+    ]);
+    const items = (review.reviews || []).map((item) => el('li', {cls: 'criterion'}, [
+      head(item.criterion, item.bias_risk),
+      el('dl', {cls: 'criterion-facts'}, [
+        ...fact('Status', item.marked_by_user
+          ? `${STATUS_TEXT[item.user_status]}, marked by user; the AI said ${STATUS_TEXT[item.ai_status]}`
+          : `${STATUS_TEXT[item.ai_status]}, as the AI had it`),
+        ...fact('Audit', AUDIT_TEXT[item.audit_result] || 'Not assessed'),
+        ...fact('Finding', item.finding),
+        ...fact('Why it may be so', (item.possible_reasons || []).join('; ')),
+        ...fact('Advice', ADVICE_TEXT[item.recommendation] || item.recommendation),
+      ]),
+    ]));
+    items.push(...(review.overrides || []).map((item) => el('li', {cls: 'criterion'}, [
+      head(OVERRIDE_TEXT[item.kind] || item.kind, item.bias_risk),
+      el('dl', {cls: 'criterion-facts'}, [...fact('Override', item.detail), ...fact('Finding', item.finding)]),
+    ])));
+    if (items.length) nodes.push(el('ul', {cls: 'criteria-list'}, items));
+    return nodes;
+  }
+
+  /** Every step the agents took, folded away: when, which agent, what it found. */
+  function deepLog(entries) {
+    return el('details', {cls: 'deep-log'}, [
+      el('summary', {text: `Audit log (${plural(entries.length, 'step')})`}),
+      el('ol', {}, entries.map((entry) => {
+        const date = new Date(entry.at);
+        const when = Number.isNaN(date.getTime()) ? '' : `${formatClock(date)}:${pad(date.getSeconds())}`;
+        const who = `${DEEP_AGENT_NAMES[entry.agent] || entry.agent}${entry.round ? `, re-examination ${entry.round}` : ''}`;
+        // The model the step ran on, when it called one (each agent's is set in .env)
+        const model = entry.model ? [document.createTextNode(' '), el('span', {cls: 'deep-log-meta', text: entry.model})] : [];
+        return el('li', {}, [
+          el('span', {cls: 'deep-log-meta', text: when}), document.createTextNode(' '),
+          el('strong', {text: who}), ...model, document.createTextNode(` · ${entry.event}`),
+        ]);
+      })),
     ]);
   }
 
@@ -2074,6 +2522,7 @@
 
   // Bootstrap returns focus only for modals opened through data attributes: send it back to the row last viewed
   els.modal.addEventListener('hidden.bs.modal', () => {
+    stopDeep();
     const row = state.rows.get(state.details.tcno);
     const button = row && !row.hidden && row.querySelector('.pill-button');
     if (button) button.focus();

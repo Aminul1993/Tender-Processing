@@ -9,6 +9,16 @@
 | Years in Business | 18 Years |
 | PAN | AAAAA1234A |
 | GST | 19AAAAA1234A1Z1 |
+| Country of incorporation | India |
+| MSE category | Medium |
+| The Code on Wages 2019 | Full compliance |
+| The Industrial Relations Code 2020 | Full compliance |
+| The Occupational Safety | Full compliance |
+| Health and Working Conditions Code 2020 | Full compliance |
+| The Code on Social Security 2020 | Full compliance |
+| NIC code | 62011 |
+| Udyam Certificate Number | UDYAM-WB-02-0055555 |
+| Address |  Premises No. 03-319, Block DH-6/11, Action Area 1D, Street No. 319, New Town, Kolkata, West Bengal 700156 (also referenced with pin 700160) |
 
 ---
 
@@ -106,3 +116,23 @@
 | GST Registration | Yes |
 | PAN | Yes |
 | JV Documents (If Applicable) | N/A |
+
+---
+
+## 9. ITR
+
+| Item | Amount |
+| --- | --- |
+| FY24 | Filled |
+| FY25 | Filled |
+| FY26 | Filled |
+
+---
+
+## 10. List of available documents
+
+| Document | Available |
+| --- | --- |
+| Bank Pass Book | Yes |
+| Cancelled cheque | Yes |
+| Trade License | Yes |

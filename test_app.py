@@ -10,15 +10,22 @@ from pathlib import Path
 from unittest import mock
 
 from fastapi.testclient import TestClient
+from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
+from langchain_core.messages import AIMessage
+from PIL import Image
 
 from app import create_app
 from config import Config
-from ext import TENDERTIGER_BLOCKED, TenderTigerBlocked, company_details, save_company_details
+from ext import NOT_RELEVANT, TENDERTIGER_BLOCKED, TenderTigerBlocked, company_details, save_company_details
+from routes.api import BODY_ERRORS
 from services import tender_service
-from services.analysis_service import (CRITERIA_FILE, RESULT_FILE, compare_routes, jv_verdict, parse_criteria,
-                                       parse_jv, parse_score, parse_verdict, plain_maths, process_tender_files,
-                                       read_criteria, recheck_saved_criteria, tender_files)
+from services.analysis_service import (CRITERIA_FILE, RESULT_FILE, TokenUsage, compare_routes, jv_verdict,
+                                       parse_criteria, parse_jv, parse_score, parse_verdict, plain_maths,
+                                       process_tender_files, read_criteria, recheck_saved_criteria, tender_files)
 from services.company_service import company_profile, parse_profile, render_profile, unnamed_part
+from services import deep_analysis_service as deep
+from services.deep_analysis_service import (DEEP_ANALYSIS_FILE, LLM_AGENTS, MAX_ROUNDS, DeepAnalysisError,
+                                            parse_amount, parse_financial_year, parse_json_reply, run_deep_analysis)
 from services.download_service import DownloadError, download_tender_documents
 from services.processing_service import explain_error
 
@@ -87,6 +94,21 @@ class FakeResponse:
     def iter_content(self, chunk_size):
         for start in range(0, len(self.body), chunk_size):
             yield self.body[start:start + chunk_size]
+
+
+def counting_model(*replies):
+    """A chat model answering each call with the next (content, input tokens, output tokens), reported as ChatOllama does."""
+    return GenericFakeChatModel(messages=iter([
+        AIMessage(content=content, response_metadata={'model_name': 'gemma4:31b-cloud'},
+                  usage_metadata={'input_tokens': sent, 'output_tokens': received, 'total_tokens': sent + received})
+        for content, sent, received in replies
+    ]))
+
+
+def spend_tokens(usage, **steps):
+    """Makes one LLM call for each step through usage, a TokenUsage, using the (input, output) tokens given."""
+    for step, (sent, received) in steps.items():
+        usage.track(counting_model(('reply', sent, received)), step).invoke('prompt')
 
 
 class ParseTest(unittest.TestCase):
@@ -238,6 +260,7 @@ class AnalysisTestCase(unittest.TestCase):
         self.company_file = Path(self.tmp.name) / 'company_details.md'
         save_company_details(COMPANY, self.company_file)
         self.llm = mock.Mock()
+        self.llm.with_config.return_value = self.llm  # TokenUsage.track() binds the token counter to it
         for patch in (mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'}),
                       mock.patch('services.analysis_service.make_model', return_value=self.llm)):
             patch.start()
@@ -339,6 +362,154 @@ class SavedCriteriaTest(AnalysisTestCase):
         result = recheck_saved_criteria(self.folder, company_file=self.company_file)
         self.assertEqual((result['verdict'], result['criteria']), ('Requires Review', []))
         self.llm.invoke.assert_not_called()
+
+
+class FileSelectionTest(AnalysisTestCase):
+    """The tender files that are not sent to the LLM, to keep a tender's tokens down."""
+
+    def analyse(self, **options):
+        with mock.patch('services.analysis_service.summarize_for_goal', return_value='Turnover at least 5 Cr') as summarize:
+            result = process_tender_files(self.folder, company_file=self.company_file, **options)
+        return result, [call.args[1] for call in summarize.call_args_list]
+
+    def test_drawings_and_item_lists_are_not_read(self):
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        (self.folder / 'Drawings1.txt').write_text('Plan of the bridge', encoding='utf-8')
+        (self.folder / 'items.csv').write_text('Item Number,Item Title\n1,Salt', encoding='utf-8')
+        (self.folder / 'BOQ_301578.txt').write_text('Estimated cost: 98 Cr', encoding='utf-8')
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+
+        result, read = self.analyse()
+
+        self.assertEqual(read, ['Estimated cost: 98 Cr', 'Turnover at least 5 Cr'])
+        # Not read on purpose, so the check is still complete
+        self.assertEqual((result['verdict'], result['unreadable_files']), ('Eligible', []))
+
+    def test_a_file_over_the_length_limit_is_listed_as_not_checked(self):
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        (self.folder / 'DCA.txt').write_text('x' * 2001, encoding='utf-8')
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+
+        with self.assertLogs('services.analysis_service', 'WARNING'):
+            result, read = self.analyse(max_file_chars=2000)
+
+        self.assertEqual(read, ['Turnover at least 5 Cr'])
+        self.assertEqual(result['verdict'], 'Requires Review')
+        self.assertEqual(result['unreadable_files'],
+                         ['DCA.txt (too long: 2,001 characters; the MAX_FILE_CHARS limit is 2,000)'])
+        self.assertIn('- DCA.txt (too long: 2,001 characters', (self.folder / CRITERIA_FILE).read_text(encoding='utf-8'))
+
+
+class ScannedPdfTest(AnalysisTestCase):
+    """A PDF that MarkItDown finds no text in, such as a scan, is read by OCR_MODEL with markitdown-ocr."""
+
+    def setUp(self):
+        super().setUp()
+        # Two pages that are only images, with no text layer
+        pages = [Image.new('RGB', (850, 1100), 'white') for _ in range(2)]
+        pages[0].save(self.folder / 'scan.pdf', save_all=True, append_images=pages[1:])
+
+    def analyse(self, *page_texts):
+        """Checks the tender with the OCR of each page answered by page_texts in turn; an exception fails it."""
+        replies = iter(page_texts)
+
+        def invoke(messages):
+            if isinstance(messages[0]['content'], list):  # a page image to read
+                reply = next(replies)
+                if isinstance(reply, Exception):
+                    raise reply
+                return mock.Mock(content=reply)
+            return mock.Mock(content='**Overall verdict:** Eligible')
+
+        self.llm.invoke.side_effect = invoke
+        with mock.patch('services.analysis_service.summarize_for_goal', return_value='Turnover at least 5 Cr') as summarize:
+            result = process_tender_files(self.folder, company_file=self.company_file)
+        return result, [call.args[1] for call in summarize.call_args_list]
+
+    def test_a_scanned_pdf_is_read_with_ocr(self):
+        result, read = self.analyse('Turnover at least 5 Cr', 'Positive net worth')
+
+        self.assertEqual(len(read), 1)
+        self.assertIn('Turnover at least 5 Cr', read[0])
+        self.assertIn('Positive net worth', read[0])
+        self.assertEqual((result['verdict'], result['unreadable_files']), ('Eligible', []))
+        image = self.llm.invoke.call_args_list[0].args[0][0]['content'][1]['image_url']['url']
+        self.assertTrue(image.startswith('data:image/'))
+
+    def test_a_scan_with_a_page_ocr_could_not_read_is_listed_as_not_checked(self):
+        with self.assertLogs('services.analysis_service', 'WARNING') as logs:
+            result, read = self.analyse('Turnover at least 5 Cr', ConnectionError('timed out'))
+
+        self.assertIn('Could not OCR every page of scan.pdf: timed out', logs.output[0])
+        self.assertEqual((read, result['unreadable_files']), ([], ['scan.pdf']))
+
+    def test_a_scan_ocr_finds_no_text_in_is_listed_as_not_checked(self):
+        result, read = self.analyse('', '')
+        self.assertEqual((read, result['unreadable_files']), ([], ['scan.pdf']))
+
+
+class ModelChoiceTest(AnalysisTestCase):
+    """Each LLM step runs on its own model: one to summarise the documents, another for the final check."""
+
+    def test_documents_are_summarised_by_one_model_and_checked_by_another(self):
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        models = {'summary-model': mock.Mock(), 'assessment-model': mock.Mock()}
+        for llm in models.values():
+            llm.with_config.return_value = llm
+            llm.invoke.return_value = mock.Mock(content=ASSESSMENT)
+
+        # Named here, so the test does not depend on the models set in .env
+        with mock.patch.multiple('services.analysis_service', SUMMARY_MODEL='summary-model',
+                                 ASSESSMENT_MODEL='assessment-model', make_model=mock.Mock(side_effect=models.get)), \
+                mock.patch('services.analysis_service.summarize_for_goal', return_value='Turnover at least 5 Cr') as summarize:
+            process_tender_files(self.folder, company_file=self.company_file)
+            self.assertIs(summarize.call_args.args[0], models['summary-model'])
+            models['assessment-model'].invoke.assert_called_once()
+
+            recheck_saved_criteria(self.folder, company_file=self.company_file)
+            self.assertEqual(models['assessment-model'].invoke.call_count, 2)
+        models['summary-model'].invoke.assert_not_called()
+
+
+class TokenUsageTest(AnalysisTestCase):
+    """The LLM tokens of a tender, counted for reading its criteria and for its final check."""
+
+    def analyse(self, *replies, usage):
+        with mock.patch('services.analysis_service.make_model', return_value=counting_model(*replies)):
+            return process_tender_files(self.folder, company_file=self.company_file, usage=usage)
+
+    def test_tokens_are_counted_by_step(self):
+        (self.folder / 'BOQ.txt').write_text('Item rates', encoding='utf-8')
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        usage = TokenUsage()
+
+        result = self.analyse((NOT_RELEVANT, 800, 3), ('Turnover at least 5 Cr', 1000, 40), (ASSESSMENT, 500, 200),
+                              usage=usage)
+
+        self.assertEqual(result['verdict'], 'Not Eligible')
+        self.assertEqual(usage.counts(), {
+            'criteria': {'input': 1800, 'output': 43, 'total': 1843},
+            'assessment': {'input': 500, 'output': 200, 'total': 700},
+            'total': {'input': 2300, 'output': 243, 'total': 2543},
+        })
+
+        # A re-check reads no documents, so only its final check costs tokens
+        usage = TokenUsage()
+        with mock.patch('services.analysis_service.make_model', return_value=counting_model((ASSESSMENT, 300, 150))):
+            recheck_saved_criteria(self.folder, company_file=self.company_file, usage=usage)
+        self.assertEqual(usage.counts()['criteria'], {'input': 0, 'output': 0, 'total': 0})
+        self.assertEqual(usage.counts()['total'], {'input': 300, 'output': 150, 'total': 450})
+
+    def test_tokens_spent_before_a_failure_are_still_counted(self):
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        usage = TokenUsage()
+
+        with mock.patch('services.analysis_service.assess_eligibility', side_effect=ConnectionError('timed out')), \
+                self.assertRaises(ConnectionError):
+            self.analyse(('Turnover at least 5 Cr', 1000, 40), usage=usage)
+
+        self.assertEqual(usage.counts()['criteria'], {'input': 1000, 'output': 40, 'total': 1040})
+        self.assertEqual(usage.counts()['assessment']['total'], 0)
 
 
 class CompanyProfileTest(unittest.TestCase):
@@ -520,10 +691,13 @@ class ApiTest(unittest.TestCase):
         (folder / 'NIT.pdf').write_bytes(b'x')
         return [folder / 'NIT.pdf']
 
-    def fake_analysis(self, folder, on_progress=None, company_file=None, prequalification_link=None):
+    def fake_analysis(self, folder, on_progress=None, company_file=None, prequalification_link=None, usage=None,
+                      max_file_chars=None):
         self.company_file = company_file
         self.prequalification_link = prequalification_link
+        self.max_file_chars = max_file_chars
         time.sleep(self.analysis_delay)
+        spend_tokens(usage, criteria=(1000, 40), assessment=(500, 200))
         return {
             'verdict': 'Eligible', 'details': '## Result\nAll criteria met.', 'score': 50,
             'criteria': [
@@ -543,8 +717,9 @@ class ApiTest(unittest.TestCase):
             ],
         }
 
-    def fake_recheck(self, folder, on_progress=None, company_file=None):
+    def fake_recheck(self, folder, on_progress=None, company_file=None, usage=None):
         self.rechecked.append(folder.name)
+        spend_tokens(usage, assessment=(300, 150))
         return {'verdict': 'Not Eligible', 'details': '## Result\nNet worth not met.', 'score': 0,
                 'criteria': [{'criterion': 'Net worth', 'requirement': '20 Cr', 'company': '5 Cr',
                               'status': 'not_met', 'source': 'NIT.pdf'}],
@@ -605,14 +780,21 @@ class ApiTest(unittest.TestCase):
         result = self.client.get('/api/result/100091540').json()
         self.assertEqual((result['verdict'], result['score'], result['files']), ('Eligible', 50, ['NIT.pdf']))
         self.assertEqual(result['unreadable_files'], ['scan.pdf'])
+        self.assertEqual(result['tokens'], {
+            'criteria': {'input': 1000, 'output': 40, 'total': 1040},
+            'assessment': {'input': 500, 'output': 200, 'total': 700},
+            'total': {'input': 1500, 'output': 240, 'total': 1740},
+        })
         failed = self.client.get('/api/result/102309372').json()
         self.assertEqual(failed['error'], 'Download failed: 404')
         self.assertEqual(failed['error_title'], 'The documents could not be downloaded')
+        self.assertEqual(failed['tokens']['total'], {'input': 0, 'output': 0, 'total': 0})  # failed before any LLM call
 
         listed = self.client.get('/api/tenders').json()['tenders'][0]
         self.assertEqual(listed['result']['verdict'], 'Eligible')
         self.assertEqual(listed['result']['checks'], {
-            'total': 2, 'met': 1, 'not_met': [], 'unknown': ['Net worth'], 'unreadable_files': 1,
+            'total': 2, 'met': 1, 'not_met': [], 'unknown': ['Net worth'], 'user_marked': 0, 'unreadable_files': 1,
+            'unreadable_checked': 0,
             'jv': {'allowed': 'yes', 'max_members': 3, 'verdict': 'Requires Review',
                    'lead': {'total': 2, 'met': 1, 'not_met': [], 'unknown': ['Net worth']}}})
         self.assertEqual(result['jv']['conditions'], ['Lead member holds at least 51%'])
@@ -620,6 +802,7 @@ class ApiTest(unittest.TestCase):
         self.assertNotIn('details', listed['result'])
         self.assertIsNotNone(self.client.get('/api/progress').json()['average_seconds'])
         self.assertEqual(self.company_file, self.config.COMPANY_DETAILS_FILE)
+        self.assertEqual(self.max_file_chars, self.config.MAX_FILE_CHARS)
         self.assertEqual(self.prequalification_link, PREQUALIFICATION_LINK)
 
     def test_tender_without_documents_is_checked_on_its_pre_qualification_alone(self):
@@ -660,6 +843,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.rechecked, ['100091540'])
         self.assertEqual((result['verdict'], result['rechecked'], result['files']), ('Not Eligible', True, ['NIT.pdf']))
         self.assertEqual(result['criteria_file'], str(folder / CRITERIA_FILE))
+        self.assertEqual((result['tokens']['criteria']['total'], result['tokens']['assessment']['total']), (0, 450))
         self.assertIsNotNone(progress['average_recheck_seconds'])
         self.assertIsNone(progress['average_seconds'])  # a quick re-check must not shorten full-run estimates
 
@@ -671,6 +855,105 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((result['verdict'], result['rechecked']), ('Eligible', False))
         self.assertEqual(self.prequalification_link, PREQUALIFICATION_LINK)
 
+    def test_a_criterion_status_can_be_marked_by_hand_and_back(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+
+        response = self.client.put('/api/result/100091540/criteria/1', json={'status': 'not_met'})
+
+        self.assertEqual(response.status_code, 200)
+        result = response.json()
+        self.assertEqual(result['criteria'][1], {'criterion': 'Net worth', 'requirement': '20 Cr', 'company': '',
+                                                 'status': 'not_met', 'source': 'NIT.pdf', 'ai_status': 'unknown',
+                                                 'marked_by_user': True})
+        # The verdict follows the statuses now; the model's is kept
+        self.assertEqual((result['verdict'], result['ai_verdict'], result['score']), ('Not Eligible', 'Eligible', 50))
+        self.assertEqual((result['checks']['not_met'], result['checks']['user_marked']), (['Net worth'], 1))
+        self.assertEqual(result['comparison'][1]['alone_status'], 'not_met')
+        listed = self.client.get('/api/tenders').json()['tenders'][0]['result']
+        self.assertEqual((listed['verdict'], listed['checks']['user_marked']), ('Not Eligible', 1))
+        self.assertEqual(self.client.get('/api/progress').json()['items'][0]['verdict'], 'Not Eligible')
+        restarted = TestClient(create_app(self.config))
+        self.assertEqual(restarted.get('/api/result/100091540').json(), result)
+
+        result = self.client.put('/api/result/100091540/criteria/1', json={'status': None}).json()
+
+        self.assertEqual((result['criteria'][1]['status'], result['verdict']), ('unknown', 'Eligible'))
+        self.assertNotIn('marked_by_user', result['criteria'][1])
+        self.assertNotIn('ai_verdict', result)
+        self.assertEqual(self.client.put('/api/result/100091540/criteria/2', json={'status': 'met'}).status_code, 404)
+        self.assertEqual(self.client.put('/api/result/999/criteria/0', json={'status': 'met'}).status_code, 404)
+        refused = self.client.put('/api/result/100091540/criteria/0', json={'status': 'maybe'})
+        self.assertEqual((refused.status_code, refused.json()['error']), (400, BODY_ERRORS['mark_criterion']))
+
+    def test_tender_files_open_in_the_browser_or_download(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        folder = self.config.TARGET_DIRECTORY / '100091540'
+        (folder / 'BOQ part').mkdir()
+        (folder / 'BOQ part' / 'BOQ 1.xls').write_bytes(b'sheet')
+        (folder / 'page.html').write_bytes(b'<script>alert(1)</script>')
+
+        pdf = self.client.get('/api/files/100091540/NIT.pdf')
+        self.assertEqual((pdf.status_code, pdf.content), (200, b'x'))
+        self.assertEqual(pdf.headers['content-type'], 'application/pdf')
+        self.assertTrue(pdf.headers['content-disposition'].startswith('inline'))
+        sheet = self.client.get('/api/files/100091540/BOQ%20part/BOQ%201.xls')
+        self.assertEqual(sheet.content, b'sheet')
+        self.assertTrue(sheet.headers['content-disposition'].startswith('attachment'))
+        # A web page among the files is downloaded, never shown as part of the app
+        self.assertTrue(self.client.get('/api/files/100091540/page.html').headers['content-disposition'].startswith('attachment'))
+        for name in (RESULT_FILE, 'missing.pdf', '..%2F..%2Fcompany_details.md'):
+            self.assertEqual(self.client.get(f'/api/files/100091540/{name}').status_code, 404, name)
+
+    def test_files_the_ai_could_not_read_can_be_checked_by_hand(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        result = self.client.put('/api/result/100091540/criteria/1', json={'status': 'met'}).json()
+        # Every criterion is met, but scan.pdf was never read
+        self.assertEqual((result['score'], result['verdict']), (100, 'Requires Review'))
+
+        result = self.client.put('/api/result/100091540/unreadable-checked', json={'checked': True}).json()
+
+        self.assertEqual((result['verdict'], result['unreadable_checked']), ('Eligible', ['scan.pdf']))
+        self.assertEqual((result['checks']['unreadable_files'], result['checks']['unreadable_checked']), (1, 1))
+        self.assertEqual(result['jv']['verdict'], 'Requires Review')  # the lead member's net worth is still undetermined
+
+        # Regenerated, scan.pdf is unreadable again: the check stands, like the mark
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540'], 'regenerate': True})
+        self.wait_for_job()
+        result = self.client.get('/api/result/100091540').json()
+        self.assertEqual((result['verdict'], result['unreadable_checked']), ('Eligible', ['scan.pdf']))
+
+        result = self.client.put('/api/result/100091540/unreadable-checked', json={'checked': False}).json()
+        self.assertEqual(result['verdict'], 'Requires Review')
+        self.assertNotIn('unreadable_checked', result)
+        refused = self.client.put('/api/result/100091540/unreadable-checked', json={})
+        self.assertEqual((refused.status_code, refused.json()['error']), (400, BODY_ERRORS['check_unreadable']))
+
+    def test_marked_statuses_are_kept_by_a_recheck_and_locked_while_it_runs(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        self.client.put('/api/result/100091540/criteria/1', json={'status': 'met'})
+        folder = self.config.TARGET_DIRECTORY / '100091540'
+        (folder / CRITERIA_FILE).write_text('# Eligibility criteria\n\n## NIT.pdf\nNet worth 20 Cr\n', encoding='utf-8')
+
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+
+        # The re-check says Net worth is not met; the mark by hand stands, and decides the verdict
+        result = self.client.get('/api/result/100091540').json()
+        self.assertEqual(result['criteria'], [{'criterion': 'Net worth', 'requirement': '20 Cr', 'company': '5 Cr',
+                                               'status': 'met', 'source': 'NIT.pdf', 'ai_status': 'not_met',
+                                               'marked_by_user': True}])
+        self.assertEqual((result['verdict'], result['ai_verdict'], result['score']), ('Eligible', 'Not Eligible', 100))
+
+        self.analysis_delay = 0.5
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540'], 'regenerate': True})
+        self.wait_for(lambda progress: progress['items'][0]['status'] == 'processing')
+        self.assertEqual(self.client.put('/api/result/100091540/criteria/0', json={'status': None}).status_code, 409)
+        self.wait_for_job()
+
     def test_results_are_saved_in_the_tender_folder_and_survive_a_restart(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
         self.wait_for_job()
@@ -679,6 +962,7 @@ class ApiTest(unittest.TestCase):
         for tcno, result in before.items():
             saved = (self.config.TARGET_DIRECTORY / tcno / RESULT_FILE).read_text(encoding='utf-8')
             self.assertEqual(json.loads(saved), result)
+        self.assertEqual(before['100091540']['tokens']['total']['total'], 1740)  # saved with the result
         broken = self.config.TARGET_DIRECTORY / '999' / RESULT_FILE
         broken.parent.mkdir()
         broken.write_text('{"tcno": "999"', encoding='utf-8')
@@ -947,6 +1231,375 @@ class ApiTest(unittest.TestCase):
 
         self.assertEqual(self.client.post('/api/process-tenders', json={'tcnos': ['100091540']}).status_code, 202)
         self.wait_for_job()
+
+    # ---------- deep analysis ----------
+
+    def deep_agents(self, **replies):
+        """Answers the deep analysis agents with DEEP_REPLIES, or the replies given, for the rest of the test."""
+        agents = ScriptedAgents(**{**DEEP_REPLIES, **replies})
+        for patch in (mock.patch('services.deep_analysis_service.make_model', return_value=agents),
+                      mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'})):
+            patch.start()
+            self.addCleanup(patch.stop)
+        return agents
+
+    def wait_for_deep(self, tcno, status='completed'):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            state = self.client.get(f'/api/deep-analysis/{tcno}').json()
+            if state['status'] == status:
+                return state
+            time.sleep(0.02)
+        self.fail(f'the deep analysis did not reach {status}')
+
+    def test_a_deep_analysis_reviews_the_result_and_is_saved_beside_it(self):
+        agents = self.deep_agents()
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        self.client.put('/api/result/100091540/criteria/1', json={'status': 'met'})  # Net worth: the AI said unknown
+        self.client.put('/api/decision/100091540', json={'decision': 'shortlisted'})
+        self.assertEqual(self.client.get('/api/deep-analysis/100091540').json()['status'], 'none')
+
+        response = self.client.post('/api/deep-analysis/100091540')
+
+        self.assertEqual(response.status_code, 202)
+        self.assertIn(response.json()['status'], ('queued', 'running', 'completed'))
+        state = self.wait_for_deep('100091540')
+        report = state['analysis']
+        self.assertFalse(state['stale'])
+        self.assertEqual(agents.agents(), ['profiler', 'audit', 'status_review', 'supervisor'])
+        # The audit judges afresh: it is never shown the statuses, the marks or the verdict
+        audit_prompt = agents.calls[1][1][1]['content']
+        self.assertNotIn('marked by user', audit_prompt.lower())
+        self.assertIn('[1] Net worth', audit_prompt)
+        # The reviewer sees the mark, the AI's status and the decision
+        review_prompt = agents.calls[2][1][1]['content']
+        self.assertIn('Met, marked by user; the AI said Cannot determine', review_prompt)
+        self.assertIn("The bid team's decision: shortlisted", review_prompt)
+
+        self.assertEqual(report['final']['determination'], 'Requires Review')
+        self.assertEqual((report['final']['current_verdict'], report['final']['agrees_with_current']),
+                         ('Requires Review', True))
+        net_worth = report['criteria'][1]
+        self.assertEqual((net_worth['current_status'], net_worth['ai_status'], net_worth['marked_by_user'],
+                          net_worth['audit_result'], net_worth['final_status'], net_worth['conflict'],
+                          net_worth['bias_risk']),
+                         ('met', 'unknown', True, 'insufficient_data', 'unknown', True, 'high'))
+        self.assertEqual(report['inputs']['unreadable'], ['scan.pdf'])
+        self.assertEqual(report['inputs']['decision'], 'shortlisted')
+        self.assertEqual([entry['agent'] for entry in report['audit_log']], list(deep.AGENTS))
+
+        folder = self.config.TARGET_DIRECTORY / '100091540'
+        self.assertEqual(json.loads((folder / DEEP_ANALYSIS_FILE).read_text(encoding='utf-8')), report)
+        # Saved beside the result, which it leaves as it was, and never listed as one of the tender's documents
+        self.assertEqual(self.client.get('/api/result/100091540').json()['criteria'][1]['status'], 'met')
+        self.assertEqual(self.client.get(f'/api/files/100091540/{DEEP_ANALYSIS_FILE}').status_code, 404)
+        download = self.client.get('/api/deep-analysis/100091540/file')
+        self.assertEqual(download.json(), report)
+        self.assertTrue(download.headers['content-disposition'].startswith('attachment'))
+
+        # It survives a restart, and goes stale once the result it reviewed changes
+        restarted = TestClient(create_app(self.config))
+        self.assertEqual(restarted.get('/api/deep-analysis/100091540').json()['analysis'], report)
+        self.client.put('/api/result/100091540/criteria/1', json={'status': None})
+        self.assertTrue(self.client.get('/api/deep-analysis/100091540').json()['stale'])
+
+    def test_a_deep_analysis_needs_a_completed_result_and_runs_once_at_a_time(self):
+        agents = self.deep_agents()
+        self.assertEqual(self.client.post('/api/deep-analysis/100091540').status_code, 404)
+        self.assertEqual(self.client.get('/api/deep-analysis/100091540/file').status_code, 404)
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
+        self.wait_for_job()
+        self.assertEqual(self.client.post('/api/deep-analysis/102309372').status_code, 404)  # its check failed
+
+        agents.delay = 0.3
+        self.client.post('/api/deep-analysis/100091540')
+        refused = self.client.post('/api/deep-analysis/100091540')
+        self.assertEqual((refused.status_code, refused.json()['error']),
+                         (409, 'A deep analysis of tender 100091540 is already running.'))
+        running = self.wait_for_deep('100091540', 'running')
+        self.assertEqual(running['progress']['stage'][:len('Company Profiler agent: ')], 'Company Profiler agent: ')
+        self.wait_for_deep('100091540')
+
+        self.analysis_delay = 0.5
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for(lambda progress: progress['items'][0]['status'] == 'processing')
+        self.assertEqual(self.client.post('/api/deep-analysis/100091540').status_code, 409)
+        self.wait_for_job()
+
+    def test_a_failed_deep_analysis_keeps_the_last_report(self):
+        agents = self.deep_agents()
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        self.client.post('/api/deep-analysis/100091540')
+        report = self.wait_for_deep('100091540')['analysis']
+
+        agents.replies['supervisor'] = [ConnectionError('ollama.com timed out')]
+        with self.assertLogs('services.deep_analysis_service', 'ERROR'):
+            self.client.post('/api/deep-analysis/100091540')
+            state = self.wait_for_deep('100091540', 'failed')
+
+        self.assertEqual((state['error'], state['error_title']), ('ollama.com timed out', 'The deep analysis failed'))
+        self.assertEqual(state['analysis'], report)
+
+
+# The deep analysis agents' answers for ApiTest's tender: Turnover met, Net worth undetermined
+DEEP_REPLIES = {
+    'profiler': [{'flags': [{'field': 'Net worth', 'issue': 'missing', 'detail': 'The profile gives no net worth.',
+                             'needed_for': 'Net worth', 'severity': 'high', 'verify_with': 'Audited balance sheet'}],
+                  'reliable_fields': ['Company Name'], 'summary': 'Net worth is missing.'}],
+    'audit': [{'rules': [{'ref': 0, 'criterion': 'Turnover', 'result': 'pass', 'reason': '171 Cr ≥ 10 Cr'},
+                         {'ref': 1, 'criterion': 'Net worth', 'result': 'insufficient_data', 'reason': 'Not stated.',
+                          'missing': 'Net worth figure'}],
+               'summary': 'Net worth decides it.'}],
+    'status_review': [{'reviews': [{'ref': 1, 'criterion': 'Net worth', 'agreement': 'disagrees', 'bias_risk': 'high',
+                                    'finding': 'No figure supports Met.', 'possible_reasons': ['Knows the figure'],
+                                    'recommendation': 'verify'}],
+                       'overrides': [], 'summary': 'One mark lacks evidence.'}],
+    'supervisor': [{'criteria': [{'ref': 0, 'criterion': 'Turnover', 'final_status': 'met', 'confidence': 0.95},
+                                 {'ref': 1, 'criterion': 'Net worth', 'final_status': 'unknown', 'confidence': 0.8,
+                                  'resolution': 'The mark has no figure behind it.'}],
+                    'determination': 'Requires Review', 'confidence': 0.8, 'summary': 'Net worth is not stated.',
+                    'deciding_criteria': ['Net worth'],
+                    'data_gaps': [{'gap': 'Net worth', 'needed_for': 'Net worth', 'how_to_close': 'Add it',
+                                   'severity': 'high'}],
+                    'recheck': []}],
+}
+
+
+class ScriptedAgents:
+    """
+    A chat model answering each deep analysis agent, told apart by its system prompt, with the next of its replies:
+    a dict is sent as JSON, a string as it is, an exception is raised. An agent's last reply repeats.
+    """
+    TITLES = {'Company Profiler': 'profiler', 'Eligibility Audit': 'audit',
+              'Discrepancy & Status Review': 'status_review', 'Supervisor / Judge': 'supervisor'}
+
+    def __init__(self, **replies):
+        self.replies = {agent: list(answers) for agent, answers in replies.items()}
+        self.calls = []  # (agent, messages)
+        self.delay = 0
+
+    def with_config(self, **kwargs):
+        return self
+
+    def invoke(self, messages):
+        agent = next(key for title, key in self.TITLES.items() if f'You are the {title} agent' in messages[0]['content'])
+        self.calls.append((agent, messages))
+        time.sleep(self.delay)
+        answers = self.replies[agent]
+        reply = answers.pop(0) if len(answers) > 1 else answers[0]
+        if isinstance(reply, Exception):
+            raise reply
+        return AIMessage(content=reply if isinstance(reply, str) else json.dumps(reply))
+
+    def agents(self):
+        return [agent for agent, _ in self.calls]
+
+
+class DeepAnalysisTest(unittest.TestCase):
+    """The five agents of a deep analysis, run over a result with a scripted model."""
+
+    RESULT = {
+        'tcno': '100091540', 'name': 'ROB', 'status': 'completed', 'verdict': 'Eligible', 'ai_verdict': 'Not Eligible',
+        'processed_at': '2026-11-05T10:00:00+00:00', 'unreadable_files': [], 'jv': None,
+        'criteria': [
+            {'criterion': 'Turnover', 'requirement': '10 Cr', 'company': '171 Cr', 'status': 'met', 'source': 'NIT.pdf'},
+            {'criterion': 'Similar work', 'requirement': '1 work of 40 Cr', 'company': '', 'status': 'met',
+             'source': 'NIT.pdf', 'ai_status': 'not_met', 'marked_by_user': True},
+        ],
+    }
+    COMPANY = COMPANY + '\n\n## Finance\n\n| Year | Turnover |\n|---|---|\n| FY26 | 1710000000 |'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.folder = Path(self.tmp.name)
+        (self.folder / CRITERIA_FILE).write_text('# Eligibility criteria\n\n## NIT.pdf\nTurnover 10 Cr; one similar '
+                                                 'work of 40 Cr.\n', encoding='utf-8')
+        patch = mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'})
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self.tmp.cleanup)
+
+    def run_agents(self, result=None, **replies):
+        agents = ScriptedAgents(**{**self.replies(), **replies})
+        with mock.patch('services.deep_analysis_service.make_model', return_value=agents):
+            report = run_deep_analysis(result or self.RESULT, self.folder, self.COMPANY,
+                                       today=tender_service.date(2026, 11, 6))
+        return report, agents
+
+    @staticmethod
+    def replies():
+        return {
+            'profiler': [{'flags': [], 'summary': 'Complete.'}],
+            'audit': [{'rules': [{'ref': 0, 'criterion': 'Turnover', 'result': 'pass', 'reason': '171 Cr ≥ 10 Cr'},
+                                 {'ref': 1, 'criterion': 'Similar work', 'result': 'fail',
+                                  'reason': 'No work of 40 Cr is listed.'}],
+                       'summary': 'Similar work fails.'}],
+            'status_review': [{'reviews': [{'ref': 1, 'agreement': 'disagrees', 'bias_risk': 'high',
+                                            'finding': 'Nothing in the profile supports Met.',
+                                            'possible_reasons': ['A work outside the profile'],
+                                            'recommendation': 'verify'}],
+                               'summary': 'The Similar work mark is unsupported.'}],
+            'supervisor': [{'criteria': [{'ref': 0, 'final_status': 'met', 'confidence': 0.9},
+                                         {'ref': 1, 'final_status': 'not_met', 'confidence': '70%'}],
+                            'determination': 'Not eligible', 'confidence': 0.7, 'summary': 'Similar work fails.',
+                            'recheck': []}],
+        }
+
+    def test_the_agents_share_one_state_and_the_supervisor_decides(self):
+        report, agents = self.run_agents()
+
+        self.assertEqual(agents.agents(), ['profiler', 'audit', 'status_review', 'supervisor'])
+        # The ingestion agent's normalised figures reach the agents after it
+        self.assertIn('FY26 > Turnover (FY 2025-26, 2025-04-01 to 2026-03-31): 1710000000 = ₹171.00 Cr',
+                      agents.calls[0][1][1]['content'])
+        judge_prompt = agents.calls[3][1][1]['content']
+        self.assertIn('[1] Similar work (disagreement): the AI: Not met; marked by user: Met; the audit: Not met',
+                      judge_prompt)
+        self.assertEqual(report['final']['determination'], 'Not Eligible')
+        self.assertEqual((report['final']['confidence'], report['final']['agrees_with_current']), (0.7, False))
+        self.assertEqual([(row['final_status'], row['confidence'], row['conflict']) for row in report['criteria']],
+                         [('met', 0.9, False), ('not_met', 0.7, True)])
+        self.assertEqual(report['rounds'], 0)
+        self.assertEqual(report['agents']['ingestion']['normalised_facts'][0]['rupees'], 1710000000)
+
+    def test_the_supervisor_sends_disputed_criteria_back_to_the_audit_for_a_limited_number_of_rounds(self):
+        recheck = {**self.replies()['supervisor'][0], 'recheck': [{'ref': 1, 'criterion': 'Similar work',
+                                                                   'question': 'Does ROB Package-1 count?'}]}
+        reexamined = {'rules': [{'ref': 1, 'criterion': 'Similar work', 'result': 'insufficient_data',
+                                 'reason': 'Its value is not stated.'}]}
+
+        report, agents = self.run_agents(supervisor=[recheck], audit=[self.replies()['audit'][0], reexamined])
+
+        self.assertEqual(agents.agents(), ['profiler', 'audit', 'status_review']
+                         + ['supervisor', 'audit'] * MAX_ROUNDS + ['supervisor'])
+        self.assertIn('Re-examine only these criteria (Supervisor / Judge agent, round 1)', agents.calls[4][1][1]['content'])
+        self.assertIn('Does ROB Package-1 count?', agents.calls[4][1][1]['content'])
+        self.assertIn('No re-examination rounds are left', agents.calls[-1][1][0]['content'])
+        self.assertEqual(report['rounds'], MAX_ROUNDS)
+        # The re-examined rule replaces the first one, which the report keeps no more
+        self.assertEqual([rule['result'] for rule in report['agents']['audit']['rules']], ['pass', 'insufficient_data'])
+        self.assertEqual(report['criteria'][1]['audit_result'], 'insufficient_data')
+        # The status review, made before the re-examination, is shown beside the audit result that stands
+        self.assertEqual(report['status_review']['reviews'][0]['audit_result'], 'insufficient_data')
+        self.assertIn('has re-examined disputed criteria 1 time.', agents.calls[5][1][1]['content'])
+
+    def test_a_determination_the_statuses_do_not_bear_out_is_requires_review(self):
+        supervisor = {**self.replies()['supervisor'][0], 'determination': 'Eligible'}
+
+        report, _ = self.run_agents(supervisor=[supervisor])
+
+        self.assertEqual((report['final']['determination'], report['final']['supervisor_determination']),
+                         ('Requires Review', 'Eligible'))
+        self.assertIn('the final statuses give Not Eligible', report['audit_log'][-1]['event'])
+
+    def test_a_criterion_the_supervisor_left_out_keeps_the_audit_result(self):
+        supervisor = {**self.replies()['supervisor'][0], 'criteria': [], 'determination': None, 'confidence': None}
+
+        report, _ = self.run_agents(supervisor=[supervisor])
+
+        self.assertEqual([row['final_status'] for row in report['criteria']], ['met', 'not_met'])
+        self.assertEqual(report['final']['determination'], 'Not Eligible')
+        self.assertIsNone(report['final']['confidence'])
+
+    def test_nothing_marked_and_nothing_disputed_skips_the_status_review(self):
+        result = copy.deepcopy(self.RESULT)
+        result['criteria'][1] = {'criterion': 'Similar work', 'requirement': '1 work of 40 Cr', 'company': '',
+                                 'status': 'not_met', 'source': 'NIT.pdf'}
+
+        report, agents = self.run_agents(result)
+
+        self.assertEqual(agents.agents(), ['profiler', 'audit', 'supervisor'])
+        self.assertTrue(report['status_review']['skipped'])
+        self.assertIsNone(report['audit_log'][3]['model'])  # it ran on no model
+
+    def test_each_agent_runs_on_its_own_model(self):
+        models = {'profiler': 'profiler-model', 'audit': 'audit-model', 'status_review': 'review-model',
+                  'supervisor': 'judge-model'}
+        agents = ScriptedAgents(**self.replies())
+
+        # Named here, so the test does not depend on the models set in .env
+        with mock.patch.dict(deep.AGENT_MODELS, models), \
+                mock.patch('services.deep_analysis_service.make_model', return_value=agents) as make_model:
+            report = run_deep_analysis(self.RESULT, self.folder, self.COMPANY)
+
+        self.assertEqual([call.args[0] for call in make_model.call_args_list],
+                         ['profiler-model', 'audit-model', 'review-model', 'judge-model'])
+        self.assertEqual(report['models'], models)
+        self.assertEqual([entry['model'] for entry in report['audit_log']],
+                         [None, 'profiler-model', 'audit-model', 'review-model', 'judge-model'])
+
+    def test_an_answer_that_is_not_json_is_asked_for_again_once(self):
+        audit = self.replies()['audit'][0]
+        report, agents = self.run_agents(audit=['Here is the matrix: {"rules": [', audit])
+        self.assertEqual(agents.agents().count('audit'), 2)
+        self.assertIn('not one valid JSON object', agents.calls[2][1][-1]['content'])
+        self.assertEqual(report['criteria'][1]['audit_result'], 'fail')
+
+        with self.assertRaises(DeepAnalysisError), self.assertLogs('services.deep_analysis_service', 'WARNING'):
+            self.run_agents(audit=['no JSON here'])
+
+    def test_tokens_are_counted_by_agent(self):
+        usage = TokenUsage(LLM_AGENTS)
+        result = copy.deepcopy(self.RESULT)
+        del result['criteria'][1]
+        model = counting_model((json.dumps({'flags': []}), 400, 20),
+                               ('```json\n{"rules": [{"ref": 0, "result": "pass"}]}\n```', 900, 60),
+                               (json.dumps({'criteria': [{'ref': 0, 'final_status': 'met'}]}), 700, 50))
+        with mock.patch('services.deep_analysis_service.make_model', return_value=model):
+            report = run_deep_analysis(result, self.folder, self.COMPANY, usage=usage)
+
+        self.assertEqual(report['tokens']['audit'], {'input': 900, 'output': 60, 'total': 960})
+        self.assertEqual(report['tokens']['status_review']['total'], 0)  # nothing to review
+        self.assertEqual(report['tokens']['total'], {'input': 2000, 'output': 130, 'total': 2130})
+
+    def test_nothing_to_review_and_no_api_key_fail_early(self):
+        empty = {**self.RESULT, 'criteria': []}
+        (self.folder / CRITERIA_FILE).unlink()
+        with self.assertRaises(DeepAnalysisError):
+            self.run_agents(empty)
+        with mock.patch.dict(os.environ, {'OLLAMA_API_KEY': ''}), self.assertRaises(RuntimeError):
+            self.run_agents()
+
+
+class DeepAnalysisInputTest(unittest.TestCase):
+    """What the ingestion agent reads from the company profile without the LLM."""
+
+    def test_amounts_are_normalised_to_rupees(self):
+        for text, rupees in [('₹ 12.5 Cr', 125_000_000), ('Rs. 1,25,00,000/-', 12_500_000), ('3 lakh', 300_000),
+                             ('INR 5 crore', 50_000_000), ('2.5 Years', None), ('76 m', None), ('62011', None)]:
+            self.assertEqual(parse_amount(text), rupees, text)
+        self.assertEqual(parse_amount('94500000000', money_name=True), 94_500_000_000)
+
+    def test_financial_years_run_april_to_march(self):
+        for text in ('FY24', 'FY 2023-24', '2023-24', 'F.Y. 2023-2024', "FY'24"):
+            year = parse_financial_year(text)
+            self.assertEqual((year['label'], year['start'].isoformat(), year['end'].isoformat()),
+                             ('FY 2023-24', '2023-04-01', '2024-03-31'), text)
+        self.assertIsNone(parse_financial_year('2024-03'))
+        self.assertIsNone(parse_financial_year('Turnover'))
+
+    def test_a_bare_number_is_money_only_in_a_money_field(self):
+        facts = [deep.normalise_fact(fact) for fact in deep.profile_facts(
+            '# Profile\n\n## 1. Basic\n\n| Item | Value |\n|---|---|\n| NIC code | 62011 |\n'
+            '| Total Existing Commitments | 4300000000 |\n\n## 2. Certificates\n\n'
+            '| Certificate | Valid until |\n|---|---|\n| ISO 9001 | 31-03-2026 |\n\n'
+            '## 3. Finance\n\n| Year | Turnover |\n|---|---|\n| FY24 | 5 Cr |')]
+
+        self.assertEqual([fact.get('rupees') for fact in facts], [None, 4_300_000_000, None, 50_000_000])
+        self.assertEqual(facts[2]['section'], 'Certificates')
+        flags = deep.date_checks(facts, tender_service.date(2026, 11, 6))
+        self.assertEqual([(flag['field'], flag['issue'], flag['severity']) for flag in flags],
+                         [('Certificates > ISO 9001 > Valid until', 'expired', 'high'),
+                          ('Finance > Turnover', 'outdated', 'medium')])
+
+    def test_json_is_found_in_a_fence_or_a_sentence(self):
+        self.assertEqual(parse_json_reply('<think>hmm</think>```json\n{"a": 1}\n```'), {'a': 1})
+        self.assertEqual(parse_json_reply('Here it is: {"a": [1, 2]} as asked.'), {'a': [1, 2]})
+        for text in ('no object', '[1, 2]', '{"a": '):
+            with self.assertRaises(ValueError):
+                parse_json_reply(text)
 
 
 if __name__ == '__main__':

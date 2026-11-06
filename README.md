@@ -32,6 +32,8 @@ services/
   processing_service.py      Background job: runs queued tenders one by one, tracks progress and results;
                              saves each result to eligibility_result.json and loads those at startup
   decision_service.py        Shortlisted / dropped decisions, saved to decisions.json
+  deep_analysis_service.py   Deep analysis: five agents review a completed result, its criteria, the company
+                             profile and the statuses marked by user; saved to deep_analysis.json
 utils/
   files.py                   Safe folder/file names, file name from a download response
   logging_setup.py           Console + rotating file logging (logs/app.log)
@@ -58,7 +60,12 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Put your TenderTiger login and ollama.com API key in `.env` (the file already exists):
+Copy [.env.example](.env.example) to `.env` and put your TenderTiger login and ollama.com API key in it; the other
+settings in it are optional (see [Configuration](#configuration)):
+
+```powershell
+Copy-Item .env.example .env
+```
 
 ```
 TENDERTIGER_EMAIL=you@example.com
@@ -112,9 +119,17 @@ can be re-checked quickly; the downloaded files stay in `downloads/`, and shortl
 | `TENDERTIGER_PASSWORD` | (none) | Password of that login |
 | `TENDERTIGER_REQUEST_GAP` | `3` | Seconds between two requests to TenderTiger; its firewall blocks bursts with a browser check |
 | `OLLAMA_API_KEY` | (none) | ollama.com key used by the LLM analysis |
+| `SUMMARY_MODEL` | `gemma4:31b-cloud` | ollama.com model that reads the documents for criteria (most of the tokens) |
+| `ASSESSMENT_MODEL` | `gpt-oss:120b-cloud` | ollama.com model that checks the company against the criteria, also on a re-check |
+| `OCR_MODEL` | `gemma4:31b-cloud` | ollama.com model that reads the pages of scanned PDFs; it must accept images (vision) |
+| `DEEP_PROFILER_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of the deep analysis's Company Profiler agent |
+| `DEEP_AUDIT_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Eligibility Audit agent, also for re-examinations |
+| `DEEP_STATUS_REVIEW_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Discrepancy & Status Review agent |
+| `DEEP_SUPERVISOR_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Supervisor / Judge agent |
 | `TARGET_DIRECTORY` | `./downloads` | Documents are stored in `TARGET_DIRECTORY/<tcno>/` |
 | `DOWNLOAD_TIMEOUT` | `120` | Seconds to wait for the document server |
 | `MAX_DOWNLOAD_MB` | `500` | Larger downloads are aborted |
+| `MAX_FILE_CHARS` | `300000` | A tender file with more text (about 100k LLM tokens) is not summarised and is listed as not checked |
 | `DECISIONS_FILE` | `TARGET_DIRECTORY/decisions.json` | Where shortlisted / dropped decisions are saved |
 | `COMPANY_DETAILS_FILE` | `./company_details.md` | The company profile; edited on the page or by hand |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
@@ -124,7 +139,9 @@ can be re-checked quickly; the downloaded files stay in `downloads/`, and shortl
 ## Company profile
 
 Every tender is checked against the markdown in `COMPANY_DETAILS_FILE` (`company_details.md`), and only
-against that: a criterion whose company figure is missing becomes Cannot determine. Click **Edit profile** in
+against that: a criterion whose company figure is missing becomes Cannot determine. Whether a project counts as
+similar work is judged per tender, from what the project was against the tender's definition, so a "Similar Work:
+Yes" label in the profile is ignored. Click **Edit profile** in
 the app bar to change it. The editor is a form built from the file: the `#` heading is the profile title, every
 `##` heading and `###` sub-heading is a field you can rename, and every markdown table becomes rows of fields.
 Any other text appears in a text box. Save (or Ctrl+S) writes the form back to the file as markdown; rows left
@@ -164,10 +181,21 @@ Company Name row.
 4. `process_tender_files()` reads the company profile and fetches the tender's `GetPreQualification` page:
    the text the page passes to `displayText($(".contentPreQua"), "...")` is checked as written, under the
    source name `TenderTiger Pre-Qualification` (many tenders have none). It then converts
-   each file to text, keeps what is relevant to eligibility, and asks the LLM to check the company against the
-   criteria from all of these sources, listing a criterion stated in several of them once. If the link cannot
+   each file to text with MarkItDown (PDF and Word `.docx`, including `.doc` files saved in the `.docx` format;
+   an old Word 97-2003 `.doc` cannot be read and is listed as unreadable). A PDF MarkItDown gets no text from,
+   such as a scan, is converted again with the [markitdown-ocr](https://pypi.org/project/markitdown-ocr/) plugin,
+   which sends each page image to `OCR_MODEL` to read; its tokens count towards the criteria step. If any page
+   cannot be read, or no text comes back, the PDF is listed as unreadable. Of each file's text it keeps what is relevant to
+   eligibility, and asks the LLM to check the company against the criteria from all of these sources, listing a criterion stated in several of them once. If the link cannot
    be fetched, `TenderTiger Pre-Qualification` is listed with the files that could not be read. With no files
    and no pre-qualification criteria there is nothing to check, and the tender fails.
+
+   To keep the LLM tokens down, files with `drawing` in their name and `.csv` files (GeM item lists) are not
+   read at all: they hold no criteria, and one tender's drawings alone came to about 300k tokens. A BOQ is
+   still read, because it may give the estimated cost. A file whose text is longer than `MAX_FILE_CHARS` is
+   not summarised either; it is listed as not checked, with its length, so the verdict cannot be Eligible.
+   Raise the limit in `.env`, restart and regenerate the criteria to read it. The log has a line per file
+   read with its length and number of chunks (one LLM call each); a tender typically uses about 20k tokens.
 
    Before that last LLM call, the criteria found are saved as `eligibility_criteria.md` in the TCNO folder:
    a `## <source>` section per file (and one for `TenderTiger Pre-Qualification`), and a
@@ -177,7 +205,10 @@ Company Name row.
    Requires Review if any file, or the pre-qualification criteria, could not be read, because the check was
    incomplete.
 6. The rows of the criteria table (every markdown table with a Status column) become `criteria`, each with
-   status `met`, `not_met` or `unknown`. The tender table shows the names of the criteria not met or not
+   status `met`, `not_met` or `unknown`. The model is given fixed rules for each status (Met only when the
+   profile states what the criterion needs; nothing inferred, such as the country from an address; exemptions
+   applied to the criterion they relax; purchase preferences and payment terms left out), because without them
+   the borderline criteria flipped between Met and Cannot determine from one re-check to the next. The tender table shows the names of the criteria not met or not
    determined; the score is the percentage of rows whose Status is Met.
 7. The verdict and score are for the company bidding alone. The model also writes a `## Joint venture`
    section: whether a JV or consortium may bid (`JV allowed: Yes / No / Not stated`), the maximum number of
@@ -214,11 +245,48 @@ then the queued tenders that need TenderTiger are cancelled, and only re-checks 
 Stopping a run cancels the queued tenders; the one in progress
 finishes.
 
+**Token usage.** Every LLM call a tender makes is counted, as the input and output tokens the model reports, in
+two steps: `criteria`, reading the documents for eligibility criteria (every chunk summary and merge of step 4),
+and `assessment`, the final check that gives the result. The counts are saved with the result as `tokens`, and
+logged. A failed tender keeps the tokens it spent before failing; a re-check spends none on `criteria`.
+
 **Saved results.** Every finished check, failed ones included, is saved as `eligibility_result.json` in the TCNO
 folder, replacing the previous one; it holds the same fields as `GET /api/result/<tcno>`. On startup the app
 loads every such file, so the table, the analysis view and the time estimates come back after a restart; a file
 it cannot read is skipped with a warning in the log. Regenerating empties the folder, so the old result is gone
 until the new one is saved.
+
+## Deep analysis
+
+A second opinion on a checked tender. In the analysis view, **Run deep analysis** starts five agents that work
+in turn on one shared state, each reading what the agents before it wrote. It reviews the eligibility criteria
+(`eligibility_criteria.md`), the company profile, the existing result and the statuses marked by user, and never
+changes the result or its verdict.
+
+| Agent | Role | What it adds |
+|---|---|---|
+| Ingestion & Context | Input parsing (no LLM) | Validates the result and criteria, normalises money to rupees and crore (`₹ 12.5 Cr`, `3 lakh`, bare figures in turnover / value / net worth fields), dates to ISO and `FY24` to its April–March dates, and flags validity dates that have passed and year-wise tables older than the last financial year to have ended |
+| Company Profiler | Data verification | Flags company data that is missing, outdated, inconsistent with other figures or expired, above all what the criteria need. No external registry is connected: each flag names the source that would settle it (MCA, GST or Udyam portal) instead of claiming a lookup |
+| Eligibility Audit | Criteria assessment | A Pass / Fail / Insufficient data / Not applicable matrix, one rule per criterion, judged afresh from the criteria and the company data. It is never shown the earlier statuses, so it cannot lean on them |
+| Discrepancy & Status Review | User action bias correction | Compares every status marked by user (and unread files marked checked, and the shortlist decision) with the audit and the profiler, rates the confirmation bias risk, and says why someone might have marked it so (knowledge outside the profile, a relationship with the client, a relaxation read into the text). Skipped, with no LLM call, when nothing was marked and the audit agrees with every AI status |
+| Supervisor / Judge | Final consensus | Resolves the disagreements and gives every criterion's final status and confidence, the determination, and the data gaps. It may send up to 6 disputed criteria back to the audit agent, with the question to settle, for up to 2 re-examination rounds |
+
+The determination follows the final statuses as a verdict does (Not Eligible if any is not met, Eligible if all
+are met and every source was read or checked, otherwise Requires Review). Where the supervisor states a different
+determination, the agents have not settled it, so it is Requires Review. An agent's answer that is not valid JSON
+is sent back once to be rewritten; a second bad answer fails the run.
+
+The report is saved as `deep_analysis.json` in the TCNO folder, beside `eligibility_result.json`, and survives a
+restart. It is never served or read as a tender document. It records what it was based on: once the result's
+statuses, the unread files checked, or the company profile change, it is shown as out of date until it is run
+again. Re-checking keeps the old report (marked out of date); regenerating empties the folder and removes it. A
+failed run leaves the last report as it was. One deep analysis runs at a time; others wait their turn. A typical
+run makes 4 to 8 LLM calls, counted by agent under `tokens`.
+
+Each LLM agent runs on its own model, set in `.env` (`DEEP_PROFILER_MODEL`, `DEEP_AUDIT_MODEL`,
+`DEEP_STATUS_REVIEW_MODEL`, `DEEP_SUPERVISOR_MODEL`; see Configuration), so a cheaper model can check the profile
+while a stronger one audits and judges. Each defaults to `ASSESSMENT_MODEL`; the Ingestion & Context agent uses
+none. The report records each agent's model under `models`, and each audit log step the model it ran on.
 
 ## API
 
@@ -397,6 +465,11 @@ in the saved results, an earlier one), and `average_recheck_seconds` that of the
   "folder": "C:\\projects\\tender\\downloads\\100091540",
   "rechecked": false,
   "criteria_file": "C:\\projects\\tender\\downloads\\100091540\\eligibility_criteria.md",
+  "tokens": {
+    "criteria": {"input": 312480, "output": 18342, "total": 330822},
+    "assessment": {"input": 9120, "output": 2654, "total": 11774},
+    "total": {"input": 321600, "output": 20996, "total": 342596}
+  },
   "duration_seconds": 412.6,
   "processed_at": "2026-11-02T07:05:12+00:00"
 }
@@ -405,12 +478,137 @@ in the saved results, an earlier one), and `average_recheck_seconds` that of the
 A failed tender has `"status": "failed"`, `verdict` and `details` set to `null`, the raw reason in `error`,
 and what failed and what to do next in `error_title` and `error_action`. `rechecked` is true when the result
 came from the saved criteria; `criteria_file` is the saved criteria file after the run, or `null`.
+`tokens` holds the LLM tokens of the run (see Token usage above); results saved before it was added have none.
 `jv.allowed` is `yes`, `no` or `unknown` (not stated); `max_members` is `null` when not stated or no JV is
 allowed; `jv.verdict` is the outcome as JV lead member (see step 8), `null` without a JV. In `comparison`,
 `alone_requirement` and `alone_status` are `null` for a requirement only a JV has, and the `lead_*`,
 `other_members` and `combined` fields are `null` when no JV may bid. Statuses are `met`, `not_met` or `unknown`.
 A failed tender has `"jv": null` and an empty `comparison`.
 `404` if the tender has no result: not processed since the server started, and no saved result in its folder.
+
+### GET /api/files/&lt;tcno&gt;/&lt;file&gt;
+
+Returns one of the tender's downloaded documents, `file` being its path as the result's `files` list it (for
+example `102418294/doc6255363863059291992.pdf`). The analysis view links every file in its file list, and each
+unreadable file, to this, in a new tab. PDFs, images and plain text open in the browser; any other type (Word,
+Excel, a web page) is downloaded, so nothing in a tender's files runs as part of the app. Only a listed document
+is served: `404` for any other name, including the saved criteria, result and deep analysis, or once the documents were
+downloaded again.
+
+### PUT /api/result/&lt;tcno&gt;/criteria/&lt;index&gt;
+
+Sets the status of one criterion by hand, when the AI got it wrong; `index` is its position in `criteria`. The
+analysis view does this from the status next to each criterion.
+
+```json
+{"status": "met"}
+```
+
+`status` is `"met"`, `"not_met"`, `"unknown"` or `null` (back to the AI's status, as is sending the AI's own).
+The criterion gets `"marked_by_user": true` and keeps the AI's status as `ai_status`. While any criterion is
+marked (or the unreadable files are checked, below), the verdict follows the statuses: Not Eligible if one is
+not met, Eligible if all are met and no unreadable file is left unchecked, otherwise Requires Review. The AI's
+verdict is kept as `ai_verdict`; the score, `checks` (with `user_marked`, the number marked) and each comparison
+row's `alone_status` follow too. `details` stays the AI's text. The result is saved, so the marks survive a
+restart, and a re-check or regenerate marks the same statuses again on the criteria of the new result with the
+same name. Response `200` with the updated result. `400` for an unknown status, `404` without a completed
+result or such a criterion, `409` while the tender is queued or being checked.
+
+### PUT /api/result/&lt;tcno&gt;/unreadable-checked
+
+Records that the bid team checked the files the AI could not read (`unreadable_files`) by hand, so they no
+longer keep the verdict from Eligible: a tender meeting every criterion becomes Eligible. The analysis view
+does this with **I have checked these files** under those files, tagged "Checked by user" with an Undo.
+
+```json
+{"checked": true}
+```
+
+`false` takes it back. The result gets `unreadable_checked` (the files checked) and `checks.unreadable_checked`
+(their number), and the verdict and the verdict as JV lead member are worked out again as above. A re-check or
+regenerate keeps the check for the files that are still unreadable. Response `200` with the updated result;
+`400` without `checked`, `404` without a completed result or unreadable files, `409` while the tender is
+queued or being checked.
+
+### POST /api/deep-analysis/&lt;tcno&gt;
+
+Starts a deep analysis of the tender's completed result (see Deep analysis above). No body. Response `202` with
+its state, as `GET` returns it. `404` without a completed result; `409` while the tender is queued or being
+checked, or while a deep analysis of it is already queued or running.
+
+### GET /api/deep-analysis/&lt;tcno&gt;
+
+The tender's deep analysis. The analysis view polls it every 2 seconds while one runs.
+
+```json
+{
+  "tcno": "100091540",
+  "status": "running",
+  "progress": {"agent": "audit", "round": 1, "done": ["ingestion", "profiler", "status_review", "supervisor"],
+               "stage": "Eligibility Audit agent: re-examining 1 disputed criterion for the supervisor (round 1)",
+               "queued_at": "...", "started_at": "...", "elapsed_seconds": 74},
+  "error": null, "error_title": null, "error_action": null,
+  "analysis": null,
+  "stale": false
+}
+```
+
+`status` is `none`, `queued`, `running`, `completed` or `failed` (then with `error`, `error_title` and
+`error_action`). `progress` is `null` unless queued or running. `analysis` is the last saved report, also after a
+failed run; `stale` is true when the result or the company profile changed since it was made. The report:
+
+```json
+{
+  "version": 2, "tcno": "100091540", "status": "completed",
+  "models": {"profiler": "gpt-oss:120b-cloud", "audit": "gpt-oss:120b-cloud",
+             "status_review": "gpt-oss:120b-cloud", "supervisor": "gpt-oss:120b-cloud"},
+  "started_at": "...", "finished_at": "...", "duration_seconds": 184.2, "rounds": 1,
+  "based_on": {"processed_at": "...", "verdict": "Eligible", "fingerprint": "9c1f0e2ab4d37c55"},
+  "inputs": {"criteria_source": "eligibility_criteria.md", "criteria": 4, "user_marked": 2,
+             "unreadable": ["a.pdf"], "unreadable_checked": ["a.pdf"], "decision": "shortlisted",
+             "normalised_facts": 22, "warnings": []},
+  "final": {"determination": "Requires Review", "confidence": 0.72,
+            "summary": "Two criteria hang on values the documents do not give ...",
+            "deciding_criteria": ["Experience Criteria"], "current_verdict": "Eligible",
+            "agrees_with_current": false, "supervisor_determination": "Requires Review"},
+  "criteria": [
+    {"ref": 0, "criterion": "Experience Criteria", "requirement": "...", "source": "NIT.pdf",
+     "current_status": "met", "ai_status": "unknown", "marked_by_user": true,
+     "audit_result": "insufficient_data", "audit_reason": "...", "audit_evidence": "...", "audit_missing": "...",
+     "final_status": "unknown", "confidence": 0.75, "basis": "...", "resolution": "...",
+     "conflict": true, "bias_risk": "high"}
+  ],
+  "data_gaps": [{"gap": "Required experience value", "needed_for": "Experience Criteria",
+                 "how_to_close": "Read the ATC document", "severity": "high"}],
+  "profile_flags": [{"field": "Bid Capacity Assessment > A (Highest Annual Turnover)", "issue": "mismatch",
+                     "detail": "...", "needed_for": "Bid capacity", "severity": "high",
+                     "verify_with": "CA-certified turnover certificate", "source": "profiler"}],
+  "status_review": {"reviews": [{"ref": 0, "criterion": "Experience Criteria", "marked_by_user": true,
+                                 "user_status": "met", "ai_status": "unknown", "audit_result": "insufficient_data",
+                                 "agreement": "disagrees", "bias_risk": "high", "finding": "...",
+                                 "possible_reasons": ["..."], "recommendation": "verify"}],
+                    "overrides": [{"kind": "unreadable_checked", "detail": "...", "bias_risk": "medium",
+                                   "finding": "..."}],
+                    "summary": "...", "skipped": false},
+  "agents": {"ingestion": {}, "profiler": {}, "audit": {"rules": [], "summary": "..."},
+             "status_review": {}, "supervisor": {}},
+  "audit_log": [{"at": "...", "agent": "ingestion", "round": 0, "model": null,
+                 "event": "4 criteria from the result ...", "seconds": 0.0}],
+  "tokens": {"profiler": {"input": 2410, "output": 380, "total": 2790}, "audit": {}, "status_review": {},
+             "supervisor": {}, "total": {}}
+}
+```
+
+`criteria` lines up every view of each criterion of the result, by its index (`ref`), followed by any the audit
+alone found (`ref` `null`, `current_status` `null`). Statuses are `met`, `not_met`, `unknown` or (final only)
+`not_applicable`; audit results `pass`, `fail`, `insufficient_data` or `not_applicable`; `conflict` is true when
+the AI, the mark by user and the audit disagree or the audit left the criterion out. `confidence` runs from 0 to
+1, `null` when not given. `profile_flags` with `"source": "ingestion"` are the date checks of the ingestion agent.
+`agents` holds each agent's own output, such as the audit's full rule matrix.
+
+### GET /api/deep-analysis/&lt;tcno&gt;/file
+
+Downloads the saved report, `deep_analysis.json`, as `deep_analysis_<tcno>.json`. `404` without one.
 
 ### PUT /api/decision/&lt;tcno&gt;
 

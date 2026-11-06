@@ -15,6 +15,7 @@ from ext import company_details  # noqa: E402
 from routes.api import EXCEPTION_HANDLERS, api  # noqa: E402
 from routes.pages import pages  # noqa: E402
 from services.decision_service import DecisionStore  # noqa: E402
+from services.deep_analysis_service import DeepAnalysisRunner  # noqa: E402
 from services.processing_service import TenderProcessor  # noqa: E402
 from utils.logging_setup import configure_logging  # noqa: E402
 
@@ -31,11 +32,14 @@ def create_app(config_object=Config):
         config_object.TARGET_DIRECTORY,
         download_timeout=config_object.DOWNLOAD_TIMEOUT,
         max_download_bytes=config_object.MAX_DOWNLOAD_MB * 1024 * 1024,
+        max_file_chars=config_object.MAX_FILE_CHARS,
         company_file=config_object.COMPANY_DETAILS_FILE,
     )
     app.state.company_file = config_object.COMPANY_DETAILS_FILE
     app.state.decisions = DecisionStore(
         config_object.DECISIONS_FILE or config_object.TARGET_DIRECTORY / 'decisions.json')
+    app.state.deep_analyses = DeepAnalysisRunner(app.state.tender_processor, app.state.decisions,
+                                                 config_object.COMPANY_DETAILS_FILE)
     app.mount('/static', StaticFiles(directory=BASE_DIR / 'static'), name='static')
     app.include_router(pages)
     app.include_router(api)

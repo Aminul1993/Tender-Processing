@@ -277,6 +277,18 @@
       <p>The verdict is for the company bidding alone. The line under it gives the outcome as lead member of a
         joint venture (JV), when one may bid. The analysis compares the two criterion by criterion; a green row is
         one the company misses alone but meets as JV lead member.</p>
+      <p>If the AI got a criterion wrong, change its status in the analysis. It is tagged <strong>Marked by
+        user</strong>, the verdict then follows the statuses, and a re-check keeps your change. Files the AI could
+        not read keep a tender at Needs review until you mark them <strong>checked</strong> there.</p>
+    </div>
+    <div class="help-item">
+      <h3>04 · Deep analysis</h3>
+      <p>For a second opinion, open a checked tender and run <strong>Deep analysis</strong>. Five AI agents
+        normalise the inputs, check the company profile for missing or inconsistent data, audit every criterion
+        afresh, question the statuses marked by user, and settle their disagreements in a final determination with
+        confidence scores, data gaps and an audit log.</p>
+      <p>It takes a few minutes, never changes the verdict, and is saved beside the result as
+        <strong>deep_analysis.json</strong>.</p>
     </div>
   </div>
 </section>
@@ -309,6 +321,8 @@
       </div>
       <div class="modal-body">
         <div id="details-summary"></div>
+        <!-- Filled by app.js from /api/deep-analysis/<tcno>: the offer to run one, its progress, or its report -->
+        <section class="deep" id="details-deep" aria-labelledby="deep-title" hidden></section>
         <section id="analysis-section" aria-labelledby="analysis-title">
           <h3 class="analysis-title" id="analysis-title">Full analysis</h3>
           <div class="analysis" id="details-content"></div>

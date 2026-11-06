@@ -14,6 +14,9 @@ class Config:
     DOWNLOAD_TIMEOUT = int(os.getenv('DOWNLOAD_TIMEOUT', '120'))
     # Bigger downloads are aborted, so a bad link cannot fill the disk
     MAX_DOWNLOAD_MB = int(os.getenv('MAX_DOWNLOAD_MB', '500'))
+    # A tender file whose text is longer is not sent to the LLM (300,000 characters is about 100k tokens) and is
+    # listed as not checked
+    MAX_FILE_CHARS = int(os.getenv('MAX_FILE_CHARS', '300000'))
     # The team's shortlisted / dropped decisions; None means TARGET_DIRECTORY/decisions.json
     DECISIONS_FILE = os.getenv('DECISIONS_FILE')
     # The company profile (markdown) every tender is checked against; edited on the page

@@ -4,11 +4,14 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from markitdown import MarkItDown
 
-from ext import (COMPANY_DETAILS_FILE, ELIGIBILITY_GOAL, TenderTigerBlocked, assess_eligibility, company_details,
-                 make_model, prequalification_criteria, summarize_for_goal)
+from ext import (ASSESSMENT_MODEL, COMPANY_DETAILS_FILE, ELIGIBILITY_GOAL, OCR_MODEL, SUMMARY_MODEL,
+                 TenderTigerBlocked, assess_eligibility, company_details, make_model, prequalification_criteria,
+                 split_text, summarize_for_goal)
 
 log = logging.getLogger(__name__)
 
@@ -33,22 +36,62 @@ CRITERIA_FILE = 'eligibility_criteria.md'
 UNREADABLE_TITLE = 'Sources that could not be read'
 # The result of a tender's last check is saved in its folder under this name; see processing_service.save_result()
 RESULT_FILE = 'eligibility_result.json'
+# The last deep analysis of that result is saved beside it under this name; see deep_analysis_service
+DEEP_ANALYSIS_FILE = 'deep_analysis.json'
+# Tender files that hold no eligibility criteria, so are not read: drawings (one tender's drawings ran to 300k
+# tokens and held none) and GeM item lists (.csv of items, quantities and consignees). A BOQ is still read,
+# because it may give the estimated cost the criteria depend on.
+_NO_CRITERIA = re.compile(r'drawing|\.csv$', re.IGNORECASE)
+# What markitdown-ocr writes besides the text it reads: a heading per page, and notes on pages it could not read
+_OCR_FILLER = re.compile(r'^\s*(## Page \d+|\*\[(No text could be extracted|Error)\b.*\]\*)\s*$', re.MULTILINE)
+
+
+class TokenUsage:
+    """
+    Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents for eligibility criteria,
+    OCR of scanned PDFs included) and 'assessment' (checking the company against them, for the final result). Given to process_tender_files() or
+    recheck_saved_criteria(), it still holds the tokens spent before a failure. Other steps can be named instead,
+    such as the agents of a deep analysis.
+    """
+    STEPS = ('criteria', 'assessment')
+
+    def __init__(self, steps=STEPS):
+        self._handlers = {step: UsageMetadataCallbackHandler() for step in steps}
+
+    def track(self, llm, step):
+        """llm, counting the tokens of every call it makes, retries and batches included, under step."""
+        return llm.with_config(callbacks=[self._handlers[step]])
+
+    def counts(self):
+        """
+        {'criteria', 'assessment', 'total'}, each {'input', 'output', 'total'} tokens; a step that made no LLM call
+        (the criteria of a re-check) counts 0.
+        """
+        keys = ('input', 'output', 'total')
+        # The handlers keep LangChain's usage metadata ({'input_tokens', ...}) per model name
+        counts = {step: {key: sum(usage.get(f'{key}_tokens', 0) for usage in handler.usage_metadata.values())
+                         for key in keys}
+                  for step, handler in self._handlers.items()}
+        counts['total'] = {key: sum(step[key] for step in counts.values()) for key in keys}
+        return counts
 
 
 def tender_files(tcno_folder):
-    """The tender's documents: every file under tcno_folder except the saved criteria and result."""
+    """The tender's documents: every file under tcno_folder except the saved criteria, result and deep analysis."""
     tcno_folder = Path(tcno_folder)
-    saved = {tcno_folder / CRITERIA_FILE, tcno_folder / RESULT_FILE}
+    saved = {tcno_folder / CRITERIA_FILE, tcno_folder / RESULT_FILE, tcno_folder / DEEP_ANALYSIS_FILE}
     return sorted(path for path in tcno_folder.rglob('*') if path.is_file() and path not in saved)
 
 
 def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DETAILS_FILE,
-                         prequalification_link=None):
+                         prequalification_link=None, usage=None, max_file_chars=300_000):
     """
     Checks the company profile saved in company_file against the eligibility criteria found in every file
     under tcno_folder, and in the pre-qualification criteria behind prequalification_link (the tender's
     TenderTiger GetPreQualification link), when one is given. The criteria found are saved in
-    tcno_folder/CRITERIA_FILE before the check, for recheck_saved_criteria().
+    tcno_folder/CRITERIA_FILE before the check, for recheck_saved_criteria(). Drawings and item lists are not
+    read (see _NO_CRITERIA), and a file with more than max_file_chars of text is listed as unreadable rather
+    than sent to the LLM.
 
     Returns {'verdict', 'details', 'score', 'criteria', 'unreadable_files'}:
       verdict           Eligible, Not Eligible or Requires Review
@@ -60,15 +103,22 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
 
     on_progress, if given, is called with a short status message before each step, plus step and steps
     (1-based position and total, counting each file and the final check) when they are known.
+    usage, a TokenUsage, if given, counts the tokens of reading the files and of the final check.
     Raises RuntimeError when OLLAMA_API_KEY is missing, the company profile is empty, or there is nothing to check
     (no files and no pre-qualification criteria); errors from the final LLM call propagate.
     """
     report = on_progress or (lambda message, **position: None)
+    usage = usage or TokenUsage()
     # Read once, so every file of the tender is checked against the same profile
     company = _company(company_file)
 
     tcno_folder = Path(tcno_folder)
     files = tender_files(tcno_folder)
+    ignored = [path for path in files if _NO_CRITERIA.search(path.name)]
+    if ignored:
+        log.info('Not reading %s: drawings and item lists hold no eligibility criteria',
+                 ', '.join(path.relative_to(tcno_folder).as_posix() for path in ignored))
+        files = [path for path in files if path not in ignored]
     summaries = []
     skipped = []
     if prequalification_link:
@@ -89,8 +139,9 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
         reason = 'could not be fetched' if skipped else 'were not found'
         raise RuntimeError(f'No tender files to check, and the pre-qualification criteria {reason}.')
 
-    llm = make_model()
+    reader = usage.track(make_model(SUMMARY_MODEL), 'criteria')
     md = MarkItDown()
+    ocr = None  # an _OcrReader, made for the first PDF that needs one
     steps = len(files) + 1
     for number, path in enumerate(files, 1):
         # Relative path, because nested zips often contain files with the same name
@@ -101,12 +152,22 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
         except Exception:
             log.warning('Could not read %s', path, exc_info=True)
             text = ''
+        if not text and path.suffix.lower() == '.pdf':
+            # No text layer, as in a scan: read the page images with OCR
+            ocr = ocr or _OcrReader(usage.track(make_model(OCR_MODEL), 'criteria'))
+            text = ocr.read(path)
         if not text:
             log.info('No readable text in %s', name)
             skipped.append(name)
             continue
+        if len(text) > max_file_chars:
+            # Summarising costs about a token per 2.6 characters, so one huge file could outspend 40 tenders
+            log.warning('Not reading %s: %d characters is over MAX_FILE_CHARS (%d)', name, len(text), max_file_chars)
+            skipped.append(f'{name} (too long: {len(text):,} characters; the MAX_FILE_CHARS limit is {max_file_chars:,})')
+            continue
+        log.info('Reading %s: %d characters in %d chunk(s)', name, len(text), len(split_text(text)))
         try:
-            summary = summarize_for_goal(llm, text, ELIGIBILITY_GOAL)
+            summary = summarize_for_goal(reader, text, ELIGIBILITY_GOAL)
         except Exception:
             log.warning('Could not summarize %s', path, exc_info=True)
             skipped.append(name)
@@ -119,25 +180,70 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
     # Saved before the final check, so a failure there does not lose the work of reading every file
     save_criteria(tcno_folder, summaries, skipped)
     report('Checking eligibility against the company details', step=steps, steps=steps)
-    return _assess(llm, summaries, skipped, company,
+    return _assess(usage.track(make_model(ASSESSMENT_MODEL), 'assessment'), summaries, skipped, company,
                    f'None of the {len(files)} file(s) contained eligibility criteria that could be read.')
 
 
-def recheck_saved_criteria(tcno_folder, on_progress=None, company_file=COMPANY_DETAILS_FILE):
+class _OcrReader:
+    """
+    Reads scanned PDFs with markitdown-ocr, which sends each page image to llm (an OCR_MODEL chat model) to read.
+    markitdown-ocr calls an OpenAI client, so this stands in for one: client.chat.completions.create().
+    """
+
+    def __init__(self, llm):
+        self._llm = llm
+        self._error = None  # the last failed call of the current read()
+        self.chat = SimpleNamespace(completions=self)
+        self._md = MarkItDown(enable_plugins=True, llm_client=self, llm_model=OCR_MODEL)
+
+    def create(self, model, messages, **options):
+        """OpenAI's chat.completions.create(), answered by llm (already set to OCR_MODEL)."""
+        try:
+            reply = self._llm.invoke(messages)
+        except Exception as error:
+            # markitdown-ocr leaves out a page it could not read without a word, so the failure is kept for read()
+            self._error = error
+            raise
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply.content))])
+
+    def read(self, path):
+        """
+        The text OCR'd from the PDF at path; '' when there is none, or when a page could not be read, so the
+        file is listed as not checked rather than checked with pages missing.
+        """
+        self._error = None
+        try:
+            text = (self._md.convert(path).markdown or '').strip()
+        except Exception:
+            log.warning('Could not OCR %s', path, exc_info=True)
+            return ''
+        if self._error or '*[Error' in text:
+            log.warning('Could not OCR every page of %s: %s', path.name, self._error or 'a page could not be rendered')
+            return ''
+        if not _OCR_FILLER.sub('', text).strip():
+            return ''
+        log.info('Read %s with OCR (%s)', path.name, OCR_MODEL)
+        return text
+
+
+def recheck_saved_criteria(tcno_folder, on_progress=None, company_file=COMPANY_DETAILS_FILE, usage=None):
     """
     Checks the company profile saved in company_file against the criteria in tcno_folder/CRITERIA_FILE, as
     saved by process_tender_files() and perhaps edited since, without reading the documents again: one LLM call.
     The sources the file lists as unreadable stay unreadable, so the check is still marked incomplete.
 
-    Returns the same dict as process_tender_files(); on_progress is called with step 1 of 1.
+    Returns the same dict as process_tender_files(); on_progress is called with step 1 of 1. usage, a TokenUsage,
+    if given, counts the tokens of the check; the criteria cost none.
     Raises RuntimeError when OLLAMA_API_KEY is missing or the company profile is empty, FileNotFoundError
     without a criteria file; errors from the LLM call propagate.
     """
     report = on_progress or (lambda message, **position: None)
+    usage = usage or TokenUsage()
     company = _company(company_file)
     criteria, skipped = read_criteria(Path(tcno_folder) / CRITERIA_FILE)
     report('Checking eligibility against the saved criteria', step=1, steps=1)
-    return _assess(make_model(), [criteria] if criteria else [], skipped, company,
+    llm = usage.track(make_model(ASSESSMENT_MODEL), 'assessment')
+    return _assess(llm, [criteria] if criteria else [], skipped, company,
                    f'The saved criteria in {CRITERIA_FILE} list no eligibility criteria.')
 
 
@@ -252,13 +358,19 @@ def compare_routes(criteria, jv):
 
 def jv_verdict(comparison, jv, skipped):
     """
-    The outcome for the company as JV lead member, with the verdict labels: Not Eligible when it misses a lead
-    member requirement, Eligible when it meets every one and no source was unreadable, otherwise Requires Review.
-    None when no JV is allowed or the documents do not say.
+    The outcome for the company as JV lead member, from its statuses (see statuses_verdict()). None when no JV is
+    allowed or the documents do not say.
     """
     if jv['allowed'] != 'yes':
         return None
-    statuses = [row['lead_status'] for row in comparison]
+    return statuses_verdict([row['lead_status'] for row in comparison], skipped)
+
+
+def statuses_verdict(statuses, skipped):
+    """
+    A verdict worked out from criteria statuses: Not Eligible when any is not met, Eligible when every one is met
+    and no source was unreadable (skipped is empty), otherwise Requires Review.
+    """
     if 'not_met' in statuses:
         return NOT_ELIGIBLE
     if statuses and all(status == 'met' for status in statuses) and not skipped:
@@ -268,15 +380,15 @@ def jv_verdict(comparison, jv, skipped):
 
 def _same_criterion(name, candidates):
     """The JV row in candidates for the criterion called name, or None."""
-    key = _criterion_key(name)
-    exact = next((row for row in candidates if _criterion_key(row['criterion']) == key), None)
+    key = criterion_key(name)
+    exact = next((row for row in candidates if criterion_key(row['criterion']) == key), None)
     return exact or next((row for row in candidates
-                          if key and _criterion_key(row['criterion'])
-                          and (key in _criterion_key(row['criterion']) or _criterion_key(row['criterion']) in key)),
+                          if key and criterion_key(row['criterion'])
+                          and (key in criterion_key(row['criterion']) or criterion_key(row['criterion']) in key)),
                          None)
 
 
-def _criterion_key(name):
+def criterion_key(name):
     """A criterion name for matching: lower case, letters and digits only."""
     return ' '.join(re.sub(r'[^a-z0-9]+', ' ', (name or '').lower()).split())
 
@@ -376,7 +488,7 @@ class _Rows:
         self._table += 1
 
     def add(self, row):
-        key = _criterion_key(row['criterion'])
+        key = criterion_key(row['criterion'])
         earlier = next((entry for entry in self._rows if entry[1] == key and entry[0] < self._table), None)
         if earlier:
             earlier[0], earlier[2] = self._table, row
