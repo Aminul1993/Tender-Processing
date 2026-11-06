@@ -181,8 +181,9 @@ Company Name row.
 4. `process_tender_files()` reads the company profile and fetches the tender's `GetPreQualification` page:
    the text the page passes to `displayText($(".contentPreQua"), "...")` is checked as written, under the
    source name `TenderTiger Pre-Qualification` (many tenders have none). It then converts
-   each file to text with MarkItDown (PDF and Word `.docx`, including `.doc` files saved in the `.docx` format;
-   an old Word 97-2003 `.doc` cannot be read and is listed as unreadable). A PDF MarkItDown gets no text from,
+   each file to text with MarkItDown: PDF, Word `.docx` (including `.doc` files saved in the `.docx` format),
+   PowerPoint `.pptx`, and Excel `.xlsx` and `.xls`, each sheet as a table. The older Word and PowerPoint 97-2003
+   formats, `.doc` and `.ppt`, cannot be read and are listed as unreadable. A PDF MarkItDown gets no text from,
    such as a scan, is converted again with the [markitdown-ocr](https://pypi.org/project/markitdown-ocr/) plugin,
    which sends each page image to `OCR_MODEL` to read; its tokens count towards the criteria step. If any page
    cannot be read, or no text comes back, the PDF is listed as unreadable. Of each file's text it keeps what is relevant to

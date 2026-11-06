@@ -1,4 +1,4 @@
-markitdown[pdf,docx]==0.1.9
+markitdown[pdf,docx,pptx,xlsx,xls]==0.1.9
 markitdown-ocr==0.1.2
 langchain-ollama==1.1.0
 fastapi==0.162.0

@@ -9,10 +9,13 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
+import docx
+import openpyxl
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from PIL import Image
+from pptx import Presentation
 
 from app import create_app
 from config import Config
@@ -384,6 +387,25 @@ class FileSelectionTest(AnalysisTestCase):
         self.assertEqual(read, ['Estimated cost: 98 Cr', 'Turnover at least 5 Cr'])
         # Not read on purpose, so the check is still complete
         self.assertEqual((result['verdict'], result['unreadable_files']), ('Eligible', []))
+
+    def test_word_powerpoint_and_excel_files_are_read(self):
+        document = docx.Document()
+        document.add_paragraph('Positive net worth')
+        document.save(self.folder / 'NIT.docx')
+        presentation = Presentation()
+        presentation.slides.add_slide(presentation.slide_layouts[0]).shapes.title.text = 'Turnover at least 5 Cr'
+        presentation.save(self.folder / 'Briefing.pptx')
+        workbook = openpyxl.Workbook()
+        workbook.active.append(['Estimated cost', '98 Cr'])
+        workbook.save(self.folder / 'BOQ.xlsx')
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+
+        result, read = self.analyse()
+
+        self.assertEqual(len(read), 3)
+        for text, expected in zip(read, ['Estimated cost', 'Turnover at least 5 Cr', 'Positive net worth']):
+            self.assertIn(expected, text)
+        self.assertEqual(result['unreadable_files'], [])
 
     def test_a_file_over_the_length_limit_is_listed_as_not_checked(self):
         (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
