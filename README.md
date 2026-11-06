@@ -39,8 +39,8 @@ utils/
   logging_setup.py           Console + rotating file logging (logs/app.log)
 templates/
   base.html                  Layout and app bar; IBM Plex, Bootstrap 5 (modal, toasts) and Bootstrap Icons
-  index.html                 Verdict tabs, run panel, tender table, selection bar, help, details modal,
-                             company profile editor; Tom Select for the searchable organisation filter
+  index.html                 Verdict tabs, run panel, tender table, selection bar, details modal, company profile
+                             editor, help modal (the ? in the app bar); Tom Select for the searchable organisation filter
 static/
   css/style.css              The visual system from design/: tokens, table grid, pills, responsive cards
   js/app.js                  Vanilla JS: loading, tabs/search/sort, selection, polling, decisions, modal
@@ -84,6 +84,12 @@ own search page (word, organisation, location, TID, company industry, quantity, 
 dates, GeM, NCB / ICB, funding, MSME, bid documents, startups): TenderTiger applies them, and the browser
 remembers the last ones applied. Without the Ollama key the tender list still loads, but every tender fails at
 the analysis step with a clear message.
+
+Beside the organisation filter, two filters narrow the page shown: the decision (**Not dropped**,
+**Shortlisted**, **No decision**, **Dropped**) and the closing date (**Open**,
+**Closes in 7 days**, today included, and **Closed**; a tender without a closing date counts as open). The verdict
+tabs count only the tenders these two filters leave, so with **Not dropped** the dropped tenders are left out of the
+counts as well as the table. **Show all tenders**, when nothing matches, clears every filter of the page.
 
 ## Run
 

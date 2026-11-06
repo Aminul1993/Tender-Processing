@@ -156,6 +156,7 @@ kbd {
   align-items: center;
   gap: 10px;
   min-width: 0;
+  margin-left: auto;  /* right-aligned, with the help button after it */
   font-size: 13px;
 }
 
@@ -197,6 +198,14 @@ kbd {
 .appbar-button:disabled {
   opacity: .6;
   cursor: default;
+}
+
+/* The ? that opens "How the eligibility check works": square, at the far right after the company line */
+.appbar-help {
+  justify-content: center;
+  width: 28px;
+  padding: 0;
+  font-size: 15px;
 }
 
 /* ---------- page ---------- */
@@ -420,7 +429,6 @@ kbd {
 .row-drop:focus-visible,
 .run-count:focus-visible,
 .bar-link:focus-visible,
-.help-toggle:focus-visible,
 .link-button:focus-visible,
 .check:focus-visible,
 .select:focus-visible {
@@ -560,6 +568,12 @@ kbd {
   background: var(--surface);
   color: var(--ink);
   font-size: 14px;
+}
+
+/* The decision and closing filters: short options, so the narrowest select rather than the organisation field's 220px */
+#filter-decision,
+#filter-closing {
+  flex-basis: 160px;
 }
 
 /* Native selects draw the page's chevron (Bootstrap Icons' chevron-down) in place of the browser's arrow */
@@ -744,11 +758,6 @@ select.filter-input {
 
 .switch-button[aria-checked="true"] .switch::after {
   transform: translateX(12px);
-}
-
-.mono-count {
-  color: var(--meta);
-  font-family: var(--font-mono);
 }
 
 /* ---------- TenderTiger search filters ---------- */
@@ -1654,43 +1663,12 @@ tbody .cell-drop {
   font-size: 14px;
 }
 
-/* ---------- how it works ---------- */
-
-.help-heading {
-  margin: 0;
-}
-
-.help-toggle {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  width: 100%;
-  padding: 16px 20px;
-  border: 0;
-  background: none;
-  color: var(--ink);
-  font-size: 15px;
-  font-weight: 600;
-  text-align: left;
-  cursor: pointer;
-}
-
-.help-state {
-  color: var(--meta);
-  font-size: 13px;
-  font-weight: 500;
-}
+/* ---------- how it works (the help modal) ---------- */
 
 .help-body {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 28px;
-  padding: 20px 20px 24px;
-  border-top: 1px solid var(--line-3);
-}
-
-.help-body[hidden] {
-  display: none;
 }
 
 .help-item h3 {
@@ -2840,11 +2818,8 @@ input.profile-input {
 
 /* ---------- narrower screens ---------- */
 
-@media (max-width: 1199.98px) {
-  .tender-table {
-    --cols: 44px minmax(0, 1fr) 112px 140px minmax(150px, 190px) 44px;
-  }
-
+/* Below the width the whole toolbar fits on one line */
+@media (max-width: 1299.98px) {
   /* Search gets its own row, so its placeholder is never cut; the other controls share the next one */
   .search {
     flex-basis: 100%;
@@ -2852,6 +2827,12 @@ input.profile-input {
 
   #process-btn {
     margin-left: auto;
+  }
+}
+
+@media (max-width: 1199.98px) {
+  .tender-table {
+    --cols: 44px minmax(0, 1fr) 112px 140px minmax(150px, 190px) 44px;
   }
 
   .cell-org {
@@ -2877,6 +2858,13 @@ input.profile-input {
     flex: 1 1 100%;
     flex-wrap: wrap;
     row-gap: 4px;
+    order: 2;
+  }
+
+  /* Stays on the brand's line, at its right */
+  .appbar-help {
+    order: 1;
+    margin-left: auto;
   }
 
   .appbar-company {

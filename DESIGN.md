@@ -327,7 +327,7 @@ Each verdict owns a triple: a pale background, an AA-legible foreground, and a m
 ### Hierarchy
 - **Headline** (600, 26px, -0.02em): the page title only ("Tenders").
 - **Title Large** (600, 18px, 1.35, -0.01em): the tender title in the details modal, never clamped there.
-- **Title** (600, 15px): app bar name, run panel status, help toggle, "Full analysis", section headings in the company profile editor (its sub-headings drop to 13px in `ink-3`). Summary headline in the modal steps to 16px.
+- **Title** (600, 15px): app bar name, run panel status, "Full analysis", section headings in the company profile editor (its sub-headings drop to 13px in `ink-3`). Summary headline in the modal steps to 16px.
 - **Body** (400 or 500, 14px, 1.4): row tender titles (500, clamped to two lines), buttons, inputs, run detail, analysis text (1.6).
 - **Body Small** (400, 13px, 1.6 in prose): organisation names (500), help copy, footers, facts lines, tab labels (500).
 - **Label** (500, 12px, 0.02em): column headers and the 12px meta line in `meta` grey.
@@ -345,7 +345,7 @@ Each verdict owns a triple: a pale background, an AA-legible foreground, and a m
 
 ## Layout
 
-A single centred column (max 1480px, 28px side padding, 20px gap between blocks, 120px bottom padding so the floating selection bar never covers the last row). Order: page head (title and summary line left, verdict tabs right, wrapping), run panel, the tender panel (toolbar, table, footer), the collapsible "How the eligibility check works" panel.
+A single centred column (max 1480px, 28px side padding, 20px gap between blocks, 120px bottom padding so the floating selection bar never covers the last row). Order: page head (title and summary line left, verdict tabs right, wrapping), run panel, the tender panel (toolbar, table, footer). "How the eligibility check works" is a modal opened from the app bar's ? button.
 
 The tender list is a real `<table>` with explicit ARIA table roles, laid out as CSS grid rows. Wide (1200px and up): seven columns, `52px | 2.6fr | 1.5fr | 120px | 150px | 190px | 44px` (select, Tender, Organisation, Value, Closes, Eligibility, drop). Each row reads along its first line: the title, organisation, value, closing date and verdict pill share one baseline (grid `first baseline`), with the checkbox and drop button beside it, however tall the verdict or organisation runs. 768 to 1199px: Organisation folds into the Tender cell as a meta line and the search field takes its own toolbar row, so Eligibility stays on screen. Below 768px: the header hides and each row becomes a card with areas `check tender drop / check verdict verdict / check closes value`, with Closes and Value carrying their own 11px labels. In the modal, the analysis table stacks into one bordered block per criterion with each cell labelled by its column. The app bar wraps the company line under the brand below 768px so the full company name and Edit profile stay readable. The company profile editor is an extra-wide scrollable modal (full screen below 992px); on narrow screens each of its tables scrolls sideways inside its own border instead of squeezing its fields below 130px.
 
@@ -397,10 +397,10 @@ Quiet and solid; one primary per area.
 - **Internal Padding:** 16 to 20px.
 
 ### Inputs / Fields
-- **Style:** 38px, 8px radius, 1px `control-line`. Search sits on `surface-sunk` with a leading search icon and a `/` kbd hint (left out on touch screens); the organisation filter is a white 220px field (see Searchable Select). Native selects (the filters' comparisons) draw the same 12px `muted` chevron, and an empty date field shows its dd-mm-yyyy format in `meta`.
+- **Style:** 38px, 8px radius, 1px `control-line`. Search sits on `surface-sunk` with a leading search icon and a `/` kbd hint (left out on touch screens); the organisation filter is a white 220px field (see Searchable Select), followed by the decision and closing date filters, 160px native selects. Below 1300px the search takes its own row and the other controls share the next, with Check eligibility at its right. Native selects (these and the filters' comparisons) draw the same 12px `muted` chevron, and an empty date field shows its dd-mm-yyyy format in `meta`.
 - **Focus:** fields you type into turn white with an `accent` border and a 3px soft blue glow; other fields use the 2px accent outline. Fields set flush inside a grid (the profile editor) draw that outline inset by 2px, so it stays inside the cell.
 - **Checkbox:** a real `<input type="checkbox">` drawn by CSS: 17px, 5px radius, 1.5px `check-line`; checked and indeterminate fill `accent` with a white tick or bar.
-- **Switch:** a `role="switch"` button holding a 28 by 16px track (`accent` when on) and a mono count.
+- **Switch:** a `role="switch"` button holding a 28 by 16px track (`accent` when on); Regenerate criteria in the selection bar.
 
 ### Searchable Select
 A select that opens a list you can search, like select2 (Tom Select over a real `<select>`, which keeps working on its own if the library does not load).
@@ -409,7 +409,7 @@ A select that opens a list you can search, like select2 (Tom Select over a real 
 - **Options:** 13px, 8px 12px padding, kept in their own (alphabetical) order while searching. The highlighted option fills `accent-wash`; the chosen one is `accent-strong` 600; matched text sits on `accent-soft` with a 2px radius. No match reads "No organisation matches" in `meta`.
 
 ### Navigation
-- **App bar:** 56px `chrome` band; 28px `accent` square mark with "TP", 15px 600 title; right side "Checking against" in `chrome-muted`, the company name in 600, and the Edit profile button: 28px, transparent, `chrome-link` 12px 500 text with a pencil icon, 7px radius and a white 18% border; hover turns the text white and the border 36%. It opens the Company Profile Editor.
+- **App bar:** 56px `chrome` band; 28px `accent` square mark with "TP", 15px 600 title; right side "Checking against" in `chrome-muted`, the company name in 600, and the Edit profile button: 28px, transparent, `chrome-link` 12px 500 text with a pencil icon, 7px radius and a white 18% border; hover turns the text white and the border 36%. It opens the Company Profile Editor. At the far right, a 28px square ? button in the same style opens "How the eligibility check works" in a large modal (help items in an auto-fit grid of 240px minimum columns, two across; full screen on phones). On a phone it stays at the right of the brand's line while the company line wraps below.
 - **Verdict tabs:** toggle buttons (`aria-pressed`) on a `track` well with 4px inset; each tab is a tone dot, a 13px 500 label and a mono count; the active tab is white with the tab-lift shadow.
 - **Page size:** "Per page" in 13px `meta` beside a compact 32px, 76px-wide select (20, 50, 100, 500) with the page's chevron, always in the footer's right-hand group, before the hint or the pager. A new size opens the page holding the first tender shown, and the browser remembers it.
 - **Pager:** in the tender panel's footer, on the right (on its own line when narrow), once the list runs past one page; until then the footer keeps its hint. Small secondary Previous and Next buttons 12px either side of a 13px `meta` status, "**Page 2** · tenders 21–40", the page in `ink` 500. TenderTiger gives no total, so there is no "of N": Next is offered while a page comes back full, and an empty next page leaves the list where it is with a short toast. While a page loads, the status reads "Loading page 3…" (or "Loading 100 per page…") and the rows fade to 50%; the new page brings the top of the list into view. Sorting (the Value and Closes headers) is TenderTiger's, over the whole list, and starts again from page 1 with the same loading state; tabs, search and the summary line cover the page shown. A selection carries across pages and orders, and the selection bar counts those "on other pages".

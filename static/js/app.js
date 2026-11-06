@@ -13,7 +13,6 @@
   const BASE_TITLE = document.title;
   const DISMISSED_KEY = 'tender-processing.dismissed-job';
   const NOTIFY_KEY = 'tender-processing.notify';
-  const HELP_KEY = 'tender-processing.help-closed';
   const FILTERS_KEY = 'tender-processing.search-filters';
   const PAGE_SIZE_KEY = 'tender-processing.page-size';
   const PAGE_SIZES = [20, 50, 100, 500];  // tenders a page may hold, as /api/tenders takes them
@@ -65,7 +64,8 @@
     filtersForm: $('search-filters'),
     filtersClear: $('filters-clear'),
     filtersApply: $('filters-apply'),
-    hideDropped: $('hide-dropped'),
+    decisionFilter: $('filter-decision'),
+    closingFilter: $('filter-closing'),
     processBtn: $('process-btn'),
     processLabel: $('process-label'),
     selectedCount: $('selected-count'),
@@ -82,9 +82,6 @@
     pageNext: $('page-next'),
     pageStatus: $('page-status'),
     pageSize: $('page-size'),
-    helpToggle: $('help-toggle'),
-    helpBody: $('help-body'),
-    helpState: $('help-state'),
     selectionBar: $('selection-bar'),
     selectionText: $('selection-text'),
     clearSelection: $('clear-selection'),
@@ -149,7 +146,6 @@
     decisions: new Map(),     // tcno -> {decision, decided_at}
     verdictFilter: '',        // the selected tab: a verdict, 'failed', 'pending', or '' for all
     searchFilters: {},        // the TenderTiger filters the list was loaded with, as /api/tenders query parameters
-    hideDropped: false,
     sort: {key: 'closing', order: 'asc'},  // how TenderTiger sorts the list: closing soonest first
     job: null,                // last /api/progress response, null while no job has run
     averageSeconds: null,     // average time per tender whose documents were read, for estimates
@@ -324,6 +320,35 @@
     return Boolean(decision && decision.decision === 'dropped');
   };
   const verdictOf = (key) => VERDICTS[key] || {label: key || 'Unknown', tone: 'none'};
+
+  /** 'closed', 'soon' (closing within URGENT_DAYS, today included) or 'open' (later, or no closing date given). */
+  function closingStatus(tender) {
+    const days = numberOr(tender.days_left);
+    if (days === null) return 'open';
+    return days < 0 ? 'closed' : days <= URGENT_DAYS ? 'soon' : 'open';
+  }
+
+  // The options of the decision and closing filters: whether a tender's decision / closing status falls under each
+  const DECISION_FILTERS = {
+    not_dropped: (decision) => decision !== 'dropped',
+    shortlisted: (decision) => decision === 'shortlisted',
+    none: (decision) => !decision,
+    dropped: (decision) => decision === 'dropped',
+  };
+  const CLOSING_FILTERS = {
+    open: (closing) => closing !== 'closed',  // closing soon is still open
+    soon: (closing) => closing === 'soon',
+    closed: (closing) => closing === 'closed',
+  };
+
+  /** Whether a tender falls under the decision and closing filters chosen ('' passes all). */
+  function inStatusFilters(tender) {
+    const decisionValue = els.decisionFilter.value;
+    const closingValue = els.closingFilter.value;
+    const decision = (state.decisions.get(tender.tcno) || {}).decision;
+    return (!decisionValue || DECISION_FILTERS[decisionValue](decision))
+      && (!closingValue || CLOSING_FILTERS[closingValue](closingStatus(tender)));
+  }
 
   function pill(tone, label) {
     return el('span', {cls: `pill tone-${tone}`}, [
@@ -713,7 +738,7 @@
         terms.every((term) => row.dataset.search.includes(term))
         && (!organisation || row.dataset.organisation === organisation)
         && (!state.verdictFilter || row.dataset.category === state.verdictFilter)
-        && !(state.hideDropped && isDropped(tender.tcno))
+        && inStatusFilters(tender)
       );
       if (!row.hidden) shown += 1;
     }
@@ -722,13 +747,14 @@
     updateSelectionUI();
   }
 
-  /** Tab counts; with "Hide dropped" on, dropped tenders are left out of them as well as the table. */
+  /**
+   * Tab counts, of the tenders the decision and closing filters leave (so "Not dropped" leaves the dropped ones out
+   * of them as well as the table).
+   */
   function updateCounts() {
-    const counts = {all: 0, dropped: 0};
+    const counts = {all: 0};
     for (const tender of state.tenders) {
-      const dropped = isDropped(tender.tcno);
-      if (dropped) counts.dropped += 1;
-      if (state.hideDropped && dropped) continue;
+      if (!inStatusFilters(tender)) continue;
       counts.all += 1;
       const key = category(tender.tcno);
       counts[key] = (counts[key] || 0) + 1;
@@ -746,18 +772,12 @@
     applyFilters();
   }
 
-  function setHideDropped(hide) {
-    state.hideDropped = hide;
-    els.hideDropped.setAttribute('aria-checked', String(hide));
-    applyFilters();
-  }
-
   function clearFilters() {
     els.search.value = '';
     if (orgPicker) orgPicker.setValue('', true);
     else els.orgFilter.value = '';
-    state.hideDropped = false;
-    els.hideDropped.setAttribute('aria-checked', 'false');
+    els.decisionFilter.value = '';
+    els.closingFilter.value = '';
     setVerdictFilter('');
   }
 
@@ -2407,18 +2427,12 @@
     }
   }
 
-  /* ---------- how it works ---------- */
-
-  function setHelpOpen(open) {
-    els.helpBody.hidden = !open;
-    els.helpToggle.setAttribute('aria-expanded', String(open));
-    els.helpState.textContent = open ? 'Hide' : 'Show';
-  }
-
   /* ---------- wiring ---------- */
 
   els.search.addEventListener('input', applyFilters);
   els.orgFilter.addEventListener('change', applyFilters);
+  els.decisionFilter.addEventListener('change', applyFilters);
+  els.closingFilter.addEventListener('change', applyFilters);
   els.refreshBtn.addEventListener('click', () => loadTenders());
   els.pagePrev.addEventListener('click', () => showList({page: state.page - 1}));
   els.pageNext.addEventListener('click', () => showList({page: state.page + 1}));
@@ -2443,22 +2457,11 @@
   els.clearSelection.addEventListener('click', clearSelection);
   els.stopBtn.addEventListener('click', stopRun);
   els.notifyBtn.addEventListener('click', toggleNotify);
-  els.hideDropped.addEventListener('click', () => setHideDropped(!state.hideDropped));
   els.sortButtons.forEach((button) => button.addEventListener('click', () => setSort(button.dataset.sort)));
 
   els.filters.addEventListener('click', (event) => {
     const tab = event.target.closest('.tab');
     if (tab) setVerdictFilter(tab.dataset.verdict);
-  });
-
-  els.helpToggle.addEventListener('click', () => {
-    const open = els.helpBody.hidden;
-    setHelpOpen(open);
-    try {
-      localStorage.setItem(HELP_KEY, open ? '0' : '1');
-    } catch (_) {
-      // Storage blocked: the section opens again on the next page load
-    }
   });
 
   // Looking at the tab again clears the "Done: ..." note from its title
@@ -2617,7 +2620,6 @@
   (async function init() {
     try {
       state.notify = localStorage.getItem(NOTIFY_KEY) === '1' && canNotify() && Notification.permission === 'granted';
-      setHelpOpen(localStorage.getItem(HELP_KEY) !== '1');
     } catch (_) {
       state.notify = false;
     }

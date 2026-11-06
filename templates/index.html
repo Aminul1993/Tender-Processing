@@ -6,6 +6,13 @@
       integrity="sha384-EIA8J01pb+PXiVYnDYseaCki0ke5k3Z/QNbhj0nU+Uso0kvSYdFnQB3G6ia7lU+Y" crossorigin="anonymous">
 {% endblock %}
 
+{% block appbar_actions %}
+<button type="button" class="appbar-button appbar-help" data-bs-toggle="modal" data-bs-target="#help-modal"
+        aria-label="How the eligibility check works" title="How the eligibility check works">
+  <i class="bi bi-question-lg" aria-hidden="true"></i>
+</button>
+{% endblock %}
+
 {% block content %}
 <div class="page-head">
   <div class="page-title">
@@ -72,6 +79,19 @@
     <select class="select" id="filter-organisation" aria-label="Filter by organisation">
       <option value="">All organisations</option>
     </select>
+    <select class="select" id="filter-decision" aria-label="Filter by decision">
+      <option value="">All decisions</option>
+      <option value="not_dropped">Not dropped</option>
+      <option value="shortlisted">Shortlisted</option>
+      <option value="none">No decision</option>
+      <option value="dropped">Dropped</option>
+    </select>
+    <select class="select" id="filter-closing" aria-label="Filter by closing date">
+      <option value="">Any closing date</option>
+      <option value="open">Open</option>
+      <option value="soon">Closes in 7 days</option>
+      <option value="closed">Closed</option>
+    </select>
     <button type="button" class="button button-secondary" id="filters-btn" aria-expanded="false"
             aria-controls="search-filters">
       <i class="bi bi-funnel" aria-hidden="true"></i> Filters
@@ -80,10 +100,6 @@
     <button type="button" class="icon-button icon-button-bordered" id="refresh-btn" title="Reload tenders"
             aria-label="Reload tenders">
       <i class="bi bi-arrow-clockwise" aria-hidden="true"></i>
-    </button>
-    <button type="button" class="switch-button" id="hide-dropped" role="switch" aria-checked="false">
-      <span class="switch" aria-hidden="true"></span>
-      Hide dropped <span class="mono-count" data-count="dropped">0</span>
     </button>
     <button type="button" class="button button-primary" id="process-btn" disabled>
       <span id="process-label">Check eligibility</span>
@@ -243,55 +259,60 @@
   </div>
 </section>
 
-<section class="panel help" aria-labelledby="help-title">
-  <h2 class="help-heading" id="help-title">
-    <button type="button" class="help-toggle" id="help-toggle" aria-expanded="true" aria-controls="help-body">
-      How the eligibility check works
-      <span class="help-state" id="help-state">Hide</span>
-    </button>
-  </h2>
-  <div class="help-body" id="help-body">
-    <div class="help-item">
-      <h3>01 · Analysis</h3>
-      <p>Every document in a selected tender is downloaded and read, including files inside ZIP archives. Each
-        eligibility criterion is compared with the company profile. A tender usually takes a few minutes.</p>
-      <p>The criteria found are saved with the documents. Checking the tender again compares the profile with
-        them without reading the documents; switch on <strong>Regenerate criteria</strong> to read them again.</p>
-    </div>
-    <div class="help-item">
-      <h3>02 · Runs in background</h3>
-      <p>You can close this page while checks run on the server. <strong>Notify me when done</strong> sends a
-        browser notification (localhost and https only). Verdicts and shortlist and drop decisions are kept when
-        the server restarts.</p>
-    </div>
-    <div class="help-item">
-      <h3>03 · Verdicts</h3>
-      <ul class="help-verdicts">
-        <li><span class="dot dot-eligible" aria-hidden="true"></span><span><strong>Eligible</strong> — the company
-          meets every criterion.</span></li>
-        <li><span class="dot dot-not" aria-hidden="true"></span><span><strong>Not eligible</strong> — a criterion is
-          not met; the row names it.</span></li>
-        <li><span class="dot dot-review" aria-hidden="true"></span><span><strong>Needs review</strong> — a criterion
-          couldn't be determined, a file was unreadable, or no criteria were found. Open it before deciding.</span></li>
-      </ul>
-      <p>The verdict is for the company bidding alone. The line under it gives the outcome as lead member of a
-        joint venture (JV), when one may bid. The analysis compares the two criterion by criterion; a green row is
-        one the company misses alone but meets as JV lead member.</p>
-      <p>If the AI got a criterion wrong, change its status in the analysis. It is tagged <strong>Marked by
-        user</strong>, the verdict then follows the statuses, and a re-check keeps your change. Files the AI could
-        not read keep a tender at Needs review until you mark them <strong>checked</strong> there.</p>
-    </div>
-    <div class="help-item">
-      <h3>04 · Deep analysis</h3>
-      <p>For a second opinion, open a checked tender and run <strong>Deep analysis</strong>. Five AI agents
-        normalise the inputs, check the company profile for missing or inconsistent data, audit every criterion
-        afresh, question the statuses marked by user, and settle their disagreements in a final determination with
-        confidence scores, data gaps and an audit log.</p>
-      <p>It takes a few minutes, never changes the verdict, and is saved beside the result as
-        <strong>deep_analysis.json</strong>.</p>
+<!-- How the eligibility check works; opened by the ? button in the app bar -->
+<div class="modal fade" id="help-modal" tabindex="-1" aria-labelledby="help-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable modal-fullscreen-sm-down">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h2 class="details-title mb-0 me-auto" id="help-title">How the eligibility check works</h2>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="modal-body help-body">
+        <div class="help-item">
+          <h3>01 · Analysis</h3>
+          <p>Every document in a selected tender is downloaded and read, including files inside ZIP archives. Each
+            eligibility criterion is compared with the company profile. A tender usually takes a few minutes.</p>
+          <p>The criteria found are saved with the documents. Checking the tender again compares the profile with
+            them without reading the documents; switch on <strong>Regenerate criteria</strong> to read them again.</p>
+        </div>
+        <div class="help-item">
+          <h3>02 · Runs in background</h3>
+          <p>You can close this page while checks run on the server. <strong>Notify me when done</strong> sends a
+            browser notification (localhost and https only). Verdicts and shortlist and drop decisions are kept when
+            the server restarts.</p>
+        </div>
+        <div class="help-item">
+          <h3>03 · Verdicts</h3>
+          <ul class="help-verdicts">
+            <li><span class="dot dot-eligible" aria-hidden="true"></span><span><strong>Eligible</strong> — the company
+              meets every criterion.</span></li>
+            <li><span class="dot dot-not" aria-hidden="true"></span><span><strong>Not eligible</strong> — a criterion is
+              not met; the row names it.</span></li>
+            <li><span class="dot dot-review" aria-hidden="true"></span><span><strong>Needs review</strong> — a criterion
+              couldn't be determined, a file was unreadable, or no criteria were found. Open it before deciding.</span></li>
+          </ul>
+          <p>The verdict is for the company bidding alone. The line under it gives the outcome as lead member of a
+            joint venture (JV), when one may bid. The analysis compares the two criterion by criterion; a green row is
+            one the company misses alone but meets as JV lead member.</p>
+          <p>If the AI got a criterion wrong, change its status in the analysis. It is tagged <strong>Marked by
+            user</strong>, the verdict then follows the statuses, and a re-check keeps your change. Files the AI could
+            not read keep a tender at Needs review until you mark them <strong>checked</strong> there.</p>
+        </div>
+        <div class="help-item">
+          <h3>04 · Deep analysis</h3>
+          <p>For a second opinion, open a checked tender and run <strong>Deep analysis</strong>. Five AI agents
+            normalise the inputs, check the company profile for missing or inconsistent data, audit every criterion
+            afresh, question the statuses marked by user, and settle their disagreements in a final determination with
+            confidence scores, data gaps and an audit log.</p>
+          <p>It takes a few minutes, never changes the verdict, and is saved beside the result as
+            <strong>deep_analysis.json</strong>.</p>
+        </div>
+      </div>
     </div>
   </div>
-</section>
+</div>
 
 <!-- Appears while tenders are selected -->
 <div class="selection-bar" id="selection-bar" role="region" aria-label="Selected tenders" hidden>
