@@ -46,8 +46,8 @@ def create_app(config_object=Config):
 
     if not os.getenv('TENDERTIGER_EMAIL') or not os.getenv('TENDERTIGER_PASSWORD'):
         log.warning('TENDERTIGER_EMAIL / TENDERTIGER_PASSWORD are not set: the tender list cannot be loaded')
-    if not os.getenv('OLLAMA_API_KEY'):
-        log.warning('OLLAMA_API_KEY is not set: tenders can be listed but every analysis will fail')
+    if not os.getenv('GROQ_API_KEY'):
+        log.warning('GROQ_API_KEY is not set: tenders can be listed but every analysis will fail')
     if not company_details(config_object.COMPANY_DETAILS_FILE):
         log.warning('The company profile %s is empty: add it with Edit profile on the page, or every analysis will fail',
                     config_object.COMPANY_DETAILS_FILE)

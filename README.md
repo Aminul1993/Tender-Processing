@@ -1,7 +1,7 @@
 # Tender Processing
 
 [![FastAPI](https://img.shields.io/badge/FastAPI-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
-[![Ollama](https://img.shields.io/badge/Ollama-000000?logo=ollama&logoColor=white)](https://ollama.com)
+[![Groq](https://img.shields.io/badge/Groq-F55036)](https://groq.com)
 [![Bootstrap 5](https://img.shields.io/badge/Bootstrap-5-7952B3?logo=bootstrap&logoColor=white)](https://getbootstrap.com)
 
 A FastAPI web app that lists your subscribed tenders, and for the ones you select: downloads the documents,
@@ -60,7 +60,7 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Copy [.env.example](.env.example) to `.env` and put your TenderTiger login and ollama.com API key in it; the other
+Copy [.env.example](.env.example) to `.env` and put your TenderTiger login and Groq API key in it; the other
 settings in it are optional (see [Configuration](#configuration)):
 
 ```powershell
@@ -70,7 +70,7 @@ Copy-Item .env.example .env
 ```
 TENDERTIGER_EMAIL=you@example.com
 TENDERTIGER_PASSWORD=your-password
-OLLAMA_API_KEY=your-key
+GROQ_API_KEY=your-key
 ```
 
 The app logs in to TenderTiger on first use and keeps the session, logging in again when the site ends it.
@@ -82,7 +82,7 @@ TenderTiger sort the whole list (closing soonest first by default) and start aga
 the first one that is not full (or, when the last is exactly full, Next finds an empty page and says so). **Filters** in the toolbar narrows that search with the filters of TenderTiger's
 own search page (word, organisation, location, TID, company industry, quantity, value, EMD, publish and closing
 dates, GeM, NCB / ICB, funding, MSME, bid documents, startups): TenderTiger applies them, and the browser
-remembers the last ones applied. Without the Ollama key the tender list still loads, but every tender fails at
+remembers the last ones applied. Without the Groq key the tender list still loads, but every tender fails at
 the analysis step with a clear message.
 
 Beside the organisation filter, two filters narrow the page shown: the decision (**Not dropped**,
@@ -124,14 +124,14 @@ can be re-checked quickly; the downloaded files stay in `downloads/`, and shortl
 | `TENDERTIGER_EMAIL` | (none) | TenderTiger login; the tender list, documents and pre-qualification use it |
 | `TENDERTIGER_PASSWORD` | (none) | Password of that login |
 | `TENDERTIGER_REQUEST_GAP` | `3` | Seconds between two requests to TenderTiger; its firewall blocks bursts with a browser check |
-| `OLLAMA_API_KEY` | (none) | ollama.com key used by the LLM analysis |
-| `SUMMARY_MODEL` | `gemma4:31b-cloud` | ollama.com model that reads the documents for criteria (most of the tokens) |
-| `ASSESSMENT_MODEL` | `gpt-oss:120b-cloud` | ollama.com model that checks the company against the criteria, also on a re-check |
-| `OCR_MODEL` | `gemma4:31b-cloud` | ollama.com model that reads the pages of scanned PDFs; it must accept images (vision) |
-| `DEEP_PROFILER_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of the deep analysis's Company Profiler agent |
-| `DEEP_AUDIT_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Eligibility Audit agent, also for re-examinations |
-| `DEEP_STATUS_REVIEW_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Discrepancy & Status Review agent |
-| `DEEP_SUPERVISOR_MODEL` | `ASSESSMENT_MODEL` | ollama.com model of its Supervisor / Judge agent |
+| `GROQ_API_KEY` | (none) | Groq key used by the LLM analysis ([console.groq.com/keys](https://console.groq.com/keys)) |
+| `SUMMARY_MODEL` | `openai/gpt-oss-20b` | Groq model that reads the documents for criteria (most of the tokens) |
+| `ASSESSMENT_MODEL` | `openai/gpt-oss-120b` | Groq model that checks the company against the criteria, also on a re-check |
+| `OCR_MODEL` | `qwen/qwen3.8-27b` | Groq model that reads the pages of scanned PDFs; it must accept images (vision) |
+| `DEEP_PROFILER_MODEL` | `ASSESSMENT_MODEL` | Groq model of the deep analysis's Company Profiler agent |
+| `DEEP_AUDIT_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Eligibility Audit agent, also for re-examinations |
+| `DEEP_STATUS_REVIEW_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Discrepancy & Status Review agent |
+| `DEEP_SUPERVISOR_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Supervisor / Judge agent |
 | `TARGET_DIRECTORY` | `./downloads` | Documents are stored in `TARGET_DIRECTORY/<tcno>/` |
 | `DOWNLOAD_TIMEOUT` | `120` | Seconds to wait for the document server |
 | `MAX_DOWNLOAD_MB` | `500` | Larger downloads are aborted |

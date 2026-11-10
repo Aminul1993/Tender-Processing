@@ -50,7 +50,7 @@ AGENT_TITLES = {
 }
 # The agents that call the LLM, whose tokens are counted
 LLM_AGENTS = AGENTS[1:]
-# The ollama.com model each of them runs on, set in .env (DEEP_PROFILER_MODEL and so on; see ext.py)
+# The Groq model each of them runs on, set in .env (DEEP_PROFILER_MODEL and so on; see ext.py)
 AGENT_MODELS = {'profiler': DEEP_PROFILER_MODEL, 'audit': DEEP_AUDIT_MODEL, 'status_review': DEEP_STATUS_REVIEW_MODEL,
                 'supervisor': DEEP_SUPERVISOR_MODEL}
 # How many times the supervisor may send disputed criteria back to the audit agent, and how many criteria a time
@@ -574,13 +574,13 @@ def run_deep_analysis(result, folder, company, decision=None, on_progress=None, 
 
     on_progress, if given, is called with (agent, stage, round) as each agent starts, round being 0 for the first
     pass and the re-examination round after it. usage, a TokenUsage over LLM_AGENTS, counts each agent's tokens.
-    Raises RuntimeError without OLLAMA_API_KEY or with an empty profile, DeepAnalysisError when there is nothing to
+    Raises RuntimeError without GROQ_API_KEY or with an empty profile, DeepAnalysisError when there is nothing to
     review or an agent's answer cannot be read; LLM errors propagate.
     """
     notify = on_progress or (lambda agent, stage, round_number=0: None)
     usage = usage or TokenUsage(LLM_AGENTS)
-    if not os.getenv('OLLAMA_API_KEY'):
-        raise RuntimeError('OLLAMA_API_KEY is not set. Add it to .env and restart the app.')
+    if not os.getenv('GROQ_API_KEY'):
+        raise RuntimeError('GROQ_API_KEY is not set. Add it to .env and restart the app.')
     if not (company or '').strip():
         raise RuntimeError('The company profile is empty.')
     started = time.monotonic()

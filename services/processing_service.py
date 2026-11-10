@@ -479,8 +479,8 @@ def explain_error(exc):
             return ('The ZIP file could not be opened',
                     'The archive may be damaged or encrypted. Retry, or check the documents on TenderTiger.')
         return ('The documents could not be downloaded', 'Retry. If it fails again, check the tender on TenderTiger.')
-    if 'OLLAMA_API_KEY' in text:
-        return ('The LLM API key is missing', 'Add OLLAMA_API_KEY to .env, restart the app and retry.')
+    if 'GROQ_API_KEY' in text:
+        return ('The LLM API key is missing', 'Add GROQ_API_KEY to .env, restart the app and retry.')
     if 'no tender files' in lower:
         if 'could not be fetched' in lower:
             return ('The pre-qualification criteria could not be fetched',

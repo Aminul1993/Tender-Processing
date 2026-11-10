@@ -5,7 +5,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 import requests
 from requests.adapters import HTTPAdapter
 
@@ -156,13 +156,12 @@ Finish with an overall verdict (Eligible, Not eligible, or Cannot determine) for
 Company details:
 {company_details}"""
 
-# The ollama.com models of the two LLM steps. Of the free-plan models tried on real tenders, gemma4 summarises
-# fastest with the fewest tokens and keeps every figure. gpt-oss:120b checks the criteria at about 1k more tokens a
-# tender.
-SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', 'gemma4:31b-cloud')
-ASSESSMENT_MODEL = os.getenv('ASSESSMENT_MODEL', 'gpt-oss:120b-cloud')
-# The ollama.com model that reads the pages of a scanned PDF (markitdown-ocr); it must accept images ('vision')
-OCR_MODEL = os.getenv('OCR_MODEL', 'gemma4:31b-cloud')
+# The Groq models of the two LLM steps (https://console.groq.com/docs/models): the smaller gpt-oss-20b reads the
+# documents, which takes most of the tokens, and gpt-oss-120b checks the company against the criteria found.
+SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', 'openai/gpt-oss-20b')
+ASSESSMENT_MODEL = os.getenv('ASSESSMENT_MODEL', 'openai/gpt-oss-120b')
+# The Groq model that reads the pages of a scanned PDF (markitdown-ocr); it must accept images ('vision')
+OCR_MODEL = os.getenv('OCR_MODEL', 'qwen/qwen3.8-27b')
 # The models of the LLM agents of a deep analysis (services/deep_analysis_service.py), each ASSESSMENT_MODEL unless
 # set: the profiler checks the company data, the audit matches it against every criterion, the status review
 # questions the statuses marked by user, and the supervisor settles their disagreements
@@ -172,14 +171,11 @@ DEEP_STATUS_REVIEW_MODEL = os.getenv('DEEP_STATUS_REVIEW_MODEL', ASSESSMENT_MODE
 DEEP_SUPERVISOR_MODEL = os.getenv('DEEP_SUPERVISOR_MODEL', ASSESSMENT_MODEL)
 
 def make_model(model=SUMMARY_MODEL):
-    """Returns the ollama.com chat model named model, with retries."""
-    return ChatOllama(
-        base_url="https://ollama.com",
-        model=model,
-        validate_model_on_init=False,
-        temperature=0,
-        client_kwargs={"timeout": 120},
-    ).with_retry(stop_after_attempt=3)
+    """Returns the Groq chat model named model, with retries. The API key is read from GROQ_API_KEY."""
+    # Qwen models put their reasoning in the reply between <think> tags unless told to hide it; gpt-oss models
+    # refuse the option and keep their reasoning out of the reply anyway
+    reasoning = {'reasoning_format': 'hidden'} if model.startswith('qwen/') else {}
+    return ChatGroq(model=model, temperature=0, timeout=120, **reasoning).with_retry(stop_after_attempt=3)
 
 def assess_eligibility(llm, summaries, company=None):
     """

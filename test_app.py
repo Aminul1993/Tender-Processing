@@ -100,9 +100,9 @@ class FakeResponse:
 
 
 def counting_model(*replies):
-    """A chat model answering each call with the next (content, input tokens, output tokens), reported as ChatOllama does."""
+    """A chat model answering each call with the next (content, input tokens, output tokens), reported as ChatGroq does."""
     return GenericFakeChatModel(messages=iter([
-        AIMessage(content=content, response_metadata={'model_name': 'gemma4:31b-cloud'},
+        AIMessage(content=content, response_metadata={'model_name': 'openai/gpt-oss-20b'},
                   usage_metadata={'input_tokens': sent, 'output_tokens': received, 'total_tokens': sent + received})
         for content, sent, received in replies
     ]))
@@ -236,7 +236,7 @@ class ParseTest(unittest.TestCase):
         title, action = explain_error(DownloadError('Download failed: 403 Client Error: Forbidden for url'))
         self.assertEqual(title, 'Document download refused')
         self.assertIn('Retry in a few minutes', action)
-        self.assertEqual(explain_error(RuntimeError('OLLAMA_API_KEY is not set.'))[0], 'The LLM API key is missing')
+        self.assertEqual(explain_error(RuntimeError('GROQ_API_KEY is not set.'))[0], 'The LLM API key is missing')
         title, action = explain_error(RuntimeError(TENDERTIGER_BLOCKED))
         self.assertEqual(title, 'TenderTiger is blocking automated visits for now')
         title, action = explain_error(RuntimeError('TenderTiger login failed: Invalid username or password.'))
@@ -245,7 +245,7 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(explain_error(ValueError('boom'))[0], 'The analysis failed')
 
     def test_empty_company_profile_fails_before_any_llm_call(self):
-        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'}), \
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'}), \
                 mock.patch('services.analysis_service.make_model') as make_model:
             with self.assertRaises(RuntimeError) as raised:
                 process_tender_files(tmp, company_file=Path(tmp) / 'missing.md')
@@ -264,7 +264,7 @@ class AnalysisTestCase(unittest.TestCase):
         save_company_details(COMPANY, self.company_file)
         self.llm = mock.Mock()
         self.llm.with_config.return_value = self.llm  # TokenUsage.track() binds the token counter to it
-        for patch in (mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'}),
+        for patch in (mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'}),
                       mock.patch('services.analysis_service.make_model', return_value=self.llm)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1260,7 +1260,7 @@ class ApiTest(unittest.TestCase):
         """Answers the deep analysis agents with DEEP_REPLIES, or the replies given, for the rest of the test."""
         agents = ScriptedAgents(**{**DEEP_REPLIES, **replies})
         for patch in (mock.patch('services.deep_analysis_service.make_model', return_value=agents),
-                      mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'})):
+                      mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'})):
             patch.start()
             self.addCleanup(patch.stop)
         return agents
@@ -1356,12 +1356,12 @@ class ApiTest(unittest.TestCase):
         self.client.post('/api/deep-analysis/100091540')
         report = self.wait_for_deep('100091540')['analysis']
 
-        agents.replies['supervisor'] = [ConnectionError('ollama.com timed out')]
+        agents.replies['supervisor'] = [ConnectionError('api.groq.com timed out')]
         with self.assertLogs('services.deep_analysis_service', 'ERROR'):
             self.client.post('/api/deep-analysis/100091540')
             state = self.wait_for_deep('100091540', 'failed')
 
-        self.assertEqual((state['error'], state['error_title']), ('ollama.com timed out', 'The deep analysis failed'))
+        self.assertEqual((state['error'], state['error_title']), ('api.groq.com timed out', 'The deep analysis failed'))
         self.assertEqual(state['analysis'], report)
 
 
@@ -1438,7 +1438,7 @@ class DeepAnalysisTest(unittest.TestCase):
         self.folder = Path(self.tmp.name)
         (self.folder / CRITERIA_FILE).write_text('# Eligibility criteria\n\n## NIT.pdf\nTurnover 10 Cr; one similar '
                                                  'work of 40 Cr.\n', encoding='utf-8')
-        patch = mock.patch.dict(os.environ, {'OLLAMA_API_KEY': 'key'})
+        patch = mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'})
         patch.start()
         self.addCleanup(patch.stop)
         self.addCleanup(self.tmp.cleanup)
@@ -1581,7 +1581,7 @@ class DeepAnalysisTest(unittest.TestCase):
         (self.folder / CRITERIA_FILE).unlink()
         with self.assertRaises(DeepAnalysisError):
             self.run_agents(empty)
-        with mock.patch.dict(os.environ, {'OLLAMA_API_KEY': ''}), self.assertRaises(RuntimeError):
+        with mock.patch.dict(os.environ, {'GROQ_API_KEY': ''}), self.assertRaises(RuntimeError):
             self.run_agents()
 
 

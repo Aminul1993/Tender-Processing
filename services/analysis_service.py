@@ -104,7 +104,7 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
     on_progress, if given, is called with a short status message before each step, plus step and steps
     (1-based position and total, counting each file and the final check) when they are known.
     usage, a TokenUsage, if given, counts the tokens of reading the files and of the final check.
-    Raises RuntimeError when OLLAMA_API_KEY is missing, the company profile is empty, or there is nothing to check
+    Raises RuntimeError when GROQ_API_KEY is missing, the company profile is empty, or there is nothing to check
     (no files and no pre-qualification criteria); errors from the final LLM call propagate.
     """
     report = on_progress or (lambda message, **position: None)
@@ -234,7 +234,7 @@ def recheck_saved_criteria(tcno_folder, on_progress=None, company_file=COMPANY_D
 
     Returns the same dict as process_tender_files(); on_progress is called with step 1 of 1. usage, a TokenUsage,
     if given, counts the tokens of the check; the criteria cost none.
-    Raises RuntimeError when OLLAMA_API_KEY is missing or the company profile is empty, FileNotFoundError
+    Raises RuntimeError when GROQ_API_KEY is missing or the company profile is empty, FileNotFoundError
     without a criteria file; errors from the LLM call propagate.
     """
     report = on_progress or (lambda message, **position: None)
@@ -294,8 +294,8 @@ def read_criteria(path):
 
 def _company(company_file):
     """The company profile in company_file, after checking the LLM can be called. Raises RuntimeError."""
-    if not os.getenv('OLLAMA_API_KEY'):
-        raise RuntimeError('OLLAMA_API_KEY is not set. Add it to .env and restart the app.')
+    if not os.getenv('GROQ_API_KEY'):
+        raise RuntimeError('GROQ_API_KEY is not set. Add it to .env and restart the app.')
     company = company_details(company_file)
     if not company:
         raise RuntimeError(f'The company profile in {company_file} is empty.')

@@ -26,7 +26,7 @@ The app checks the tender against the company's own figures, not against keyword
 - **Documents:** each tender's documents download as one zip, often with zips nested inside. Typical contents are the NIT, annexures and the BOQ, as PDF, Excel and similar files. The tenders are Indian public-sector works (railways, PWD and others), with values in INR.
 - **Pace:** analysis is slow. A typical tender takes several minutes and about 90 LLM calls, so the team selects a batch, the server works through it one tender at a time, and the page shows live progress. The criteria found are saved in the tender's folder, so checking it again (after a profile change, say) takes one LLM call unless the team chooses to regenerate them.
 - **Hosting:** a single-process FastAPI app on the company's own machine or server. Job progress is kept in memory and lost on restart; each tender's last result is saved in its folder and loaded again at startup, and the downloaded files are kept.
-- **LLM:** a cloud model on ollama.com, which needs an API key. Without the key the tender list still loads, but every analysis fails with a clear message.
+- **LLM:** cloud models on Groq, which need an API key. Without the key the tender list still loads, but every analysis fails with a clear message.
 
 ## Capabilities and Constraints
 
