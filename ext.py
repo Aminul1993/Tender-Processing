@@ -5,6 +5,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
+from langchain_core.runnables import RunnableLambda
 from langchain_groq import ChatGroq
 import requests
 from requests.adapters import HTTPAdapter
@@ -98,23 +99,40 @@ def company_details(path=COMPANY_DETAILS_FILE):
     Returns the company profile saved in path, as markdown, or an empty string if the file does not exist.
     """
     with _company_lock:
-        try:
-            # utf-8-sig, because Windows editors may save the file with a BOM
-            return Path(path).read_text(encoding='utf-8-sig').strip()
-        except FileNotFoundError:
-            return ''
+        return _read_company(path)
 
 def save_company_details(text, path=COMPANY_DETAILS_FILE):
     """
     Saves the company profile to path. Writes a temporary file first, so a crash mid-write cannot leave
     half a profile.
     """
-    path = Path(path)
     with _company_lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + '.tmp')
-        temporary.write_text(text.strip() + '\n', encoding='utf-8')
-        os.replace(temporary, path)
+        _write_company(text, path)
+
+def update_company_details(change, path=COMPANY_DETAILS_FILE):
+    """
+    Changes the company profile saved in path: change is given the profile as markdown and returns it changed,
+    saved unless it is the same. No other save can come between the read and the write.
+    """
+    with _company_lock:
+        text = _read_company(path)
+        changed = change(text)
+        if changed.strip() != text:
+            _write_company(changed, path)
+
+def _read_company(path):
+    try:
+        # utf-8-sig, because Windows editors may save the file with a BOM
+        return Path(path).read_text(encoding='utf-8-sig').strip()
+    except FileNotFoundError:
+        return ''
+
+def _write_company(text, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(text.strip() + '\n', encoding='utf-8')
+    os.replace(temporary, path)
 
 ELIGIBILITY_GOAL = (
     'Find the eligibility / qualification criteria a bidder must meet, such as similar work experience, '
@@ -126,7 +144,7 @@ ELIGIBILITY_GOAL = (
 )
 
 # assess_eligibility() fills in {company_details} when it runs, so a saved profile applies to the next check
-ELIGIBILITY_TASK = """Find every eligibility criterion in the document summaries and check whether the company below meets it when bidding alone.
+ELIGIBILITY_TASK = """Find every eligibility criterion in the document excerpts and check whether the company below meets it when bidding alone.
 
 For each criterion:
 1. State the requirement exactly as written, with its source file. If several sources state the same criterion, list it once and name them all.
@@ -144,6 +162,7 @@ Use only the company details given below. Mark each criterion by these rules, so
 - Not met: the company details state it, and it falls short.
 - Cannot determine: the company details do not state it, or the documents do not give the required value (such as a turnover "as indicated in the bid document"). Say what is missing. Do not infer a fact the company details do not state, such as the company's country from its address, or its MSE category from a Udyam number.
 - An exemption or relaxation (for MSEs, startups and the like) is not a criterion of its own: apply it to the criterion it relaxes, and only when the company details state that the company qualifies for it.
+- The table "Criteria marked by the bid team", if the company details have one, holds the statuses the bid team set by hand on criteria of earlier tenders. When a criterion here has the same requirement as a row, give it the row's status and say the bid team marked it so; otherwise do not use the row.
 - Leave out terms that are not conditions for bidding, such as purchase preferences, price matching, and payment or delivery terms.
 
 Write plain text, not LaTeX: use symbols such as ≥, ≤ and × directly.
@@ -153,11 +172,19 @@ Present the result in this order:
 - A section headed "## Joint venture" with the lines "JV allowed: <Yes, No or Not stated>" and "Maximum JV members: <number or Not stated>", with their sources. If a JV is allowed, follow them with a table with columns: Criterion | Lead member | Other members | JV combined | Company as lead member | Source, one row per criterion as in step 6, and the other JV conditions as a bullet list.
 Finish with an overall verdict (Eligible, Not eligible, or Cannot determine) for the company bidding alone, and the criteria that decide it.
 
-Company details:
+{tender_details}Company details:
 {company_details}"""
 
-# The Groq models of the two LLM steps (https://console.groq.com/docs/models): the smaller gpt-oss-20b reads the
-# documents, which takes most of the tokens, and gpt-oss-120b checks the company against the criteria found.
+# The tender's own data from the TenderTiger list, put before the company details when assess_eligibility() has it
+TENDER_DETAILS = """Tender details, from the TenderTiger list:
+{tender}
+When a requirement depends on the estimated cost or tender value and the excerpts do not state it, use the tender value above and say so; a figure in the excerpts comes first. Count periods such as "the last three financial years" back from the closing date, and check that certificates and registrations are still valid on it, unless the excerpts give another date.
+
+"""
+
+# The Groq models (https://console.groq.com/docs/models). gpt-oss-120b checks the company against the criteria
+# retrieved from the tender's Pinecone index. SUMMARY_MODEL is used only by summarize_for_goal(), which the tender
+# pipeline no longer calls: the documents are indexed in Pinecone instead of summarised.
 SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', 'openai/gpt-oss-20b')
 ASSESSMENT_MODEL = os.getenv('ASSESSMENT_MODEL', 'openai/gpt-oss-120b')
 # The Groq model that reads the pages of a scanned PDF (markitdown-ocr); it must accept images ('vision')
@@ -169,28 +196,54 @@ DEEP_PROFILER_MODEL = os.getenv('DEEP_PROFILER_MODEL', ASSESSMENT_MODEL)
 DEEP_AUDIT_MODEL = os.getenv('DEEP_AUDIT_MODEL', ASSESSMENT_MODEL)
 DEEP_STATUS_REVIEW_MODEL = os.getenv('DEEP_STATUS_REVIEW_MODEL', ASSESSMENT_MODEL)
 DEEP_SUPERVISOR_MODEL = os.getenv('DEEP_SUPERVISOR_MODEL', ASSESSMENT_MODEL)
+# Most tokens a model may write in one reply, reasoning included. Sent with every call: without it Groq stops a reply
+# at 3,072 tokens, which cut eligibility checks off mid-table (one needs 6,831), and adds those 3,072 to the prompt
+# when it checks a request against the free tier's 8,000 tokens per minute (error 413)
+LLM_MAX_OUTPUT_TOKENS = int(os.getenv('LLM_MAX_OUTPUT_TOKENS', '16384'))
+
+
+class AnswerCutOff(RuntimeError):
+    """The model reached LLM_MAX_OUTPUT_TOKENS before it finished its reply."""
+
+
+def _whole_reply(message):
+    """message, unless the model was stopped before the end of it: a cut-off check must not pass for a result."""
+    if (getattr(message, 'response_metadata', None) or {}).get('finish_reason') == 'length':
+        raise AnswerCutOff(f"The model's reply was cut off at {LLM_MAX_OUTPUT_TOKENS:,} tokens "
+                           '(LLM_MAX_OUTPUT_TOKENS).')
+    return message
+
 
 def make_model(model=SUMMARY_MODEL):
-    """Returns the Groq chat model named model, with retries. The API key is read from GROQ_API_KEY."""
+    """
+    Returns the Groq chat model named model, with retries. The API key is read from GROQ_API_KEY.
+    A reply cut off at LLM_MAX_OUTPUT_TOKENS raises AnswerCutOff (not retried: it would be cut off again).
+    """
     # Qwen models put their reasoning in the reply between <think> tags unless told to hide it; gpt-oss models
     # refuse the option and keep their reasoning out of the reply anyway
     reasoning = {'reasoning_format': 'hidden'} if model.startswith('qwen/') else {}
-    return ChatGroq(model=model, temperature=0, timeout=120, **reasoning).with_retry(stop_after_attempt=3)
+    llm = ChatGroq(model=model, temperature=0, timeout=120, max_tokens=LLM_MAX_OUTPUT_TOKENS, **reasoning)
+    return llm.with_retry(stop_after_attempt=3) | RunnableLambda(_whole_reply)
 
-def assess_eligibility(llm, summaries, company=None):
+def assess_eligibility(llm, summaries, company=None, tender=None):
     """
-    Checks the company against the eligibility criteria found in the document summaries.
+    Checks the company against the eligibility criteria found in summaries: the tender's document excerpts, one
+    '## <source file>' section each, as retrieved from its Pinecone index.
     company is the company profile as markdown; by default it is read from COMPANY_DETAILS_FILE.
+    tender, if given, is the tender's data from the TenderTiger list as text (organisation, closing date, tender
+    value and so on), sent with how to use its value and closing date (TENDER_DETAILS).
     Returns the model's assessment as markdown.
     """
     if company is None:
         company = company_details()
     response = llm.invoke([
         {'role': 'system', 'content': (
-            'You check tender eligibility. The document summaries below are the only source of eligibility criteria. '
+            'You check tender eligibility. The document excerpts below, retrieved from the tender\'s documents, are '
+            'the only source of eligibility criteria. "[…]" marks text left out between two excerpts. '
             'Name the source file for each point.\n\n' + '\n\n'.join(summaries)
         )},
-        {'role': 'user', 'content': ELIGIBILITY_TASK.format(company_details=company)},
+        {'role': 'user', 'content': ELIGIBILITY_TASK.format(
+            company_details=company, tender_details=TENDER_DETAILS.format(tender=tender) if tender else '')},
     ])
     return response.content
 

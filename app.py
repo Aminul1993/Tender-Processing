@@ -16,14 +16,18 @@ from routes.api import EXCEPTION_HANDLERS, api  # noqa: E402
 from routes.pages import pages  # noqa: E402
 from services.decision_service import DecisionStore  # noqa: E402
 from services.deep_analysis_service import DeepAnalysisRunner  # noqa: E402
+from services.pinecone_service import PineconeService  # noqa: E402
 from services.processing_service import TenderProcessor  # noqa: E402
 from utils.logging_setup import configure_logging  # noqa: E402
 
 log = logging.getLogger(__name__)
 
 
-def create_app(config_object=Config):
-    """Application factory: sets up logging, the tender processor, the decision store and the routers."""
+def create_app(config_object=Config, vector_store=None):
+    """
+    Application factory: sets up logging, the tenders' Pinecone namespaces (vector_store, a PineconeService, or one
+    made from config_object), the tender processor, the decision store and the routers.
+    """
     configure_logging(config_object.LOG_LEVEL, config_object.LOG_DIRECTORY)
     app = FastAPI(title='Tender Processing', exception_handlers=EXCEPTION_HANDLERS)
 
@@ -34,8 +38,11 @@ def create_app(config_object=Config):
         max_download_bytes=config_object.MAX_DOWNLOAD_MB * 1024 * 1024,
         max_file_chars=config_object.MAX_FILE_CHARS,
         company_file=config_object.COMPANY_DETAILS_FILE,
+        index=vector_store or PineconeService.from_config(config_object),
+        workers=config_object.INGEST_WORKERS,
     )
     app.state.company_file = config_object.COMPANY_DETAILS_FILE
+    app.state.default_filters_file = config_object.DEFAULT_FILTERS_FILE
     app.state.decisions = DecisionStore(
         config_object.DECISIONS_FILE or config_object.TARGET_DIRECTORY / 'decisions.json')
     app.state.deep_analyses = DeepAnalysisRunner(app.state.tender_processor, app.state.decisions,
@@ -46,6 +53,8 @@ def create_app(config_object=Config):
 
     if not os.getenv('TENDERTIGER_EMAIL') or not os.getenv('TENDERTIGER_PASSWORD'):
         log.warning('TENDERTIGER_EMAIL / TENDERTIGER_PASSWORD are not set: the tender list cannot be loaded')
+    if not app.state.tender_processor.index.configured:
+        log.warning('PINECONE_API_KEY is not set: tenders can be listed but every analysis will fail')
     if not os.getenv('GROQ_API_KEY'):
         log.warning('GROQ_API_KEY is not set: tenders can be listed but every analysis will fail')
     if not company_details(config_object.COMPANY_DETAILS_FILE):

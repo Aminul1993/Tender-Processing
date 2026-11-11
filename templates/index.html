@@ -7,10 +7,16 @@
 {% endblock %}
 
 {% block appbar_actions %}
-<button type="button" class="appbar-button appbar-help" data-bs-toggle="modal" data-bs-target="#help-modal"
-        aria-label="How the eligibility check works" title="How the eligibility check works">
-  <i class="bi bi-question-lg" aria-hidden="true"></i>
-</button>
+<div class="appbar-actions">
+  <button type="button" class="appbar-button appbar-button-collapsible" id="closed-open"
+          title="Tenders that have closed but whose documents are still in the download folder">
+    <i class="bi bi-folder-x" aria-hidden="true"></i> <span class="appbar-button-text">Closed tenders</span>
+  </button>
+  <button type="button" class="appbar-button appbar-help" data-bs-toggle="modal" data-bs-target="#help-modal"
+          aria-label="How the eligibility check works" title="How the eligibility check works">
+    <i class="bi bi-question-lg" aria-hidden="true"></i>
+  </button>
+</div>
 {% endblock %}
 
 {% block content %}
@@ -200,7 +206,12 @@
     </div>
     <div class="filters-foot">
       <button type="button" class="link-button" id="filters-clear">Clear filters</button>
-      <button type="submit" class="button button-primary button-sm" id="filters-apply">Apply filters</button>
+      <div class="footer-group">
+        <!-- Applies the filters kept in default_filters.json -->
+        <button type="button" class="button button-secondary button-sm" id="filters-default"
+                title="Search with the team's default filters, kept in default_filters.json">Default filters</button>
+        <button type="submit" class="button button-primary button-sm" id="filters-apply">Apply filters</button>
+      </div>
     </div>
   </form>
 
@@ -274,8 +285,10 @@
           <h3>01 · Analysis</h3>
           <p>Every document in a selected tender is downloaded and read, including files inside ZIP archives. Each
             eligibility criterion is compared with the company profile. A tender usually takes a few minutes.</p>
-          <p>The criteria found are saved with the documents. Checking the tender again compares the profile with
-            them without reading the documents; switch on <strong>Regenerate criteria</strong> to read them again.</p>
+          <p>All of a tender's documents are indexed in its own Pinecone namespace (tcno-&lt;number&gt;), and
+            the passages on each kind of requirement are retrieved from it for the check. Checking the tender again
+            retrieves them from the namespace without downloading the documents; switch on <strong>Regenerate
+            criteria</strong> to delete the namespace, download the documents again and rebuild it.</p>
         </div>
         <div class="help-item">
           <h3>02 · Runs in background</h3>
@@ -314,12 +327,32 @@
   </div>
 </div>
 
+<!-- Closed tenders whose documents are still downloaded; opened by Closed tenders in the app bar -->
+<div class="modal fade" id="closed-modal" tabindex="-1" aria-labelledby="closed-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable modal-fullscreen-sm-down">
+    <div class="modal-content">
+      <div class="modal-header align-items-start">
+        <div class="details-heading">
+          <h2 class="details-title" id="closed-title">Closed tenders with downloaded files</h2>
+          <p class="details-facts" id="closed-facts"></p>
+        </div>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <!-- Filled by app.js from /api/closed-downloads; not a live region, as a delete would read out the whole list
+           again (its toast says what was deleted) -->
+      <div class="modal-body" id="closed-body"></div>
+    </div>
+  </div>
+</div>
+
 <!-- Appears while tenders are selected -->
 <div class="selection-bar" id="selection-bar" role="region" aria-label="Selected tenders" hidden>
   <span class="selection-text" id="selection-text" aria-live="polite"></span>
-  <!-- Shown while a selected tender has saved criteria: read its documents again instead of re-checking them -->
+  <!-- Shown while a selected tender has a Pinecone namespace: rebuild it from the documents instead of re-checking it -->
   <button type="button" class="switch-button bar-switch" id="regenerate-toggle" role="switch" aria-checked="false"
-          title="Read the documents again and save new criteria, instead of re-checking the saved ones" hidden>
+          title="Delete the Pinecone namespace, download the documents again and rebuild it, instead of re-checking against it" hidden>
     <span class="switch" aria-hidden="true"></span>
     Regenerate criteria
   </button>
@@ -388,7 +421,9 @@
         <div class="details-heading">
           <h2 class="details-title" id="company-title">Company profile</h2>
           <p class="details-facts" id="company-help">Every tender is checked against these details and nothing else. Keep figures
-            exact; a criterion whose figure is missing becomes Needs review.</p>
+            exact; a criterion whose figure is missing becomes Needs review.
+            <a href="/api/profile-gaps/file" download>Download this month's profile-gap report</a>: what the checks
+            most often could not find here.</p>
         </div>
         <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
           <i class="bi bi-x-lg" aria-hidden="true"></i>

@@ -63,6 +63,7 @@
     filtersCount: $('filters-count'),
     filtersForm: $('search-filters'),
     filtersClear: $('filters-clear'),
+    filtersDefault: $('filters-default'),
     filtersApply: $('filters-apply'),
     decisionFilter: $('filter-decision'),
     closingFilter: $('filter-closing'),
@@ -108,9 +109,14 @@
     companyModal: $('company-modal'),
     companyForm: $('company-form'),
     companySave: $('company-save'),
+    closedOpen: $('closed-open'),
+    closedModal: $('closed-modal'),
+    closedFacts: $('closed-facts'),
+    closedBody: $('closed-body'),
   };
   const detailsModal = new bootstrap.Modal(els.modal);
   const companyModal = new bootstrap.Modal(els.companyModal);
+  const closedModal = new bootstrap.Modal(els.closedModal);
   // The organisation filter with a search box in its list, like select2. Tom Select keeps the <select>'s value
   // and fires its change event, so the rest of the page reads els.orgFilter as before. Without the library the
   // plain select still works.
@@ -149,7 +155,7 @@
     sort: {key: 'closing', order: 'asc'},  // how TenderTiger sorts the list: closing soonest first
     job: null,                // last /api/progress response, null while no job has run
     averageSeconds: null,     // average time per tender whose documents were read, for estimates
-    averageRecheckSeconds: null,  // average time per tender checked against its saved criteria
+    averageRecheckSeconds: null,  // average time per tender re-checked against its Pinecone namespace
     regenerate: false,        // the selection bar's Regenerate criteria switch
     pollTimer: null,
     pollFailures: 0,
@@ -163,6 +169,7 @@
     // The profile editor: the blocks being edited, and the saved blocks as JSON to spot unsaved edits
     company: {blocks: [], saved: '[]'},
     companyError: null,       // the editor's last save problem, closed again on the next save
+    closed: null,             // the Closed tenders popup: {directory, closed, unknown} from /api/closed-downloads
   };
 
   /* ---------- helpers ---------- */
@@ -369,12 +376,15 @@
   /** True when the list runs to more than one page: the page shown is not the first, or it was full. */
   const isPaged = () => state.page > 1 || state.hasMore;
 
-  /** Whether the tender's criteria are saved, so a check can re-use them: the last run says so, else the list. */
-  function hasSavedCriteria(tcno) {
+  /**
+   * Whether the tender's documents are indexed in its Pinecone namespace, so a check can re-use them: the last run says
+   * so, else the list.
+   */
+  function hasIndexedCriteria(tcno) {
     const result = state.results.get(tcno);
-    if (result) return Boolean(result.criteria_file);
+    if (result) return Boolean(result.namespace);
     const tender = tenderOf(tcno);
-    return Boolean(tender && tender.has_saved_criteria);
+    return Boolean(tender && tender.has_indexed_criteria);
   }
 
   /** Seconds for `full` tenders whose documents are read and `quick` re-checks; null until both were timed. */
@@ -533,7 +543,7 @@
   }
 
   function buildRow(t) {
-    const reason = !t.has_document && !t.has_prequalification && !t.has_saved_criteria ? 'it has no documents'
+    const reason = !t.has_document && !t.has_prequalification && !t.has_indexed_criteria ? 'it has no documents'
       : isClosed(t) ? 'it has closed' : '';
     const checkbox = el('input', {
       cls: 'check row-check',
@@ -619,10 +629,10 @@
     } else if (!result) {
       const tender = tenderOf(tcno);
       parts.push(pill('none', 'Not processed'));
-      if (tender && !tender.has_document && !tender.has_prequalification && !tender.has_saved_criteria) {
+      if (tender && !tender.has_document && !tender.has_prequalification && !tender.has_indexed_criteria) {
         parts.push(note('No documents to check'));
       } else if (isClosed(tender)) parts.push(note('Closed for bids'));
-      else if (hasSavedCriteria(tcno)) parts.push(note('Criteria saved: quick re-check'));
+      else if (hasIndexedCriteria(tcno)) parts.push(note('Indexed: quick re-check'));
       else if (tender && !tender.has_document) parts.push(note('Pre-qualification criteria only'));
     } else {
       const failed = result.status === 'failed';
@@ -797,20 +807,20 @@
     els.processLabel.textContent = label;
     els.barProcess.textContent = label;
     els.selectionBar.hidden = count === 0;
-    els.regenerateToggle.hidden = ![...state.selected].some(hasSavedCriteria);
+    els.regenerateToggle.hidden = ![...state.selected].some(hasIndexedCriteria);
     els.regenerateToggle.setAttribute('aria-checked', String(state.regenerate));
     renderSelectionText(count);
     updateSummary();
   }
 
   /**
-   * "3 selected · 1 on another page · ₹1,100.56 Cr · about 20 min · 2 from saved criteria · 1 will be checked
+   * "3 selected · 1 on another page · ₹1,100.56 Cr · about 20 min · 2 quick re-checks · 1 will be checked
    * again". The live region only speaks on change.
    */
   function renderSelectionText(count) {
     const tenders = [...state.selected].map(tenderOf).filter(Boolean);
     const value = tenders.reduce((sum, t) => sum + (valueInCrore(t) || 0), 0);
-    const saved = tenders.filter((t) => hasSavedCriteria(t.tcno)).length;
+    const saved = tenders.filter((t) => hasIndexedCriteria(t.tcno)).length;
     const quick = state.regenerate ? 0 : saved;
     const elsewhere = [...state.selected].filter((tcno) => !state.rows.has(tcno)).length;
     const parts = [];
@@ -818,7 +828,7 @@
     if (value) parts.push(`₹${crore(value)} Cr`);
     const estimate = estimateSeconds(tenders.length - quick, quick);
     if (estimate) parts.push(`about ${formatMinutes(estimate)}`);
-    if (saved) parts.push(state.regenerate ? `${saved} re-read from documents` : `${saved} from saved criteria`);
+    if (saved) parts.push(state.regenerate ? `${saved} re-read from documents` : plural(saved, 'quick re-check'));
     const rechecks = tenders.filter((t) => state.results.has(t.tcno)).length;
     if (rechecks) parts.push(`${rechecks} will be checked again`);
     if (isRunning()) parts.push('joins the current run');
@@ -1029,6 +1039,8 @@
     const loaded = await loadTenders({quiet: true, filters, page: 1});
     els.filtersApply.disabled = false;
     if (loaded) setFiltersOpen(false);
+    // Disabled while it loaded, it lost the focus; a failed load leaves the form open, so give it back
+    else if (document.activeElement === document.body) els.filtersApply.focus();
   }
 
   /** Empties the form, and loads the list without filters when it has some. */
@@ -1037,6 +1049,36 @@
     // Still loaded with the filters if that failed, so the form shows them again
     if (filterCount(state.searchFilters) && !(await loadTenders({quiet: true, filters: {}, page: 1}))) {
       fillFilterForm(state.searchFilters);
+    }
+  }
+
+  /**
+   * Puts the filters of default_filters.json into the form and loads the list with them, leaving the form open on
+   * what was applied. A missing or broken file, or a range that cannot be searched, says so and loads nothing.
+   */
+  async function applyDefaultFilters() {
+    // aria-disabled, not disabled, while it loads: a disabled button loses the keyboard focus to the page
+    const button = els.filtersDefault;
+    if (button.getAttribute('aria-disabled') === 'true') return;
+    button.setAttribute('aria-disabled', 'true');
+    try {
+      fillFilterForm(await api('/api/default-filters'));
+      const filters = formFilters();
+      const problem = rangeProblem(filters);
+      if (problem) {
+        const [field, message] = problem;
+        field.setCustomValidity(message);
+        field.reportValidity();
+      } else if (!(await loadTenders({quiet: true, filters, page: 1}))) {
+        fillFilterForm(state.searchFilters);  // still loaded with the filters it had
+      }
+    } catch (error) {
+      // A bare "Not Found" is the server's, not the endpoint's: a server started before it was added
+      toast(error.message === 'Not Found'
+        ? 'Could not apply the default filters: the server is running an older version. Restart it and try again.'
+        : `Could not apply the default filters: ${error.message}`);
+    } finally {
+      button.removeAttribute('aria-disabled');
     }
   }
 
@@ -1049,7 +1091,7 @@
   /* ---------- processing and progress ---------- */
 
   /**
-   * Queues tenders: starts a run, or adds them to the running one. Tenders with saved criteria are re-checked
+   * Queues tenders: starts a run, or adds them to the running one. Tenders with a Pinecone namespace are re-checked
    * against them unless regenerate is true. Returns true on success.
    */
   async function queue(tcnos, regenerate = false) {
@@ -1207,7 +1249,7 @@
   }
 
   /**
-   * Seconds left in the run, from the average time per tender of each kind (documents read, or saved criteria
+   * Seconds left in the run, from the average time per tender of each kind (documents read, or Pinecone namespace
    * re-checked); null until a tender of every kind still to come has completed.
    */
   function remainingSeconds(job) {
@@ -1382,19 +1424,19 @@
         el('p', {cls: 'folder', text: 'Result saved.'}),
       ]));
     }
-    if (result.criteria_file) renderCriteriaActions(result);
+    if (result.namespace) renderCriteriaActions(result);
     const run = [];
     if (result.processed_at) run.push(`Processed ${formatDateTime(result.processed_at)}`);
     if (result.duration_seconds !== undefined) run.push(`took ${formatDuration(result.duration_seconds)}`);
-    if (result.rechecked) run.push('checked against the saved criteria');
+    if (result.rechecked) run.push(`checked against the Pinecone namespace ${result.namespace || ''}`.trim());
     if (result.tokens) {
       const count = (step) => result.tokens[step].total.toLocaleString('en-IN');
-      run.push(`${count('total')} LLM tokens (${count('criteria')} reading the criteria, ${count('assessment')} for the result)`);
+      run.push(`${count('total')} LLM tokens (${count('criteria')} reading scanned documents, ${count('assessment')} for the result)`);
     }
     els.modalRun.textContent = run.join(' · ');
   }
 
-  /** Where the criteria are saved, with Re-check (against them) and Regenerate criteria (from the documents). */
+  /** The tender's Pinecone namespace, with Re-check (against it) and Regenerate criteria (rebuild it from the documents). */
   function renderCriteriaActions(result) {
     const busy = state.active.has(result.tcno);
     const button = (text, regenerate) => {
@@ -1405,8 +1447,13 @@
     };
     els.modalCriteria.className = 'details-criteria';
     els.modalCriteria.replaceChildren(
-      el('p', {text: 'Criteria saved. Re-check compares the current company profile with them without reading the '
-        + 'documents; Regenerate criteria reads the documents again.'}),
+      el('p', {}, [
+        document.createTextNode('Documents indexed in Pinecone ('),
+        el('span', {cls: 'mono', text: result.namespace}),
+        document.createTextNode('). Re-check retrieves the criteria from it and compares the current company profile '
+          + 'with them without downloading the documents; Regenerate criteria deletes it, downloads the documents '
+          + 'again and rebuilds it.'),
+      ]),
       el('div', {cls: 'actions'}, [button('Re-check', false), button('Regenerate criteria', true)]),
     );
   }
@@ -2108,6 +2155,147 @@
     els.shortlistBtn.disabled = els.dropBtn.disabled = false;
   }
 
+  /* ---------- closed downloads ---------- */
+
+  /** A file size as the team reads it: "820 KB", "45.2 MB". */
+  function formatBytes(bytes) {
+    if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+    const mb = bytes / (1024 * 1024);
+    return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(2)} GB`;
+  }
+
+  /** Opens the list of closed tenders whose documents are still in the download folder; a fresh scan each time. */
+  function openClosed() {
+    closedModal.show();
+    loadClosed();
+  }
+
+  /** Scans the download folder into the popup; a failed scan says why and offers Try again. */
+  async function loadClosed() {
+    els.closedFacts.textContent = '';
+    els.closedBody.setAttribute('aria-busy', 'true');
+    els.closedBody.replaceChildren(el('div', {cls: 'text-center py-5', attrs: {style: 'color: var(--meta)'}}, [
+      el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}),
+      document.createTextNode('Looking through the download folder…'),
+    ]));
+    try {
+      state.closed = await api('/api/closed-downloads');
+      renderClosed();
+    } catch (error) {
+      const retry = el('button', {cls: 'button button-secondary button-sm', text: 'Try again', attrs: {type: 'button'}});
+      retry.addEventListener('click', loadClosed);
+      els.closedBody.replaceChildren(el('div', {cls: 'closed-empty'}, [
+        el('p', {cls: 'message-error', text: `Could not look through the download folder: ${error.message}`}),
+        retry,
+      ]));
+    } finally {
+      els.closedBody.removeAttribute('aria-busy');
+    }
+  }
+
+  /** One table of tenders: closed ones with their closing date (closed-dated), the others without. */
+  function closedTable(tenders, label, withDate) {
+    const head = ['Tender', ...(withDate ? ['Closed'] : []), 'Files', ''];
+    return el('div', {cls: 'closed-wrap'}, [
+      el('table', {cls: withDate ? 'closed-table closed-dated' : 'closed-table', attrs: {'aria-label': label}}, [
+        el('thead', {}, [el('tr', {}, head.map((text, n) => el('th', {
+          cls: n === head.length - 2 ? 'closed-num' : '', attrs: {scope: 'col'},
+        }, [text ? document.createTextNode(text) : el('span', {cls: 'visually-hidden', text: 'Delete'})])))]),
+        el('tbody', {}, tenders.map((tender) => el('tr', {}, [
+          el('td', {}, [
+            el('div', {cls: 'closed-name', text: sentenceStart(tender.name) || 'Name not on record', attrs: {title: tender.name}}),
+            el('div', {cls: 'closed-tcno mono', text: tender.tcno}),
+          ]),
+          withDate ? el('td', {cls: 'text-nowrap'}, [
+            el('div', {text: displayDate(tender.closing_date)}),
+            el('div', {cls: 'closed-meta', text: `${plural(tender.days_closed, 'day')} ago`}),
+          ]) : null,
+          el('td', {cls: 'closed-num text-nowrap'}, [
+            el('div', {text: plural(tender.files, 'file')}),
+            el('div', {cls: 'closed-meta', text: formatBytes(tender.bytes)}),
+          ]),
+          el('td', {cls: 'closed-action'}, [
+            el('button', {
+              cls: 'button button-danger button-sm',
+              attrs: {type: 'button', 'data-delete': tender.tcno, 'aria-label': `Delete tender ${tender.tcno}`},
+            }, [icon('bi-trash3'), document.createTextNode(' Delete')]),
+          ]),
+        ]))),
+      ]),
+    ]);
+  }
+
+  /** The popup from state.closed, the last /api/closed-downloads response less the tenders deleted since. */
+  function renderClosed() {
+    const data = state.closed;
+    const size = (tenders) => tenders.reduce((total, tender) => total + tender.bytes, 0);
+    // "3 tenders, 45.2 MB"; nothing while none has closed
+    els.closedFacts.textContent = data.closed.length
+      ? `${plural(data.closed.length, 'tender')}, ${formatBytes(size(data.closed))}` : '';
+    const parts = [];
+    if (data.closed.length) {
+      parts.push(closedTable(data.closed, 'Closed tenders with downloaded files', true));
+    } else {
+      // The tenders without a closing date below have most likely closed, so this says only what is known
+      parts.push(el('p', {cls: 'closed-empty', text: data.unknown.length
+        ? 'No tender known to have closed has files left in the download folder.'
+        : 'No closed tender has files left in the download folder.'}));
+    }
+    if (data.unknown.length) {
+      parts.push(el('section', {cls: 'closed-unknown', attrs: {'aria-labelledby': 'closed-unknown-title'}}, [
+        el('h3', {cls: 'closed-subtitle', attrs: {id: 'closed-unknown-title'},
+          text: `No closing date on record · ${plural(data.unknown.length, 'tender')}, ${formatBytes(size(data.unknown))}`}),
+        el('p', {cls: 'closed-note', text: 'Checked before the app kept closing dates. A tender gets its date when it '
+          + 'next appears in the tender list; one TenderTiger no longer lists has most likely closed.'}),
+        closedTable(data.unknown, 'Tenders with downloaded files and no closing date on record', false),
+      ]));
+    }
+    els.closedBody.replaceChildren(...parts);
+  }
+
+  /**
+   * Delete: after a confirmation, deletes everything kept for the tender (its downloaded documents, result, deep
+   * analysis, decision and Pinecone namespace), takes it off the list and moves focus to the next Delete, or to Close.
+   */
+  async function deleteClosed(button) {
+    const tcno = button.dataset.delete;
+    const tender = [...state.closed.closed, ...state.closed.unknown].find((item) => item.tcno === tcno);
+    if (!tender || !window.confirm(`Delete tender ${tcno}?
+
+Its ${plural(tender.files, 'downloaded file')} `
+      + `(${formatBytes(tender.bytes)}), its result and deep analysis, the decision on it and its Pinecone namespace `
+      + 'are all deleted, for good. Statuses marked by hand stay in the company profile.')) return;
+    const buttons = [...els.closedBody.querySelectorAll('[data-delete]')];
+    const next = buttons[buttons.indexOf(button) + 1];
+    button.disabled = true;
+    button.replaceChildren(el('span', {cls: 'spinner-border spinner-border-sm', attrs: {'aria-hidden': 'true'}}),
+      document.createTextNode(' Deleting…'));
+    let deleted;
+    try {
+      deleted = await api(`/api/downloads/${encodeURIComponent(tcno)}`, {method: 'DELETE'});
+    } catch (error) {
+      toast(`Could not delete tender ${tcno}: ${error.message}`);
+      button.disabled = false;
+      button.replaceChildren(icon('bi-trash3'), document.createTextNode(' Delete'));
+      return;
+    }
+    const keep = (item) => item.tcno !== tcno;
+    state.closed = {...state.closed, closed: state.closed.closed.filter(keep), unknown: state.closed.unknown.filter(keep)};
+    renderClosed();
+    const focus = next && els.closedBody.querySelector(`[data-delete="${CSS.escape(next.dataset.delete)}"]`);
+    (focus || els.closedModal.querySelector('[data-bs-dismiss="modal"]')).focus();
+    toast(`Deleted tender ${tcno}: ${plural(deleted.files, 'file')} (${formatBytes(deleted.bytes)}), its result`
+      + `${deleted.namespace_deleted ? ' and its Pinecone namespace' : ''}.`, 'success');
+    // A tender also on the page now reads as never checked
+    state.results.delete(tcno);
+    state.decisions.delete(tcno);
+    const listed = tenderOf(tcno);
+    if (listed) Object.assign(listed, {result: null, decision: null, has_indexed_criteria: false});
+    updateRow(tcno);
+    updateSelectionUI();
+    applyFilters();
+  }
+
   /* ---------- company profile ---------- */
 
   /** Loads the saved profile into the editor and opens it; a fresh load, in case someone else changed it. */
@@ -2444,6 +2632,7 @@
   els.filtersBtn.addEventListener('click', () => setFiltersOpen(els.filtersForm.hidden));
   els.filtersForm.addEventListener('submit', applySearchFilters);
   els.filtersClear.addEventListener('click', clearSearchFilters);
+  els.filtersDefault.addEventListener('click', applyDefaultFilters);
   // A range problem shown on one field is gone once any filter changes
   els.filtersForm.addEventListener('input', () => {
     [...els.filtersForm.elements].forEach((field) => field.setCustomValidity && field.setCustomValidity(''));
@@ -2599,6 +2788,13 @@
     if (first) first.focus();
   });
   els.companyModal.addEventListener('hidden.bs.modal', () => els.companyEdit.focus());
+
+  els.closedOpen.addEventListener('click', openClosed);
+  els.closedBody.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-delete]');
+    if (button && !button.disabled) deleteClosed(button);
+  });
+  els.closedModal.addEventListener('hidden.bs.modal', () => els.closedOpen.focus());
 
   els.copyBtn.addEventListener('click', async () => {
     try {

@@ -162,6 +162,7 @@ kbd {
 
 .appbar-label {
   color: var(--chrome-muted);
+  white-space: nowrap;
 }
 
 .appbar-company {
@@ -200,12 +201,42 @@ kbd {
   cursor: default;
 }
 
-/* The ? that opens "How the eligibility check works": square, at the far right after the company line */
+/* Closed tenders and the ?, at the far right after the company line */
+.appbar-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: 8px;
+}
+
+/* The ? that opens "How the eligibility check works": square */
 .appbar-help {
   justify-content: center;
   width: 28px;
   padding: 0;
   font-size: 15px;
+}
+
+/*
+ * Below 992px Closed tenders becomes a square icon like the ?, so the company name keeps its room on the line
+ * and is never cut short; the text stays the button's name for screen readers, and its title shows on hover.
+ */
+@media (max-width: 991.98px) {
+  .appbar-button-collapsible {
+    justify-content: center;
+    width: 28px;
+    padding: 0;
+    font-size: 14px;
+  }
+
+  .appbar-button-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
 }
 
 /* ---------- page ---------- */
@@ -369,12 +400,32 @@ kbd {
   color: var(--ink);
 }
 
-.button-secondary:hover:not(:disabled) {
+.button-secondary:hover:not(:disabled, [aria-disabled="true"]) {
   border-color: var(--control-line-hover);
   background: var(--hover);
 }
 
-.button-secondary:disabled {
+/* aria-disabled while what it started loads (Default filters): looks disabled, but keeps the keyboard focus */
+.button-secondary:disabled,
+.button-secondary[aria-disabled="true"] {
+  color: var(--faint);
+  cursor: default;
+}
+
+/* The one destructive action, Delete in Closed tenders: the secondary shape in red */
+.button-danger {
+  border-color: color-mix(in oklch, var(--not-dot) 45%, white);
+  background: var(--surface);
+  color: var(--not-fg);
+}
+
+.button-danger:hover:not(:disabled) {
+  border-color: var(--not-dot);
+  background: var(--not-bg);
+}
+
+.button-danger:disabled {
+  border-color: var(--control-line);
   color: var(--faint);
   cursor: default;
 }
@@ -1789,6 +1840,175 @@ tbody .cell-drop {
   background: #4A4B50;
 }
 
+/* ---------- closed downloads (the modal) ---------- */
+
+/* Empty while no tender has closed: then the title alone, with no gap under it */
+#closed-facts:empty {
+  display: none;
+}
+
+#closed-title:has(+ #closed-facts:empty) {
+  margin-bottom: 0;
+}
+
+.closed-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+
+.closed-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.closed-table th {
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--surface-sunk);
+  color: var(--meta);
+  font-size: 12px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  text-align: left;
+}
+
+.closed-table td {
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line-3);
+  vertical-align: top;
+}
+
+.closed-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.closed-table .closed-num {
+  text-align: right;
+}
+
+/* Delete files, at the end of each row */
+.closed-table .closed-action {
+  width: 1%;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+/* Two lines of a long title; the whole one is its tooltip */
+.closed-name {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  min-width: 220px;
+  line-height: 1.4;
+}
+
+.closed-tcno,
+.closed-meta {
+  margin-top: 2px;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.closed-empty {
+  margin: 0;
+  padding: 24px 0;
+  color: var(--muted);
+  font-size: 14px;
+  text-align: center;
+}
+
+/* A failed scan: what went wrong, then Try again */
+.closed-empty .message-error {
+  margin: 0 0 14px;
+}
+
+.closed-unknown {
+  margin-top: 28px;
+}
+
+.closed-subtitle {
+  margin: 0 0 4px;
+  color: var(--meta);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+
+.closed-note {
+  margin: 0 0 10px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.5;
+  text-wrap: pretty;
+}
+
+/*
+ * On a phone each tender is a block: its name with Delete beside it, then one line under them, when it closed at
+ * the left and its files at the right; without a closing date the files take the left.
+ */
+@media (max-width: 575.98px) {
+  .closed-table thead {
+    display: none;
+  }
+
+  .closed-table tr {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 6px 12px;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--line-3);
+  }
+
+  .closed-table tbody tr:last-child {
+    border-bottom: 0;
+  }
+
+  .closed-table td {
+    padding: 0;
+    border: 0;
+  }
+
+  .closed-table td:first-child {
+    grid-column: 1;
+  }
+
+  .closed-table .closed-num {
+    grid-column: 2;
+  }
+
+  .closed-table:not(.closed-dated) .closed-num {
+    grid-column: 1;
+    text-align: left;
+  }
+
+  .closed-table .closed-action {
+    grid-row: 1;
+    grid-column: 2;
+    width: auto;
+    align-self: start;
+  }
+
+  .closed-name {
+    min-width: 0;
+  }
+
+  /* A figure and its note on one line: "2 files · 301 KB", "03 Nov 2026 · 8 days ago" */
+  .closed-table td:not(:first-child) > div {
+    display: inline;
+  }
+
+  .closed-table td:not(:first-child) > .closed-meta::before {
+    content: " · ";
+    content: " · " / "";
+  }
+}
+
 /* ---------- details modal ---------- */
 
 .modal {
@@ -2262,6 +2482,12 @@ select.select.status-select {
   color: var(--muted);
   line-height: 1.5;
   overflow-wrap: anywhere;
+}
+
+/* The namespace's name, an identifier: mono at the source files' size */
+.details-criteria p .mono {
+  color: var(--ink-3);
+  font-size: 12px;
 }
 
 .details-criteria .actions {
@@ -2861,8 +3087,8 @@ input.profile-input {
     order: 2;
   }
 
-  /* Stays on the brand's line, at its right */
-  .appbar-help {
+  /* Stay on the brand's line, at its right */
+  .appbar-actions {
     order: 1;
     margin-left: auto;
   }

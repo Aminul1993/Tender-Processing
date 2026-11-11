@@ -7,18 +7,10 @@
 | Company Name | ABC Infrastructure Limited |
 | Constitution | Public Limited Company |
 | Years in Business | 18 Years |
-| PAN | AAAAA1234A |
-| GST | 19AAAAA1234A1Z1 |
 | Country of incorporation | India |
 | MSE category | Medium |
-| The Code on Wages 2019 | Full compliance |
-| The Industrial Relations Code 2020 | Full compliance |
-| The Occupational Safety | Full compliance |
-| Health and Working Conditions Code 2020 | Full compliance |
-| The Code on Social Security 2020 | Full compliance |
 | NIC code | 62011 |
-| Udyam Certificate Number | UDYAM-WB-02-0055555 |
-| Address |  Premises No. 03-319, Block DH-6/11, Action Area 1D, Street No. 319, New Town, Kolkata, West Bengal 700156 (also referenced with pin 700160) |
+| Address | Premises No. 03-319, Block DH-6/11, Action Area 1D, Street No. 319, New Town, Kolkata, West Bengal 700156 (also referenced with pin 700160) |
 
 ---
 
@@ -136,3 +128,36 @@
 | Bank Pass Book | Yes |
 | Cancelled cheque | Yes |
 | Trade License | Yes |
+
+---
+
+## 11. Standing declarations and certificates
+
+Declarations and registrations that hold for every tender. Leave a value empty until it is confirmed: a criterion that needs it is then marked Cannot determine instead of being guessed.
+
+| Item | Value | Valid until |
+| --- | --- | --- |
+| Land border (GFR 144(xi)): bidder, or its owners, from a country sharing a land border with India |  |  |
+| Make in India supplier class (Class-I, Class-II or Non-local) |  |  |
+| Local content (%) |  |  |
+| The Code on Wages 2019 | Full compliance |  |
+| The Industrial Relations Code 2020 | Full compliance |  |
+| The Occupational Safety, Health and Working Conditions Code 2020 | Full compliance |  |
+| The Code on Social Security 2020 | Full compliance |  |
+| GST | 19AAAAA1234A1Z1 |  |
+| PAN | AAAAA1234A |  |
+| Udyam Certificate Number | UDYAM-WB-02-0055555 |  |
+| ISO certificates (standard, certificate number, scope) |  |  |
+| BIS licences (IS number, CM/L number) |  |  |
+| Local offices (city and state of each) |  |  |
+| OEM authorisations (OEM and products) |  |  |
+
+---
+
+## Criteria marked by the bid team
+
+| Criterion | Requirement | Status | TCNO | Marked on |
+| --- | --- | --- | --- | --- |
+| The applicant must have PAN & Aadhar Card. | Valid PAN and Aadhar numbers. | Met | 102090397 | 2026-11-11 |
+| Minimum bank solvency | Bank solvency ≥ Rs 37.96 Lac (40 % of estimated cost) | Met | 102090216 | 2026-11-11 |
+| Minimum net‑worth | Net‑worth ≥ Rs 9.49 Lac (10 % of estimated cost) | Met | 102090216 | 2026-11-11 |

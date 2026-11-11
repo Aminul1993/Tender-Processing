@@ -7,3 +7,4 @@ Jinja2==3.1.6
 httpx==0.28.1
 requests==2.34.2
 python-dotenv==1.2.4
+pinecone==10.3.0

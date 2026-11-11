@@ -1,15 +1,17 @@
 """JSON API used by the tender page. Every error response has the shape {"error": "<message>"}."""
+import json
 import logging
 import mimetypes
-from datetime import date
+import re
+from datetime import date, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import FileResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ext import company_details, save_company_details
@@ -17,7 +19,9 @@ from services import tender_service
 from services.company_service import EMPTY_PROFILE, company_profile, parse_profile, render_profile, unnamed_part
 from services.decision_service import DecisionStore
 from services.deep_analysis_service import DeepAnalysisRunner, DeepAnalysisRunning
+from services.pinecone_service import VectorStoreError, VectorStoreNotConfigured
 from services.processing_service import NoJobRunning, TenderBusy, TenderProcessor
+from services.profile_gap_service import profile_gap_report, report_markdown
 from services.tender_service import TenderServiceError
 from utils.files import safe_name
 
@@ -51,6 +55,11 @@ def get_company_file(request: Request) -> Path:
     return request.app.state.company_file
 
 
+def get_default_filters_file(request: Request) -> Path:
+    """The default filters file, DEFAULT_FILTERS_FILE in the config given to create_app()."""
+    return request.app.state.default_filters_file
+
+
 def get_deep_analyses(request: Request) -> DeepAnalysisRunner:
     """The app's DeepAnalysisRunner, created in create_app()."""
     return request.app.state.deep_analyses
@@ -61,8 +70,11 @@ def get_deep_analyses(request: Request) -> DeepAnalysisRunner:
 INLINE_TYPES = {'application/pdf', 'image/png', 'image/jpeg', 'image/gif', 'image/webp', 'text/plain'}
 
 Processor = Annotated[TenderProcessor, Depends(get_processor)]
+# A month of the profile-gap report, YYYY-MM; the current month when left out
+Month = Annotated[str | None, Query(pattern=r'^\d{4}-(0[1-9]|1[0-2])$')]
 Decisions = Annotated[DecisionStore, Depends(get_decisions)]
 CompanyFile = Annotated[Path, Depends(get_company_file)]
+DefaultFiltersFile = Annotated[Path, Depends(get_default_filters_file)]
 DeepAnalyses = Annotated[DeepAnalysisRunner, Depends(get_deep_analyses)]
 
 
@@ -116,7 +128,8 @@ class ProcessRequest(BaseModel):
     model_config = ConfigDict(coerce_numbers_to_str=True)  # TCNOs may be sent as numbers
 
     tcnos: list[str] = Field(min_length=1)
-    # Read the documents again and save new criteria, instead of checking the criteria saved by an earlier run
+    # Delete the tender's Pinecone namespace, download and read the documents again and rebuild the namespace,
+    # instead of re-checking against the namespace an earlier run built
     regenerate: bool = False
 
 
@@ -180,6 +193,8 @@ def list_tenders(processor: Processor, decisions: Decisions, query: Annotated[Te
                                               page_size=query.page_size)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from None
+    # Kept with the saved results, so the date is still known once TenderTiger stops listing a closed tender
+    processor.remember_closing_dates(tenders)
     results = processor.summaries()
     recorded = decisions.all()
     rows = []
@@ -187,18 +202,67 @@ def list_tenders(processor: Processor, decisions: Decisions, query: Annotated[Te
         row = tender_service.to_row(tender)
         row['result'] = results.get(row['tcno'])
         row['decision'] = recorded.get(row['tcno'])
-        row['has_saved_criteria'] = processor.criteria_file(row['tcno']).is_file()
+        # Its documents are indexed, so a check re-uses them: the tender's Pinecone namespace tcno-<tcno> exists
+        row['has_indexed_criteria'] = processor.index.has_namespace(row['tcno'])
         rows.append(row)
     return {'count': len(rows), 'tenders': rows, 'page': query.page, 'page_size': query.page_size,
             'has_more': len(tenders) >= query.page_size, 'sort': query.sort, 'order': query.order}
+
+
+DATE_FILTERS = ('published_from', 'published_to', 'closing_from', 'closing_to')
+AMOUNT_FILTERS = ('qty', 'value', 'emd')
+RELATIVE_DATE = re.compile(r'today(?:\s*([+-])\s*(\d+))?', re.IGNORECASE)
+
+
+def _relative_date(value):
+    """A date filter of "today", "today+7" or "today-7" (days) as that date; any other value as it is."""
+    match = RELATIVE_DATE.fullmatch(value.strip()) if isinstance(value, str) else None
+    if not match:
+        return value
+    days = int(match[2] or 0)
+    return date.today() + timedelta(days=-days if match[1] == '-' else days)
+
+
+@api.get('/default-filters')
+def default_filters(path: DefaultFiltersFile):
+    """
+    The TenderTiger filters in DEFAULT_FILTERS_FILE (default_filters.json), which Default filters on the page
+    applies, as /api/tenders query parameters: strings, set filters only. The file holds one object with the same
+    names, e.g. {"closing_from": "today", "bid_doc": true}; a date may also be "today+7" or "today-7" (days). 404
+    without the file; 500 when it does not hold valid filters, saying what is wrong.
+    """
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except FileNotFoundError:
+        raise HTTPException(404, f'There are no default filters yet: add them to {path.name} in {path.parent}.') from None
+    except (OSError, ValueError) as exc:  # unreadable, or not JSON (JSONDecodeError is a ValueError)
+        raise HTTPException(500, f'Could not read the default filters in {path.name}: {exc}') from None
+    if not isinstance(raw, dict):
+        raise HTTPException(500, f'{path.name} must hold one JSON object of filters, like {{"bid_doc": true}}.')
+    try:
+        filters = TenderFilters.model_validate(
+            {name: _relative_date(value) if name in DATE_FILTERS else value for name, value in raw.items()})
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise HTTPException(500, f"{path.name}, {'.'.join(map(str, first['loc']))}: {first['msg']}") from None
+    params = {}
+    for name, value in filters.model_dump(exclude_defaults=True).items():
+        if value is not None:
+            params[name] = 'true' if value is True else value.isoformat() if isinstance(value, date) else str(value)
+    # A comparison only with its amount, and always with it, even the default "gt"
+    for name in AMOUNT_FILTERS:
+        params.pop(f'{name}_op', None)
+        if name in params or f'{name}_to' in params:
+            params[f'{name}_op'] = getattr(filters, f'{name}_op')
+    return params
 
 
 @api.post('/process-tenders', status_code=202)
 def process_tenders(payload: ProcessRequest, processor: Processor):
     """
     Queues the tenders posted as {"tcnos": ["...", ...], "regenerate": false}, in that order. Starts a job, or
-    adds them to the running one. A tender with saved criteria is checked against them unless regenerate is
-    true. Returns 202 with the job's progress.
+    adds them to the running one. A tender with a Pinecone namespace is re-checked against it unless regenerate is
+    true (then the namespace is deleted and rebuilt from the documents). Returns 202 with the job's progress.
     """
     tcnos = list(dict.fromkeys(payload.tcnos))  # drop duplicates, keep order
     tenders = [tender_service.get_tender(tcno) for tcno in tcnos]
@@ -302,6 +366,65 @@ def deep_analysis_file(tcno: str, deep: DeepAnalyses):
                         content_disposition_type='attachment', headers={'X-Content-Type-Options': 'nosniff'})
 
 
+@api.get('/closed-downloads')
+def closed_downloads(processor: Processor):
+    """
+    The tenders whose closing date has passed but whose documents are still in the download folder, longest closed
+    first, and those with documents but no closing date on record: {"directory", "closed": [...], "unknown": [...]},
+    each {"tcno", "name", "closing_date", "days_closed", "files", "bytes"}.
+    """
+    return processor.closed_downloads()
+
+
+@api.delete('/downloads/{tcno}')
+def delete_downloads(tcno: str, processor: Processor, decisions: Decisions, deep: DeepAnalyses):
+    """
+    Deletes everything kept for the tender: its Pinecone namespace, its downloaded documents, saved result and deep
+    analysis, and the team's decision, so it reads as never checked. Only the statuses marked by hand stay, recorded
+    in the company profile. Returns {"tcno", "files", "bytes", "namespace_deleted"}: how many documents went, their
+    size, and whether there was a namespace.
+    """
+    if deep.running(tcno):
+        raise HTTPException(409, f'A deep analysis of tender {tcno} is running. Delete the tender once it is done.')
+    try:
+        deleted = processor.delete_tender(tcno)
+    except LookupError as exc:
+        raise HTTPException(404, str(exc)) from None
+    except TenderBusy:
+        raise HTTPException(409, f'Tender {tcno} is being checked. Delete it once that is done.') from None
+    except OSError as exc:
+        log.exception('Could not delete the files of tender %s', tcno)
+        raise HTTPException(409, f'Could not delete every file of tender {tcno}: {exc}. Close any program that has '
+                                 'one open and try again.') from None
+    deep.forget(tcno)
+    if tcno in decisions.all():
+        decisions.set(tcno, None)
+    return deleted
+
+
+@api.get('/namespace/{tcno}')
+def namespace_status(tcno: str, processor: Processor):
+    """
+    The tender's Pinecone namespace: its name and index, whether it exists and is complete, and what it holds
+    (sources with their chunk counts, the sources that could not be read, records, embedding model, when it was
+    built).
+    """
+    return processor.index.status(tcno)
+
+
+@api.delete('/namespace/{tcno}')
+def delete_namespace(tcno: str, processor: Processor):
+    """
+    Deletes the tender's Pinecone namespace, freeing a place under the Pinecone plan's namespace limit. The
+    tender's result is kept; its next check downloads and indexes the documents again.
+    """
+    try:
+        deleted = processor.delete_namespace(tcno)
+    except TenderBusy:
+        raise HTTPException(409, f'Tender {tcno} is being checked. Delete its namespace once that is done.') from None
+    return {'tcno': tcno, 'namespace': processor.index.namespace(tcno), 'deleted': deleted}
+
+
 def _change_result(tcno, change):
     """Runs change, a hand edit of the tender's result, with its errors as HTTP errors."""
     try:
@@ -327,6 +450,24 @@ def get_company(company_file: CompanyFile):
     and the company name of the app bar.
     """
     return _company(company_details(company_file))
+
+
+@api.get('/profile-gaps')
+def profile_gaps(processor: Processor, company_file: CompanyFile, month: Month = None):
+    """
+    The profile-gap report of ?month=YYYY-MM (the current month by default): why the checks of that month marked
+    criteria Cannot determine, most frequent reason first, and whether the company profile states each now.
+    """
+    return profile_gap_report(processor.saved_results(), company_details(company_file), month)
+
+
+@api.get('/profile-gaps/file')
+def profile_gaps_file(processor: Processor, company_file: CompanyFile, month: Month = None):
+    """Downloads the profile-gap report of ?month=YYYY-MM (the current month by default) as markdown."""
+    report = profile_gap_report(processor.saved_results(), company_details(company_file), month)
+    return Response(report_markdown(report), media_type='text/markdown; charset=utf-8',
+                    headers={'Content-Disposition': f'attachment; filename="profile-gaps-{report["month"]}.md"',
+                             'X-Content-Type-Options': 'nosniff'})
 
 
 @api.put('/company')
@@ -375,6 +516,11 @@ async def tender_service_error(request, exc):
     return _error(str(exc), 502)
 
 
+async def vector_store_error(request, exc):
+    """Pinecone is not configured (503) or failed (502)."""
+    return _error(str(exc), 503 if isinstance(exc, VectorStoreNotConfigured) else 502)
+
+
 async def unexpected_error(request, exc):
     """Keeps unhandled errors in JSON. Starlette re-raises the exception afterwards, so the server logs it."""
     return _error('Internal server error. See logs/app.log for details.', 500)
@@ -384,5 +530,6 @@ EXCEPTION_HANDLERS = {
     StarletteHTTPException: http_error,
     RequestValidationError: validation_error,
     TenderServiceError: tender_service_error,
+    VectorStoreError: vector_store_error,
     Exception: unexpected_error,
 }

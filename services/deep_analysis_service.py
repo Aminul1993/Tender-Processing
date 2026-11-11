@@ -2,9 +2,10 @@
 Deep analysis: a second, multi-agent review of a tender's completed eligibility result. Five agents work in turn on
 one shared state (a blackboard), each reading what the agents before it wrote:
 
-  ingestion      Ingestion & Context agent (no LLM): validates the result, the saved criteria and the company
-                 profile, normalises money to rupees, dates to ISO and financial years to their dates, flags expired
-                 or outdated profile entries, and collects the statuses the bid team marked by hand.
+  ingestion      Ingestion & Context agent (no LLM): validates the result, the criteria retrieved from the tender's
+                 Pinecone namespace (see load_knowledge()) and the company profile, normalises money to rupees, dates to
+                 ISO and financial years to their dates, flags expired or outdated profile entries, and collects the
+                 statuses the bid team marked by hand.
   profiler       Company Profiler agent: flags company data that is missing, outdated, inconsistent or expired,
                  above all the data the criteria need. No external registry is connected, so it says what to check
                  against one (the MCA or GST portal, say) instead of claiming it did.
@@ -34,9 +35,9 @@ from pathlib import Path
 
 from ext import (COMPANY_DETAILS_FILE, DEEP_AUDIT_MODEL, DEEP_PROFILER_MODEL, DEEP_STATUS_REVIEW_MODEL,
                  DEEP_SUPERVISOR_MODEL, company_details, make_model)
-from services.analysis_service import (CRITERIA_FILE, DEEP_ANALYSIS_FILE, REQUIRES_REVIEW, TokenUsage,
-                                       criterion_key, read_criteria, statuses_verdict)
-from services.company_service import parse_profile
+from services.analysis_service import DEEP_ANALYSIS_FILE, REQUIRES_REVIEW, TokenUsage, criterion_key, statuses_verdict
+from services.company_service import parse_profile, profile_for_tender
+from services.pinecone_service import NamespaceIncomplete, VectorStoreError
 from services.processing_service import TenderBusy, explain_error
 from utils.files import safe_name
 
@@ -56,8 +57,33 @@ AGENT_MODELS = {'profiler': DEEP_PROFILER_MODEL, 'audit': DEEP_AUDIT_MODEL, 'sta
 # How many times the supervisor may send disputed criteria back to the audit agent, and how many criteria a time
 MAX_ROUNDS = 2
 MAX_RECHECKS = 6
-# Bumped when the saved report changes shape: 2 gives each agent's model ('models'), not one 'model'
-REPORT_VERSION = 2
+# Bumped when the saved report changes shape: 2 gives each agent's model ('models'), not one 'model'; 3 takes the
+# criteria from the tender's Pinecone namespace ('inputs': 'criteria_source' names it, 'excerpts' counts them)
+REPORT_VERSION = 3
+# What the agents are given from the tender's Pinecone namespace, beside the criteria of the result: the excerpts found
+# for each kind of requirement, and the excerpts nearest each criterion (Supporting Evidence; see load_knowledge())
+KNOWLEDGE_QUERIES = {
+    'Eligibility Criteria': [
+        'Eligibility criteria and pre-qualification requirements a bidder must meet',
+        'Who may bid: registration, constitution, OEM or authorised dealer, blacklisting and debarment',
+    ],
+    'Financial Requirements': [
+        'Minimum average annual turnover, net worth, solvency, working capital and bid capacity formula',
+        'Estimated cost or tender value, earnest money deposit and performance security',
+    ],
+    'Technical Requirements': [
+        'Technical eligibility: certifications, licences, plant, equipment, key personnel and specifications',
+    ],
+    'Experience Requirements': [
+        'Similar work experience: completed works of a stated value in the last years, and the definition of '
+        'similar work',
+    ],
+    'JV Requirements': [
+        'Joint venture or consortium: whether allowed, maximum members, lead member share, and what each member and '
+        'the joint venture as a whole must meet',
+    ],
+}
+EVIDENCE_LABEL = 'Supporting Evidence'
 
 STATUSES = ('met', 'not_met', 'unknown')
 AUDIT_RESULTS = ('pass', 'fail', 'insufficient_data', 'not_applicable')
@@ -237,11 +263,71 @@ def date_checks(facts, today):
     return flags
 
 
-def ingest(result, folder, company, decision=None, today=None):
+def load_knowledge(index, tcno, result):
+    """
+    What the agents read of the tender's documents, retrieved from its Pinecone namespace (index, a PineconeService):
+    the excerpts for each kind of requirement in KNOWLEDGE_QUERIES, and for each criterion of the result the excerpts
+    nearest its name and requirement (Supporting Evidence). Each excerpt is given once, numbered [E1], [E2], ... in
+    document order, followed by which excerpts answer each kind and each criterion.
+
+    Returns {'text', 'source', 'excerpts', 'warning'}; never raises: when the index is missing or Pinecone fails,
+    text is empty and warning says why, so the audit works from the result's own requirements.
+    """
+    name = index.namespace(tcno)
+    queries = dict(KNOWLEDGE_QUERIES)
+    evidence = {}  # query label -> (criterion number, name)
+    for ref, row in enumerate(result.get('criteria') or []):
+        requirement = _text(row.get('requirement'))
+        criterion = _text(row.get('criterion'))
+        if criterion or requirement:
+            label = f'{EVIDENCE_LABEL} [{ref}]'
+            queries[label] = [f'{criterion}: {requirement}'.strip(': ')]
+            evidence[label] = (ref, criterion or requirement)
+    try:
+        index.require()
+        # Within the index's RETRIEVAL_MAX_CHARS, like the eligibility check, so one setting sizes every prompt
+        retrieval = index.retrieve(tcno, queries)
+    except NamespaceIncomplete:
+        return {'text': '', 'source': None, 'excerpts': 0,
+                'warning': f'The Pinecone namespace {name} is missing or incomplete'}
+    except VectorStoreError as exc:
+        log.warning('Deep analysis of %s: could not retrieve the criteria from %s', tcno, name, exc_info=True)
+        return {'text': '', 'source': None, 'excerpts': 0,
+                'warning': f'The Pinecone namespace {name} could not be searched ({exc})'}
+    if not retrieval.chunks:
+        return {'text': '', 'source': None, 'excerpts': 0, 'warning': f'The Pinecone namespace {name} holds no text'}
+
+    labels = {}  # query label -> excerpt numbers
+    blocks = []
+    for number, chunk in enumerate(retrieval.chunks, 1):
+        blocks.append(f"[E{number}] {chunk['source_file']} (part {chunk['chunk_index'] + 1})\n{chunk['text'].strip()}")
+        for label in chunk['queries']:
+            labels.setdefault(label, []).append(f'E{number}')
+    guide = []
+    for label in KNOWLEDGE_QUERIES:
+        guide.append(f"- {label}: {', '.join(labels.get(label, [])) or 'nothing found'}")
+    if evidence:
+        guide.append(f'- {EVIDENCE_LABEL} (by criterion number):\n' + '\n'.join(
+            f"  - [{ref}] {criterion}: {', '.join(labels.get(label, [])) or 'nothing found'}"
+            for label, (ref, criterion) in evidence.items()))
+    pinned = labels.get('pinned')
+    if pinned:
+        guide.append(f"- TenderTiger's own data and pre-qualification criteria, given in full: {', '.join(pinned)}")
+    unread = retrieval.unreadable
+    text = ('### Excerpts\n' + '\n\n'.join(blocks) + '\n\n### Where each kind of requirement is found\n'
+            + '\n'.join(guide))
+    if unread:
+        text += '\n\n### Sources that could not be read, so are not in the index\n' + '\n'.join(f'- {s}' for s in unread)
+    return {'text': text, 'source': f'Pinecone namespace {retrieval.namespace}', 'excerpts': len(retrieval.chunks),
+            'warning': None}
+
+
+def ingest(result, knowledge, company, decision=None, today=None):
     """
     The Ingestion & Context agent: checks the shape of the inputs and lays them out in the shared state for the
-    other agents. result is the tender's completed result, folder its folder (for CRITERIA_FILE), company the
-    profile markdown and decision the team's shortlisted / dropped decision, if any.
+    other agents. result is the tender's completed result, knowledge what load_knowledge() retrieved from its
+    Pinecone namespace (or None), company the profile markdown and decision the team's shortlisted / dropped decision,
+    if any.
 
     Returns the context: {'tcno', 'name', 'today', 'financial_year', 'last_financial_year', 'criteria',
     'criteria_text', 'criteria_source', 'unreadable', 'unreadable_checked', 'verdict', 'ai_verdict', 'jv',
@@ -267,22 +353,22 @@ def ingest(result, folder, company, decision=None, today=None):
                          'company': _text(row.get('company')), 'source': _text(row.get('source')),
                          'status': status, 'ai_status': ai_status, 'marked_by_user': marked})
     if not criteria:
-        warnings.append('The result has no criteria table, so the audit works from the criteria file alone.')
+        warnings.append("The result has no criteria table, so the audit works from the tender's Pinecone namespace "
+                        'alone.')
 
-    try:
-        criteria_text, _ = read_criteria(Path(folder) / CRITERIA_FILE)
-        criteria_source = CRITERIA_FILE
-    except FileNotFoundError:
-        criteria_text = ''
+    knowledge = knowledge or {}
+    criteria_text = knowledge.get('text') or ''
+    criteria_source = knowledge.get('source') or ''
+    excerpts = knowledge.get('excerpts') or 0
     if not criteria_text.strip():
         criteria_text = '\n'.join(f"- {row['criterion']}: {row['requirement'] or 'requirement not recorded'} "
                                   f"(source: {row['source'] or 'not given'})" for row in criteria)
         criteria_source = 'result'
-        warnings.append(f'{CRITERIA_FILE} is missing or empty, so the audit works from the requirements the result '
-                        'recorded.')
+        reason = knowledge.get('warning') or "The tender's Pinecone namespace returned no criteria"
+        warnings.append(f'{reason}, so the audit works from the requirements the result recorded.')
     if not criteria_text.strip():
-        raise DeepAnalysisError('There are no criteria to review: the result has none and the criteria file is '
-                                'missing.')
+        raise DeepAnalysisError("There are no criteria to review: the result has none and the tender's Pinecone "
+                                'namespace returned none.')
 
     facts = [normalise_fact(fact) for fact in profile_facts(company)]
     if not facts:
@@ -294,7 +380,7 @@ def ingest(result, folder, company, decision=None, today=None):
         'financial_year': this_year['label'],
         'last_financial_year': financial_year(this_year['start'] - timedelta(days=1))['label'],
         'criteria': criteria, 'criteria_text': criteria_text, 'criteria_source': criteria_source,
-        'unreadable': unreadable,
+        'excerpts': excerpts, 'unreadable': unreadable,
         'unreadable_checked': [source for source in result.get('unreadable_checked') or [] if source in unreadable],
         'verdict': result.get('verdict'), 'ai_verdict': result.get('ai_verdict') or result.get('verdict'),
         'jv': result.get('jv') or {}, 'decision': decision, 'company': company, 'facts': facts,
@@ -566,11 +652,11 @@ def judge(llm, context, profile, audit, review, conflicts, round_number, rounds_
 
 # ---------- orchestration ----------
 
-def run_deep_analysis(result, folder, company, decision=None, on_progress=None, usage=None, today=None):
+def run_deep_analysis(result, knowledge, company, decision=None, on_progress=None, usage=None, today=None):
     """
     Runs the five agents over a tender's completed result and returns the report saved as DEEP_ANALYSIS_FILE (see
-    compile_report()). folder holds the tender's saved criteria; company is the profile markdown; decision the team's
-    shortlisted / dropped decision, if any.
+    compile_report()). knowledge is what load_knowledge() retrieved from the tender's Pinecone namespace (None when it
+    has none); company is the profile markdown; decision the team's shortlisted / dropped decision, if any.
 
     on_progress, if given, is called with (agent, stage, round) as each agent starts, round being 0 for the first
     pass and the re-examination round after it. usage, a TokenUsage over LLM_AGENTS, counts each agent's tokens.
@@ -604,7 +690,7 @@ def run_deep_analysis(result, folder, company, decision=None, on_progress=None, 
 
     state = {}  # the blackboard every agent reads and writes
     state['context'] = step('ingestion', 'reading the result, the criteria and the company profile',
-                            lambda: _logged(ingest(result, folder, company, decision, today), _ingestion_event))
+                            lambda: _logged(ingest(result, knowledge, company, decision, today), _ingestion_event))
     context = state['context']
     state['profile'] = step('profiler', 'checking the company data the criteria need',
                             lambda: _logged(profile_company(model('profiler'), context), _profiler_event))
@@ -785,7 +871,8 @@ def compile_report(state, rounds, audit_log, usage):
         'version': REPORT_VERSION, 'tcno': context['tcno'], 'name': context['name'], 'status': 'completed',
         'models': dict(AGENT_MODELS), 'finished_at': _now(),
         'inputs': {
-            'criteria_source': context['criteria_source'], 'criteria': len(context['criteria']),
+            'criteria_source': context['criteria_source'], 'excerpts': context['excerpts'],
+            'criteria': len(context['criteria']),
             'user_marked': sum(1 for criterion in context['criteria'] if criterion['marked_by_user']),
             'unreadable': context['unreadable'], 'unreadable_checked': context['unreadable_checked'],
             'decision': context['decision'], 'normalised_facts': sum(1 for fact in context['facts']
@@ -864,8 +951,8 @@ def explain_deep_error(exc):
         if 'no completed result' in text.lower():
             return ('The result is gone', 'Check the tender again, then run the deep analysis.')
         if 'no criteria' in text:
-            return ('Nothing to review', 'The result has no criteria and its criteria file is missing. Regenerate the '
-                    'criteria, then run the deep analysis again.')
+            return ('Nothing to review', "The result has no criteria and the tender's Pinecone namespace is missing. "
+                    'Regenerate the criteria, then run the deep analysis again.')
         return ('An agent gave an answer the app could not read', 'Run the deep analysis again. If it fails again, '
                 'see logs/app.log.')
     title, action = explain_error(exc)
@@ -916,6 +1003,19 @@ class DeepAnalysisRunner:
         log.info('Deep analysis of tender %s queued', tcno)
         return self.state(tcno)
 
+    def running(self, tcno):
+        """True while a deep analysis of the tender is queued or running."""
+        with self._lock:
+            run = self._runs.get(str(tcno))
+            return bool(run and run['status'] in ('queued', 'running'))
+
+    def forget(self, tcno):
+        """Drops the tender's last failed run from memory, once the tender is deleted (its report goes with its folder)."""
+        with self._lock:
+            run = self._runs.get(str(tcno))
+            if run and run['status'] == 'failed':
+                del self._runs[str(tcno)]
+
     def state(self, tcno):
         """
         {'tcno', 'status', 'progress', 'error', 'error_title', 'error_action', 'analysis', 'stale'}: status is
@@ -941,8 +1041,15 @@ class DeepAnalysisRunner:
         if analysis:
             result = self.processor.result(tcno)
             based_on = (analysis.get('based_on') or {}).get('fingerprint')
-            state['stale'] = not result or based_on != result_fingerprint(result, company_details(self.company_file))
+            state['stale'] = not result or based_on != result_fingerprint(result, self._company(tcno))
         return state
+
+    def _company(self, tcno):
+        """
+        The company profile the tender's agents review, without the tender's own marks (profile_for_tender()):
+        the audit judges afresh, and the status review sees the marks in the result.
+        """
+        return profile_for_tender(company_details(self.company_file), tcno)
 
     def _update(self, tcno, **changes):
         with self._lock:
@@ -967,10 +1074,12 @@ class DeepAnalysisRunner:
                 result = self.processor.result(tcno)
                 if not result or result['status'] != 'completed':
                     raise DeepAnalysisError(f'No completed result for TCNO {tcno}: it was checked again or failed.')
-                company = company_details(self.company_file)
-                entry = (self.decisions.all().get(tcno) if self.decisions else None) or {}
+                company = self._company(tcno)
+                entry =(self.decisions.all().get(tcno) if self.decisions else None) or {}
                 folder = self.processor.target_directory / safe_name(tcno)
-                report = run_deep_analysis(result, folder, company, decision=entry.get('decision'), usage=usage,
+                self._progress(tcno, 'ingestion', 'retrieving the criteria from the Pinecone namespace')
+                knowledge = load_knowledge(self.processor.index, tcno, result)
+                report = run_deep_analysis(result, knowledge, company, decision=entry.get('decision'), usage=usage,
                                            on_progress=lambda *args: self._progress(tcno, *args))
                 report['based_on'] = {'processed_at': result.get('processed_at'), 'verdict': result.get('verdict'),
                                       'fingerprint': result_fingerprint(result, company)}

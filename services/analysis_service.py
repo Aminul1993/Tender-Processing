@@ -1,17 +1,29 @@
-"""Reads every file of a tender and checks the company's eligibility with the LLM pipeline from ext.py."""
+"""
+Reads every file of a tender, indexes them all in the tender's own Pinecone namespace (tcno-<tcno>, in the shared
+index), retrieves the passages on eligibility from it and checks the company's eligibility against them with the
+LLM pipeline of ext.py:
+
+  download -> extract text -> chunk -> embed -> upsert into namespace tcno-<tcno> -> retrieve relevant chunks
+  -> assessment
+
+A re-check skips everything before the retrieval: the namespace is the tender's saved criteria.
+"""
 import logging
 import os
 import re
-from datetime import datetime
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from types import SimpleNamespace
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from markitdown import MarkItDown
 
-from ext import (ASSESSMENT_MODEL, COMPANY_DETAILS_FILE, ELIGIBILITY_GOAL, OCR_MODEL, SUMMARY_MODEL,
-                 TenderTigerBlocked, assess_eligibility, company_details, make_model, prequalification_criteria,
-                 split_text, summarize_for_goal)
+from ext import (ASSESSMENT_MODEL, COMPANY_DETAILS_FILE, OCR_MODEL, TenderTigerBlocked, assess_eligibility,
+                 company_details, make_model, prequalification_criteria)
+from services.company_service import profile_for_tender
+from services.pinecone_service import Document, document_type
+from services.tender_service import to_row
 
 log = logging.getLogger(__name__)
 
@@ -26,14 +38,9 @@ _VERDICT = re.compile(
 )
 _VERDICT_LABELS = {'eligible': ELIGIBLE, 'not eligible': NOT_ELIGIBLE, 'ineligible': NOT_ELIGIBLE}
 
-# The source name the tender's TenderTiger pre-qualification criteria are checked under, beside the file names
+# The source names the tender's TenderTiger texts are indexed and checked under, beside the file names
 PREQUALIFICATION_SOURCE = 'TenderTiger Pre-Qualification'
-
-# The criteria found in a tender's documents are saved in its folder under this name, so the tender can be
-# checked again without reading the documents; see save_criteria() and recheck_saved_criteria()
-CRITERIA_FILE = 'eligibility_criteria.md'
-# The criteria file's section that lists the sources that could not be read
-UNREADABLE_TITLE = 'Sources that could not be read'
+TENDER_DATA_SOURCE = 'TenderTiger Tender Data'
 # The result of a tender's last check is saved in its folder under this name; see processing_service.save_result()
 RESULT_FILE = 'eligibility_result.json'
 # The last deep analysis of that result is saved beside it under this name; see deep_analysis_service
@@ -44,14 +51,47 @@ DEEP_ANALYSIS_FILE = 'deep_analysis.json'
 _NO_CRITERIA = re.compile(r'drawing|\.csv$', re.IGNORECASE)
 # What markitdown-ocr writes besides the text it reads: a heading per page, and notes on pages it could not read
 _OCR_FILLER = re.compile(r'^\s*(## Page \d+|\*\[(No text could be extracted|Error)\b.*\]\*)\s*$', re.MULTILINE)
+# Scanned PDFs are OCR'd one at a time, whatever the number of files read in parallel
+_OCR_SLOT = threading.Lock()
+
+# What the eligibility check retrieves from the tender's namespace before calling the LLM: a few searches for each kind
+# of requirement, so every kind gets its share of the excerpts (see PineconeService.retrieve())
+ASSESSMENT_QUERIES = {
+    'eligibility': [
+        'Eligibility criteria and pre-qualification requirements a bidder must meet',
+        'Minimum qualification criteria: who may bid, registration, bidder must be a company, firm, OEM or authorised '
+        'dealer',
+    ],
+    'financial': [
+        'Minimum average annual turnover required in the last financial years',
+        'Net worth, solvency certificate, working capital, bank guarantee and bid capacity formula',
+        'Estimated cost, tender value, earnest money deposit (EMD) and performance security',
+    ],
+    'technical': [
+        'Technical eligibility: certifications, licences, plant, equipment and key personnel the bidder must have',
+        'Technical specifications and scope of work the bidder must be able to deliver',
+    ],
+    'experience': [
+        'Similar work experience: completed works of a stated value in the last years',
+        'Definition of similar work and the documents that prove experience, such as completion certificates',
+    ],
+    'jv': [
+        'Joint venture or consortium allowed, maximum number of members, lead member share',
+        'Qualifying criteria the lead member, the other members and the joint venture as a whole must each meet',
+    ],
+    'compliance': [
+        'Documents to submit with the bid: GST, PAN, registration, ISO certificates, affidavits and declarations',
+        'Exemptions and relaxations for MSE, MSME, Udyam or startup bidders; blacklisting and debarment conditions',
+    ],
+}
 
 
 class TokenUsage:
     """
-    Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents for eligibility criteria,
-    OCR of scanned PDFs included) and 'assessment' (checking the company against them, for the final result). Given to process_tender_files() or
-    recheck_saved_criteria(), it still holds the tokens spent before a failure. Other steps can be named instead,
-    such as the agents of a deep analysis.
+    Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents: the OCR of scanned PDFs)
+    and 'assessment' (checking the company against the criteria retrieved, for the final result). Given to
+    process_tender_files() or recheck_saved_criteria(), it still holds the tokens spent before a failure. Other steps
+    can be named instead, such as the agents of a deep analysis. Embedding tokens are Pinecone's, not counted here.
     """
     STEPS = ('criteria', 'assessment')
 
@@ -77,49 +117,56 @@ class TokenUsage:
 
 
 def tender_files(tcno_folder):
-    """The tender's documents: every file under tcno_folder except the saved criteria, result and deep analysis."""
+    """The tender's documents: every file under tcno_folder except the saved result and deep analysis."""
     tcno_folder = Path(tcno_folder)
-    saved = {tcno_folder / CRITERIA_FILE, tcno_folder / RESULT_FILE, tcno_folder / DEEP_ANALYSIS_FILE}
+    saved = {tcno_folder / RESULT_FILE, tcno_folder / DEEP_ANALYSIS_FILE}
     return sorted(path for path in tcno_folder.rglob('*') if path.is_file() and path not in saved)
 
 
-def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DETAILS_FILE,
-                         prequalification_link=None, usage=None, max_file_chars=300_000):
+def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, company_file=COMPANY_DETAILS_FILE,
+                         prequalification_link=None, tender=None, usage=None, max_file_chars=300_000, workers=4):
     """
-    Checks the company profile saved in company_file against the eligibility criteria found in every file
-    under tcno_folder, and in the pre-qualification criteria behind prequalification_link (the tender's
-    TenderTiger GetPreQualification link), when one is given. The criteria found are saved in
-    tcno_folder/CRITERIA_FILE before the check, for recheck_saved_criteria(). Drawings and item lists are not
-    read (see _NO_CRITERIA), and a file with more than max_file_chars of text is listed as unreadable rather
-    than sent to the LLM.
+    Checks the company profile saved in company_file against the eligibility criteria of a tender: every file
+    under tcno_folder, the pre-qualification criteria behind prequalification_link (the tender's TenderTiger
+    GetPreQualification link) when one is given, and the tender's TenderTiger data (tender, the raw list row) when
+    given. Every source is converted to text (files in parallel, workers at a time), and all of them are indexed
+    together in the tender's own Pinecone namespace, built anew (index, a PineconeService; tcno defaults to the
+    folder name). The chunks relevant to each kind of requirement (ASSESSMENT_QUERIES) are then retrieved from the
+    namespace and checked by the LLM. Drawings and item lists are not read (see _NO_CRITERIA), and a file with more than
+    max_file_chars of text is listed as unreadable rather than indexed.
 
-    Returns {'verdict', 'details', 'score', 'criteria', 'unreadable_files'}:
+    Returns {'verdict', 'details', 'score', 'criteria', 'unreadable_files', 'jv', 'comparison', 'index'}:
       verdict           Eligible, Not Eligible or Requires Review
       details           the full assessment as markdown (criteria table, calculations, verdict)
       score             percentage of criteria marked Met, or None when the assessment has no criteria table
       criteria          the rows of the criteria table, see parse_criteria()
-      unreadable_files  files that could not be read or summarised, so were not checked; PREQUALIFICATION_SOURCE
+      unreadable_files  files that could not be read, so were not indexed or checked; PREQUALIFICATION_SOURCE
                         when the pre-qualification criteria could not be fetched
+      index             {'index', 'namespace', 'sources', 'chunks', 'embedding_tokens', 'retrieved_chunks',
+                        'retrieved_characters'}
 
     on_progress, if given, is called with a short status message before each step, plus step and steps
-    (1-based position and total, counting each file and the final check) when they are known.
-    usage, a TokenUsage, if given, counts the tokens of reading the files and of the final check.
+    (1-based position and total: one per file, then indexing, then the final check) when they are known.
+    usage, a TokenUsage, if given, counts the tokens of reading scanned files and of the final check.
     Raises RuntimeError when GROQ_API_KEY is missing, the company profile is empty, or there is nothing to check
-    (no files and no pre-qualification criteria); errors from the final LLM call propagate.
+    (no files and no pre-qualification criteria); VectorStoreError when the index cannot be built or searched;
+    errors from the final LLM call propagate (the namespace is kept, so a re-check can follow).
     """
     report = on_progress or (lambda message, **position: None)
     usage = usage or TokenUsage()
-    # Read once, so every file of the tender is checked against the same profile
-    company = _company(company_file)
-
     tcno_folder = Path(tcno_folder)
+    tcno = str(tcno or tcno_folder.name)
+    # Read once, so every file of the tender is checked against the same profile
+    company = _company(company_file, tcno)
+    index.require()
+
     files = tender_files(tcno_folder)
     ignored = [path for path in files if _NO_CRITERIA.search(path.name)]
     if ignored:
         log.info('Not reading %s: drawings and item lists hold no eligibility criteria',
                  ', '.join(path.relative_to(tcno_folder).as_posix() for path in ignored))
         files = [path for path in files if path not in ignored]
-    summaries = []
+    documents = []
     skipped = []
     if prequalification_link:
         report('Reading the pre-qualification criteria')
@@ -129,59 +176,105 @@ def process_tender_files(tcno_folder, on_progress=None, company_file=COMPANY_DET
             # Fail the tender, so the job stops calling the site, rather than check it without these criteria
             raise
         except Exception:
-            log.warning('Could not fetch the pre-qualification criteria of %s', tcno_folder.name, exc_info=True)
+            log.warning('Could not fetch the pre-qualification criteria of %s', tcno, exc_info=True)
             skipped.append(PREQUALIFICATION_SOURCE)
         else:
             if prequalification:
-                # Already a short list of criteria, so it is checked as written rather than summarised
-                summaries.append(f'## {PREQUALIFICATION_SOURCE}\n{prequalification}')
-    if not files and not summaries:
+                # Already a short list of criteria: indexed as written, and always sent in full (see retrieve())
+                documents.append(Document(PREQUALIFICATION_SOURCE, prequalification, 'prequalification'))
+    if not files and not documents:
         reason = 'could not be fetched' if skipped else 'were not found'
         raise RuntimeError(f'No tender files to check, and the pre-qualification criteria {reason}.')
+    if tender:
+        documents.insert(0, Document(TENDER_DATA_SOURCE, tender_data_text(tender), 'tender_data'))
+    # Before reading: a Pinecone plan with no room for the namespace fails the tender before any OCR is paid for
+    # (TenderProcessor has already made it before downloading; this empties it again, which is quick)
+    index.reset_namespace(tcno, on_progress=report)
 
-    reader = usage.track(make_model(SUMMARY_MODEL), 'criteria')
-    md = MarkItDown()
-    ocr = None  # an _OcrReader, made for the first PDF that needs one
-    steps = len(files) + 1
-    for number, path in enumerate(files, 1):
+    steps = len(files) + 2
+    read, unreadable = read_documents(tcno_folder, files, usage, max_file_chars=max_file_chars, workers=workers,
+                                      on_progress=lambda message, number: report(message, step=number, steps=steps))
+    documents += read
+    skipped += unreadable
+
+    name = index.namespace(tcno)
+    report(f'Indexing {len(documents)} source(s) in the Pinecone namespace {name}', step=steps - 1, steps=steps)
+    built = index.ingest(tcno, documents, skipped,
+                         on_progress=lambda message: report(message, step=steps - 1, steps=steps))
+    manifest = built.pop('manifest')
+    report(f'Checking eligibility against the criteria retrieved from {name}', step=steps, steps=steps)
+    analysis = _assess_from_index(index, tcno, usage, company,
+                                  f'None of the {len(files)} file(s) contained text that could be read.', manifest,
+                                  tender=tender)
+    analysis['index'] = {**built, **analysis['index']}
+    return analysis
+
+
+def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4, on_progress=None):
+    """
+    Converts each of files (under tcno_folder) to text with MarkItDown, workers files at a time; a PDF with no text
+    layer, such as a scan, is read with OCR (OCR_MODEL, its tokens counted in usage under 'criteria').
+    Returns (documents, skipped) in the order of files: a Document for each file with text, and the names of the
+    files with none or too much (over max_file_chars). on_progress, if given, is called with (message, number) as
+    each file is done, number counting the files done so far.
+    """
+    report = on_progress or (lambda message, number: None)
+    tcno_folder = Path(tcno_folder)
+    local = threading.local()  # a MarkItDown per thread
+
+    def read(path):
         # Relative path, because nested zips often contain files with the same name
         name = path.relative_to(tcno_folder).as_posix()
-        report(f'Analysing file {number} of {len(files)}: {name}', step=number, steps=steps)
+        if not hasattr(local, 'md'):
+            local.md = MarkItDown()
         try:
-            text = (md.convert(path).markdown or '').strip()
+            text = (local.md.convert(path).markdown or '').strip()
         except Exception:
             log.warning('Could not read %s', path, exc_info=True)
             text = ''
         if not text and path.suffix.lower() == '.pdf':
-            # No text layer, as in a scan: read the page images with OCR
-            ocr = ocr or _OcrReader(usage.track(make_model(OCR_MODEL), 'criteria'))
-            text = ocr.read(path)
+            # No text layer, as in a scan: read the page images with OCR (a reader per file: it keeps state). One
+            # scan at a time, as before files were read in parallel: OCR calls in parallel would hit Groq's rate
+            # limit, and one page refused makes the whole file unreadable
+            with _OCR_SLOT:
+                text = _OcrReader(usage.track(make_model(OCR_MODEL), 'criteria')).read(path)
         if not text:
             log.info('No readable text in %s', name)
-            skipped.append(name)
-            continue
+            return name, None, name
         if len(text) > max_file_chars:
-            # Summarising costs about a token per 2.6 characters, so one huge file could outspend 40 tenders
+            # Indexing is cheap, but a file this long is usually a drawing set or a data dump that would crowd the
+            # criteria out of the search results
             log.warning('Not reading %s: %d characters is over MAX_FILE_CHARS (%d)', name, len(text), max_file_chars)
-            skipped.append(f'{name} (too long: {len(text):,} characters; the MAX_FILE_CHARS limit is {max_file_chars:,})')
-            continue
-        log.info('Reading %s: %d characters in %d chunk(s)', name, len(text), len(split_text(text)))
-        try:
-            summary = summarize_for_goal(reader, text, ELIGIBILITY_GOAL)
-        except Exception:
-            log.warning('Could not summarize %s', path, exc_info=True)
-            skipped.append(name)
-            continue
-        if summary:
-            summaries.append(f'## {name}\n{summary}')
-        else:
-            log.info('Nothing relevant to eligibility in %s', name)
+            return name, None, f'{name} (too long: {len(text):,} characters; the MAX_FILE_CHARS limit is {max_file_chars:,})'
+        log.info('Read %s: %d characters', name, len(text))
+        return name, Document(name, text, document_type(name)), None
 
-    # Saved before the final check, so a failure there does not lose the work of reading every file
-    save_criteria(tcno_folder, summaries, skipped)
-    report('Checking eligibility against the company details', step=steps, steps=steps)
-    return _assess(usage.track(make_model(ASSESSMENT_MODEL), 'assessment'), summaries, skipped, company,
-                   f'None of the {len(files)} file(s) contained eligibility criteria that could be read.')
+    results = {}
+    if files:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(files)))) as pool:
+            futures = {pool.submit(read, path): path for path in files}
+            for number, future in enumerate(as_completed(futures), 1):
+                path = futures[future]
+                results[path] = future.result()
+                report(f'Read file {number} of {len(files)}: {results[path][0]}', number)
+    documents = [results[path][1] for path in files if results[path][1]]
+    skipped = [results[path][2] for path in files if results[path][2]]
+    return documents, skipped
+
+
+def tender_data_text(tender):
+    """The tender's own data as TenderTiger lists it, as text to index beside its documents."""
+    row = to_row(tender)
+    value = row.get('tender_value')
+    lines = [
+        ('Tender', row.get('name')), ('TCNO', row.get('tcno')), ('Tender reference', row.get('reference')),
+        ('Organisation', row.get('organisation')), ('Location', row.get('location')),
+        ('Published', row.get('published_date')), ('Closing date', row.get('closing_date')),
+        # Said when missing, so the model does not take a value it was never given for granted
+        ('Tender value as listed on TenderTiger (not from the tender documents)',
+         f"{row.get('currency') or 'INR'} {value:,.2f}" if value else 'not listed'),
+    ]
+    return '\n'.join(f'{label}: {text}' for label, text in lines if text)
 
 
 class _OcrReader:
@@ -226,85 +319,67 @@ class _OcrReader:
         return text
 
 
-def recheck_saved_criteria(tcno_folder, on_progress=None, company_file=COMPANY_DETAILS_FILE, usage=None):
+def recheck_saved_criteria(tcno, *, index, on_progress=None, company_file=COMPANY_DETAILS_FILE, usage=None,
+                           tender=None):
     """
-    Checks the company profile saved in company_file against the criteria in tcno_folder/CRITERIA_FILE, as
-    saved by process_tender_files() and perhaps edited since, without reading the documents again: one LLM call.
-    The sources the file lists as unreadable stay unreadable, so the check is still marked incomplete.
+    Checks the company profile saved in company_file against the criteria retrieved from the tender's Pinecone
+    namespace (built by process_tender_files()), without downloading or reading the documents again: the embedding
+    of the queries and one LLM call. The sources the namespace lists as unreadable stay unreadable, so the check is
+    still marked incomplete. tender, the raw TenderTiger list row, if given, is sent as it is now, in place of the
+    copy indexed with the documents (a closing date may have moved since).
 
     Returns the same dict as process_tender_files(); on_progress is called with step 1 of 1. usage, a TokenUsage,
     if given, counts the tokens of the check; the criteria cost none.
-    Raises RuntimeError when GROQ_API_KEY is missing or the company profile is empty, FileNotFoundError
-    without a criteria file; errors from the LLM call propagate.
+    Raises RuntimeError when GROQ_API_KEY is missing or the company profile is empty, NamespaceIncomplete without
+    a complete namespace, VectorStoreError when Pinecone fails; errors from the LLM call propagate.
     """
     report = on_progress or (lambda message, **position: None)
     usage = usage or TokenUsage()
-    company = _company(company_file)
-    criteria, skipped = read_criteria(Path(tcno_folder) / CRITERIA_FILE)
-    report('Checking eligibility against the saved criteria', step=1, steps=1)
-    llm = usage.track(make_model(ASSESSMENT_MODEL), 'assessment')
-    return _assess(llm, [criteria] if criteria else [], skipped, company,
-                   f'The saved criteria in {CRITERIA_FILE} list no eligibility criteria.')
+    company = _company(company_file, tcno)
+    index.require()
+    name = index.namespace(tcno)
+    report(f'Checking eligibility against the criteria retrieved from {name}', step=1, steps=1)
+    return _assess_from_index(index, str(tcno), usage, company,
+                              f'The Pinecone namespace {name} holds no document text.', tender=tender)
 
 
-def save_criteria(tcno_folder, summaries, skipped):
+def _assess_from_index(index, tcno, usage, company, nothing_found, manifest=None, tender=None):
     """
-    Writes the criteria found in a tender (summaries: one '## <source>' section each) and the sources that
-    could not be read to tcno_folder/CRITERIA_FILE, in the form read_criteria() reads back. Returns its path.
+    Retrieves the chunks of ASSESSMENT_QUERIES from the tender's namespace and makes the final check on them.
+    manifest is the one the namespace was just built with, if it was. tender, the raw TenderTiger list row, if
+    given, goes to the model as the tender's details (tender value, organisation, closing date, ...), and its copy
+    in the namespace is left out of the excerpts.
     """
-    parts = ['# Eligibility criteria', (
-        f"> Taken from the tender documents on {datetime.now():%d %b %Y %H:%M}. Checking this tender again "
-        'compares the company profile with this file instead of reading the documents: edit it to correct a '
-        'criterion, or regenerate it to read the documents again.'
-    )]
-    if not summaries:
-        parts.append('> No eligibility criteria were found in the documents.')
-    parts += [summary.strip() for summary in summaries]
-    if skipped:
-        parts.append(f'## {UNREADABLE_TITLE}\n\nThese were not checked, so any criteria they hold are missing '
-                     'above:\n\n' + '\n'.join(f'- {name}' for name in skipped))
-    path = Path(tcno_folder) / CRITERIA_FILE
-    # Written beside and then moved, so a crash mid-write cannot leave half the criteria to be checked later
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text('\n\n'.join(parts) + '\n', encoding='utf-8')
-    os.replace(temporary, path)
-    log.info('Saved the eligibility criteria in %s', path)
-    return path
+    retrieval = index.retrieve(tcno, ASSESSMENT_QUERIES, manifest=manifest)
+    sections = retrieval.sections()
+    details = None
+    if tender:
+        details = tender_data_text(tender)
+        sections = [section for section in sections if not section.startswith(f'## {TENDER_DATA_SOURCE}\n')]
+    analysis = _assess(usage.track(make_model(ASSESSMENT_MODEL), 'assessment'), sections,
+                       retrieval.unreadable, company, nothing_found, details)
+    analysis['index'] = {'index': index.index_name, 'namespace': retrieval.namespace,
+                         'retrieved_chunks': len(retrieval.chunks), 'retrieved_characters': retrieval.characters}
+    return analysis
 
 
-def read_criteria(path):
+def _company(company_file, tcno):
     """
-    Reads a criteria file written by save_criteria(). Returns (criteria, unreadable): the criteria as markdown,
-    without the title, the notes under it and the unreadable section, and the sources that section lists.
-    Raises FileNotFoundError.
+    The company profile in company_file to check tender tcno against (without its own marks, see
+    profile_for_tender()), after checking the LLM can be called. Raises RuntimeError.
     """
-    text = Path(path).read_text(encoding='utf-8-sig')
-    head, *sections = re.split(r'(?m)^(?=## )', text)
-    # Only the title and the notes are dropped from above the first section; anything added there is kept
-    parts = ['\n'.join(line for line in head.splitlines() if not line.startswith(('# ', '>')))]
-    unreadable = []
-    for section in sections:
-        title, _, body = section.partition('\n')
-        if title[3:].strip() == UNREADABLE_TITLE:
-            unreadable += [line[2:].strip() for line in body.splitlines() if line.startswith('- ')]
-        else:
-            parts.append(section)
-    return '\n\n'.join(part.strip() for part in parts if part.strip()), unreadable
-
-
-def _company(company_file):
-    """The company profile in company_file, after checking the LLM can be called. Raises RuntimeError."""
     if not os.getenv('GROQ_API_KEY'):
         raise RuntimeError('GROQ_API_KEY is not set. Add it to .env and restart the app.')
-    company = company_details(company_file)
+    company = profile_for_tender(company_details(company_file), tcno)
     if not company:
         raise RuntimeError(f'The company profile in {company_file} is empty.')
     return company
 
 
-def _assess(llm, summaries, skipped, company, nothing_found):
+def _assess(llm, summaries, skipped, company, nothing_found, tender_details=None):
     """
     The final check of process_tender_files() and recheck_saved_criteria(); nothing_found explains no criteria.
+    tender_details is the tender's data from the TenderTiger list as text, if known.
     Besides the verdict for bidding alone, returns 'jv' ({'allowed', 'max_members', 'verdict', 'conditions'}, where
     verdict is for the company as JV lead member, see jv_verdict()) and 'comparison' (see compare_routes()).
     """
@@ -312,7 +387,7 @@ def _assess(llm, summaries, skipped, company, nothing_found):
         return {'verdict': REQUIRES_REVIEW, 'details': _note_skipped(nothing_found, skipped), 'score': None,
                 'criteria': [], 'unreadable_files': skipped, 'comparison': [],
                 'jv': {'allowed': 'unknown', 'max_members': None, 'verdict': None, 'conditions': []}}
-    assessment = plain_maths(assess_eligibility(llm, summaries, company))
+    assessment = plain_maths(assess_eligibility(llm, summaries, company, tender_details))
     verdict = parse_verdict(assessment)
     # A verdict that never saw some documents must not read as complete
     if skipped and verdict == ELIGIBLE:

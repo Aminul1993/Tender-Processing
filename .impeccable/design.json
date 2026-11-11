@@ -1,6 +1,6 @@
 {
   "schemaVersion": 2,
-  "generatedAt": "2026-11-02T12:26:57+00:00",
+  "generatedAt": "2026-11-11T12:18:19+00:00",
   "title": "Design System: Tender Processing",
   "extensions": {
     "colorMeta": {
@@ -661,7 +661,7 @@
       },
       "title": {
         "displayName": "Title",
-        "purpose": "App bar name, run status, help toggle, analysis heading."
+        "purpose": "App bar name, run panel status, \"Full analysis\", section headings in the company profile editor."
       },
       "body": {
         "displayName": "Body",
@@ -711,7 +711,7 @@
       {
         "name": "modal",
         "value": "0 24px 60px rgba(20, 20, 25, .18)",
-        "purpose": "Details modal, over a chrome backdrop at 45% opacity."
+        "purpose": "Every modal (details, company profile, help, closed tenders), over a chrome backdrop at 45% opacity."
       },
       {
         "name": "focus-glow",
@@ -763,9 +763,19 @@
     ],
     "breakpoints": [
       {
+        "name": "toolbar",
+        "value": "1300px",
+        "purpose": "Below 1300px the search takes its own toolbar row; the other controls share the next, Check eligibility at its right."
+      },
+      {
         "name": "wide",
         "value": "1200px",
         "purpose": "Seven-column table."
+      },
+      {
+        "name": "compact",
+        "value": "992px",
+        "purpose": "Below 992px Closed tenders in the app bar becomes a 28px icon square; the company profile editor goes full screen."
       },
       {
         "name": "medium",
@@ -775,7 +785,12 @@
       {
         "name": "narrow",
         "value": "767.98px",
-        "purpose": "Below 768px: rows become cards; analysis table stacks; app bar wraps."
+        "purpose": "Below 768px: rows become cards; analysis table stacks; app bar wraps the company line under the brand."
+      },
+      {
+        "name": "phone",
+        "value": "575.98px",
+        "purpose": "Below 576px: the help and closed tenders modals go full screen; each closed tender becomes a block."
       }
     ]
   },
@@ -861,12 +876,20 @@
       "css": ".ds-pt{width:520px;font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-pt-wrap{overflow-x:auto;border:1px solid var(--line, #E4E4DF);border-radius:10px;background:var(--surface, #fff)}.ds-pt-table{width:100%;border-collapse:collapse;font-size:13px}.ds-pt-table th{padding:0;border-bottom:1px solid var(--line, #E4E4DF);background:var(--surface-sunk, #FAFAF8);color:var(--muted, #5E6066);font-weight:500;text-align:left;white-space:nowrap}.ds-pt-table td{padding:0;border-top:1px solid var(--line-3, #F0F0EC)}.ds-pt-table tbody tr:first-child td{border-top:0}.ds-pt-table td+td:not(.ds-pt-rm-cell),.ds-pt-table th+th:not(.ds-pt-rm-cell){border-left:1px solid var(--line-3, #F0F0EC)}.ds-pt-col{display:flex;align-items:center}.ds-pt-colname{flex:1;min-width:100px;height:34px;padding:0 10px;border:0;background:transparent;color:var(--muted, #5E6066);font:500 13px 'IBM Plex Sans',system-ui,sans-serif;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-col-rm{display:grid;place-items:center;width:26px;height:26px;margin-right:4px;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--faint, #8A8C92);cursor:pointer;opacity:0;transition:opacity .15s cubic-bezier(.16,1,.3,1)}.ds-pt-table th:hover .ds-pt-col-rm,.ds-pt-table th:focus-within .ds-pt-col-rm{opacity:1}.ds-pt-cell{box-sizing:border-box;display:block;width:100%;min-width:130px;height:38px;padding:0 10px;border:0;background:transparent;color:var(--ink, #1A1B1E);font:400 13px 'IBM Plex Sans',system-ui,sans-serif;font-variant-numeric:tabular-nums;transition:background-color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-cell:hover,.ds-pt-colname:hover{background:var(--hover, #FBFBF9)}.ds-pt-cell:focus,.ds-pt-colname:focus{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:-2px;background:var(--surface, #fff)}.ds-pt-key{color:var(--ink-2, #3A3C42);font-weight:500}.ds-pt-rm-cell{width:40px;text-align:center}.ds-pt-rm{display:grid;place-items:center;width:32px;height:32px;margin:0 auto;padding:0;border:1px solid transparent;border-radius:7px;background:transparent;color:var(--faint, #8A8C92);cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1),border-color .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-pt-rm:hover,.ds-pt-col-rm:hover{border-color:var(--control-line, #DCDCD6);background:var(--surface, #fff);color:var(--ink, #1A1B1E)}.ds-pt-rm:focus-visible,.ds-pt-col-rm:focus-visible,.ds-pt-link:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}.ds-pt-foot{display:flex;flex-wrap:wrap;align-items:center;gap:6px 16px;margin-top:8px}.ds-pt-link{display:inline-flex;align-items:center;gap:4px;padding:0;border:0;background:none;color:var(--accent, oklch(0.55 0.14 255));font:500 13px 'IBM Plex Sans',system-ui,sans-serif;text-decoration:underline;text-underline-offset:.2em;cursor:pointer}.ds-pt-link:hover{color:var(--accent-strong, oklch(0.48 0.14 255))}.ds-pt-link-quiet{margin-left:auto;color:var(--muted, #5E6066)}.ds-pt-link-quiet:hover{color:var(--ink, #1A1B1E)}.ds-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
     },
     {
+      "name": "Closed Tenders",
+      "kind": "custom",
+      "refersTo": "",
+      "description": "The closed tenders whose documents are still downloaded: title over mono TCNO, closing date over how long ago, files over their size, and a red Delete that asks first.",
+      "html": "<div class=\"ds-ct\"><table class=\"ds-ct-table\" aria-label=\"Closed tenders with downloaded files\"><thead><tr><th>Tender</th><th>Closed</th><th class=\"ds-ct-num\">Files</th><th><span class=\"ds-vh\">Delete</span></th></tr></thead><tbody><tr><td><div class=\"ds-ct-name\">Upgradation of GPRA type IV quarters at Andrews Ganj extension, New Delhi</div><div class=\"ds-ct-meta ds-ct-mono\">102128206</div></td><td><div>03 Nov 2026</div><div class=\"ds-ct-meta\">8 days ago</div></td><td class=\"ds-ct-num\"><div>3 files</div><div class=\"ds-ct-meta\">2.3 MB</div></td><td class=\"ds-ct-act\"><button type=\"button\" class=\"ds-ct-del\" aria-label=\"Delete tender 102128206\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M6.5 1h3a.5.5 0 0 1 .5.5v1H6v-1a.5.5 0 0 1 .5-.5M11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3A1.5 1.5 0 0 0 5 1.5v1H1.5a.5.5 0 0 0 0 1h.538l.853 10.66A2 2 0 0 0 4.885 16h6.23a2 2 0 0 0 1.994-1.84l.853-10.66h.538a.5.5 0 0 0 0-1zm1.958 1-.846 10.58a1 1 0 0 1-.997.92h-6.23a1 1 0 0 1-.997-.92L3.042 3.5zm-7.487 1a.5.5 0 0 1 .528.47l.5 8.5a.5.5 0 0 1-.998.06L5 5.03a.5.5 0 0 1 .47-.53Zm5.058 0a.5.5 0 0 1 .47.53l-.5 8.5a.5.5 0 1 1-.998-.06l.5-8.5a.5.5 0 0 1 .528-.47M8 4.5a.5.5 0 0 1 .5.5v8.5a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5\"/></svg> Delete</button></td></tr><tr><td><div class=\"ds-ct-name\">Annual repair and maintenance of income tax quarters at Alappuzha</div><div class=\"ds-ct-meta ds-ct-mono\">102264098</div></td><td><div>05 Nov 2026</div><div class=\"ds-ct-meta\">6 days ago</div></td><td class=\"ds-ct-num\"><div>1 file</div><div class=\"ds-ct-meta\">57 KB</div></td><td class=\"ds-ct-act\"><button type=\"button\" class=\"ds-ct-del\" aria-label=\"Delete tender 102264098\"><svg width=\"13\" height=\"13\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M6.5 1h3a.5.5 0 0 1 .5.5v1H6v-1a.5.5 0 0 1 .5-.5M11 2.5v-1A1.5 1.5 0 0 0 9.5 0h-3A1.5 1.5 0 0 0 5 1.5v1H1.5a.5.5 0 0 0 0 1h.538l.853 10.66A2 2 0 0 0 4.885 16h6.23a2 2 0 0 0 1.994-1.84l.853-10.66h.538a.5.5 0 0 0 0-1zm1.958 1-.846 10.58a1 1 0 0 1-.997.92h-6.23a1 1 0 0 1-.997-.92L3.042 3.5zm-7.487 1a.5.5 0 0 1 .528.47l.5 8.5a.5.5 0 0 1-.998.06L5 5.03a.5.5 0 0 1 .47-.53Zm5.058 0a.5.5 0 0 1 .47.53l-.5 8.5a.5.5 0 1 1-.998-.06l.5-8.5a.5.5 0 0 1 .528-.47M8 4.5a.5.5 0 0 1 .5.5v8.5a.5.5 0 0 1-1 0V5a.5.5 0 0 1 .5-.5\"/></svg> Delete</button></td></tr></tbody></table></div>",
+      "css": ".ds-ct{width:620px;overflow-x:auto;border:1px solid var(--line, #E4E4DF);border-radius:10px;background:var(--surface, #fff);font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-ct-table{width:100%;border-collapse:collapse;color:var(--ink, #1A1B1E);font-size:13px;font-variant-numeric:tabular-nums}.ds-ct-table th{padding:9px 12px;border-bottom:1px solid var(--line-2, #EDEDE9);background:var(--surface-sunk, #FAFAF8);color:var(--meta, #6A6C72);font-size:12px;font-weight:500;letter-spacing:.02em;text-align:left}.ds-ct-table td{padding:10px 12px;border-bottom:1px solid var(--line-3, #F0F0EC);vertical-align:top;white-space:nowrap}.ds-ct-table tbody tr:last-child td{border-bottom:0}.ds-ct-table td:first-child{white-space:normal}.ds-ct-table .ds-ct-num{text-align:right}.ds-ct-name{display:-webkit-box;overflow:hidden;-webkit-box-orient:vertical;-webkit-line-clamp:2;min-width:220px;line-height:1.4}.ds-ct-meta{margin-top:2px;color:var(--meta, #6A6C72);font-size:12px}.ds-ct-mono{font-family:'IBM Plex Mono',monospace}.ds-ct-act{width:1%;vertical-align:middle!important}.ds-ct-del{display:inline-flex;align-items:center;gap:8px;height:32px;padding:0 12px;border:1px solid color-mix(in oklch, oklch(0.58 0.16 25) 45%, white);border-radius:8px;background:var(--surface, #fff);color:oklch(0.45 0.15 25);font:500 13px/1 'IBM Plex Sans',system-ui,sans-serif;cursor:pointer;transition:background-color .15s cubic-bezier(.16,1,.3,1),border-color .15s cubic-bezier(.16,1,.3,1)}.ds-ct-del:hover{border-color:oklch(0.58 0.16 25);background:oklch(0.95 0.03 25)}.ds-ct-del:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}.ds-vh{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}"
+    },
+    {
       "name": "App Bar",
       "kind": "nav",
       "refersTo": "appbar",
-      "description": "Near-black band with the product mark, the company every verdict is checked against, and a quiet Edit profile button that opens the company profile editor.",
-      "html": "<header class=\"ds-appbar\"><div class=\"ds-brand\"><span class=\"ds-mark\" aria-hidden=\"true\">TP</span><span class=\"ds-title\">Tender Processing</span></div><div class=\"ds-prof\"><span class=\"ds-lbl\">Checking against</span><span class=\"ds-co\">ABC Infrastructure Ltd.</span><button type=\"button\" class=\"ds-appbar-btn\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M15.502 1.94a.5.5 0 0 1 0 .706L14.459 3.69l-2-2L13.502.646a.5.5 0 0 1 .707 0l1.293 1.293zm-1.75 2.456-2-2L4.939 9.21a.5.5 0 0 0-.121.196l-.805 2.414a.25.25 0 0 0 .316.316l2.414-.805a.5.5 0 0 0 .196-.12l6.813-6.814z\"/><path fill-rule=\"evenodd\" d=\"M1 13.5A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-6a.5.5 0 0 0-1 0v6a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5H9a.5.5 0 0 0 0-1H2.5A1.5 1.5 0 0 0 1 2.5z\"/></svg> Edit profile</button></div></header>",
-      "css": ".ds-appbar{display:flex;align-items:center;justify-content:space-between;gap:16px;height:56px;padding:0 28px;background:var(--chrome, #16171A);color:var(--chrome-ink, #F3F3F0);font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-brand{display:flex;align-items:center;gap:12px}.ds-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:7px;background:oklch(0.55 0.14 255);color:#fff;font-size:13px;font-weight:700}.ds-title{font-size:15px;font-weight:600;letter-spacing:-0.01em}.ds-prof{display:flex;align-items:center;gap:10px;font-size:13px}.ds-lbl{color:var(--chrome-muted, #9A9BA0)}.ds-co{font-weight:600}.ds-appbar-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:transparent;color:var(--chrome-link, #B5B6BA);font:500 12px 'IBM Plex Sans',system-ui,sans-serif;white-space:nowrap;cursor:pointer;transition:border-color .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-appbar-btn:hover{border-color:rgba(255,255,255,.36);color:#fff}.ds-appbar-btn:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}"
+      "description": "Near-black band with the product mark, the company every verdict is checked against with a quiet Edit profile button, then Closed tenders and the ? (how the check works) at the far right; below 992px Closed tenders is its icon alone in a 28px square.",
+      "html": "<header class=\"ds-appbar\"><div class=\"ds-brand\"><span class=\"ds-mark\" aria-hidden=\"true\">TP</span><span class=\"ds-title\">Tender Processing</span></div><div class=\"ds-prof\"><span class=\"ds-lbl\">Checking against</span><span class=\"ds-co\">ABC Infrastructure Ltd.</span><button type=\"button\" class=\"ds-appbar-btn\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M15.502 1.94a.5.5 0 0 1 0 .706L14.459 3.69l-2-2L13.502.646a.5.5 0 0 1 .707 0l1.293 1.293zm-1.75 2.456-2-2L4.939 9.21a.5.5 0 0 0-.121.196l-.805 2.414a.25.25 0 0 0 .316.316l2.414-.805a.5.5 0 0 0 .196-.12l6.813-6.814z\"/><path fill-rule=\"evenodd\" d=\"M1 13.5A1.5 1.5 0 0 0 2.5 15h11a1.5 1.5 0 0 0 1.5-1.5v-6a.5.5 0 0 0-1 0v6a.5.5 0 0 1-.5.5h-11a.5.5 0 0 1-.5-.5v-11a.5.5 0 0 1 .5-.5H9a.5.5 0 0 0 0-1H2.5A1.5 1.5 0 0 0 1 2.5z\"/></svg> Edit profile</button></div><div class=\"ds-actions\"><button type=\"button\" class=\"ds-appbar-btn\" title=\"Tenders that have closed but whose documents are still in the download folder\"><svg width=\"12\" height=\"12\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path d=\"M.54 3.87.5 3a2 2 0 0 1 2-2h3.672a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 9.828 3h3.982a2 2 0 0 1 1.992 2.181L15.546 8H14.54l.265-2.91A1 1 0 0 0 13.81 4H2.19a1 1 0 0 0-.996 1.09l.637 7a1 1 0 0 0 .995.91H9v1H2.826a2 2 0 0 1-1.991-1.819l-.637-7a2 2 0 0 1 .342-1.31zm6.339-1.577A1 1 0 0 0 6.172 2H2.5a1 1 0 0 0-1 .981l.006.139q.323-.119.684-.12h5.396z\"/><path d=\"M11.854 10.146a.5.5 0 0 0-.707.708L12.293 12l-1.146 1.146a.5.5 0 0 0 .707.708L13 12.707l1.146 1.147a.5.5 0 0 0 .708-.708L13.707 12l1.147-1.146a.5.5 0 0 0-.707-.708L13 11.293z\"/></svg> Closed tenders</button><button type=\"button\" class=\"ds-appbar-btn ds-appbar-sq\" aria-label=\"How the eligibility check works\"><svg width=\"15\" height=\"15\" viewBox=\"0 0 16 16\" fill=\"currentColor\" aria-hidden=\"true\"><path fill-rule=\"evenodd\" d=\"M4.475 5.458c-.284 0-.514-.237-.47-.517C4.28 3.24 5.576 2 7.825 2c2.25 0 3.767 1.36 3.767 3.215 0 1.344-.665 2.288-1.79 2.973-1.1.659-1.414 1.118-1.414 2.01v.03a.5.5 0 0 1-.5.5h-.77a.5.5 0 0 1-.5-.495l-.003-.2c-.043-1.221.477-2.001 1.645-2.712 1.03-.632 1.397-1.135 1.397-2.028 0-.979-.758-1.698-1.926-1.698-1.009 0-1.71.529-1.938 1.402-.066.254-.278.461-.54.461h-.777ZM7.496 14c.622 0 1.095-.474 1.095-1.09 0-.618-.473-1.092-1.095-1.092-.606 0-1.087.474-1.087 1.091S6.89 14 7.496 14\"/></svg></button></div></header>",
+      "css": ".ds-appbar{display:flex;align-items:center;justify-content:space-between;gap:16px;height:56px;padding:0 28px;background:var(--chrome, #16171A);color:var(--chrome-ink, #F3F3F0);font-family:'IBM Plex Sans',system-ui,sans-serif}.ds-brand{display:flex;align-items:center;gap:12px}.ds-mark{display:grid;place-items:center;width:28px;height:28px;border-radius:7px;background:oklch(0.55 0.14 255);color:#fff;font-size:13px;font-weight:700}.ds-title{font-size:15px;font-weight:600;letter-spacing:-0.01em}.ds-prof{display:flex;align-items:center;gap:10px;margin-left:auto;font-size:13px}.ds-actions{display:flex;align-items:center;gap:8px}.ds-lbl{color:var(--chrome-muted, #9A9BA0)}.ds-co{font-weight:600}.ds-appbar-btn{display:inline-flex;align-items:center;gap:6px;height:28px;padding:0 10px;border:1px solid rgba(255,255,255,.18);border-radius:7px;background:transparent;color:var(--chrome-link, #B5B6BA);font:500 12px 'IBM Plex Sans',system-ui,sans-serif;white-space:nowrap;cursor:pointer;transition:border-color .15s cubic-bezier(.16,1,.3,1),color .15s cubic-bezier(.16,1,.3,1)}.ds-appbar-btn:hover{border-color:rgba(255,255,255,.36);color:#fff}.ds-appbar-btn:focus-visible{outline:2px solid var(--accent, oklch(0.55 0.14 255));outline-offset:2px}.ds-lbl{white-space:nowrap}.ds-appbar-sq{justify-content:center;width:28px;padding:0}"
     },
     {
       "name": "Selection Bar",
@@ -896,7 +919,7 @@
       },
       {
         "name": "The Verdict Owns Its Hue Rule",
-        "body": "Green, ochre and red belong to the verdicts and their direct echoes (criterion status, closing urgency, decisions). Nothing else on the page may borrow them.",
+        "body": "Green, ochre and red belong to the verdicts and their direct echoes (criterion status, closing urgency, decisions). Red alone also marks errors and deleting. Nothing else on the page may borrow them.",
         "section": "colors"
       },
       {
@@ -907,6 +930,11 @@
       {
         "name": "The Mono Means Compare Rule",
         "body": "Mono is for identifiers, money, counts and file paths. It never sets prose, headings or labels.",
+        "section": "typography"
+      },
+      {
+        "name": "The Source Case Rule",
+        "body": "TenderTiger often sends text in lower case. A tender title gets a capital first letter; organisations and places are title-cased with \"of\", \"and\" and the like kept lower case. Only first letters are raised, so abbreviations already in capitals (PWD, NHAI) stay.",
         "section": "typography"
       },
       {
@@ -939,7 +967,7 @@
     ],
     "donts": [
       "**Don't** use Unicode characters as icons.",
-      "**Don't** use the verdict greens, ochres or reds for anything that is not a verdict, criterion status, urgency or decision.",
+      "**Don't** use the verdict greens, ochres or reds for anything that is not a verdict, criterion status, urgency or decision; red alone also marks errors and deleting.",
       "**Don't** set grey secondary text on a tinted panel.",
       "**Don't** put shadows on in-flow panels or rows.",
       "**Don't** use `faint` for readable text; it is for disabled states and quiet icons.",

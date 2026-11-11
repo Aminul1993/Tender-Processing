@@ -3,6 +3,7 @@ Loads the tender list through ext.tender_list(), narrowed by the filters of Tend
 every tender listed in memory.
 """
 import logging
+import re
 import threading
 from datetime import date, datetime
 from urllib.parse import urlencode
@@ -158,16 +159,21 @@ def prequalification_url(tender):
     return f'{TENDERTIGER_URL}/TenderDetail/GetPreQualification?{query}'
 
 
+def closing_date(tender):
+    """The raw tender's closing date as a date, or None when the list gives none that can be read."""
+    return _parse_date(tender.get('closingdate'))
+
+
 def to_row(tender):
     """
     Picks the fields the tender table shows. The browser only ever sends TCNOs back; the server looks up the
     TenderTiger IDs the downloads need.
     """
-    closing = _parse_date(tender.get('closingdate'))
+    closing = closing_date(tender)
     return {
         'tcno': str(tender.get('tcno')),
         'name': _text(tender.get('tendersbrief')),
-        'reference': _text(tender.get('tenderrefno')),
+        'reference': _text(tender.get('tenderrefno'), ', '),  # "gem/2026/b/8104997, gem/2026/r/767291"
         'organisation': _text(tender.get('companyname')),
         'location': ', '.join(filter(None, (_text(tender.get('cityname')), _text(tender.get('statename'))))),
         'published_date': _date_text(tender.get('publicationdate')),
@@ -181,9 +187,18 @@ def to_row(tender):
     }
 
 
-def _text(value):
-    """API text fields can be None or contain line breaks; return one clean line."""
-    return '' if value is None else ' '.join(str(value).split())
+BREAK_TAG = re.compile(r'<br\s*/?>', re.IGNORECASE)
+
+
+def _text(value, line_join=' '):
+    """
+    API text fields can be None or hold line breaks, as newlines or as <br> tags (two references in one field, say);
+    returns one clean line, its lines joined by line_join.
+    """
+    if value is None:
+        return ''
+    lines = (' '.join(line.split()) for line in BREAK_TAG.sub('\n', str(value)).splitlines())
+    return line_join.join(line for line in lines if line)
 
 
 def _parse_date(value):

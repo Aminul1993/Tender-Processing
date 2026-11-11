@@ -38,5 +38,7 @@ def configure_logging(level, log_directory):
     access = logging.getLogger('uvicorn.access')
     if not any(isinstance(f, _SkipProgressPolling) for f in access.filters):
         access.addFilter(_SkipProgressPolling())
-    # httpx logs every LLM request at INFO, which is roughly 90 lines per tender
+    # httpx logs every LLM and Pinecone request at INFO, and the Pinecone SDK every query and fetch: dozens of lines
+    # per tender. services.pinecone_service logs what matters (indexes built, retrievals, retries)
     logging.getLogger('httpx').setLevel(logging.WARNING)
+    logging.getLogger('pinecone').setLevel(logging.WARNING)

@@ -135,6 +135,14 @@ components:
     rounded: "{rounded.control}"
     padding: "0 12px"
     height: "32px"
+  button-danger:
+    backgroundColor: "{colors.surface}"
+    textColor: "{colors.not-fg}"
+    rounded: "{rounded.control}"
+    padding: "0 12px"
+    height: "32px"
+  button-danger-hover:
+    backgroundColor: "{colors.not-bg}"
   icon-button:
     textColor: "{colors.muted}"
     rounded: "{rounded.sm}"
@@ -291,7 +299,7 @@ A restrained warm-neutral palette with one cool blue for action and a fixed set 
 Each verdict owns a triple: a pale background, an AA-legible foreground, and a mid-tone dot.
 - **Clear Green** (`eligible-*`): Eligible; also the Shortlisted decision line and a "Met" criterion.
 - **Caution Ochre** (`review-*`): Needs review (API value "Requires Review"); also "Cannot determine" and closing within 20 days.
-- **Brick Red** (`not-*`): Not eligible (API value "Not Eligible"); also "Not met", errors, and closing within 7 days.
+- **Brick Red** (`not-*`): Not eligible (API value "Not Eligible"); also "Not met", errors, closing within 7 days, and the one destructive action (Delete in Closed tenders).
 - **Slate** (`failed-*`): a run that failed for this tender; neutral, because a failure says nothing about eligibility.
 - **Unread Grey** (`none-*`): not processed yet; also the default days-left pill.
 - **Processing Blue** (`processing-fg`, `processing-dot` on `accent-soft`): a tender being checked right now.
@@ -313,7 +321,7 @@ Each verdict owns a triple: a pale background, an AA-legible foreground, and a m
 ### Named Rules
 **The One Blue Rule.** Blue means "you can act on this, or you have selected it". It is never used to colour data, status or decoration, except the processing tone, which is the system acting on the user's behalf.
 
-**The Verdict Owns Its Hue Rule.** Green, ochre and red belong to the verdicts and their direct echoes (criterion status, closing urgency, decisions). Nothing else on the page may borrow them.
+**The Verdict Owns Its Hue Rule.** Green, ochre and red belong to the verdicts and their direct echoes (criterion status, closing urgency, decisions). Red alone also marks errors and deleting. Nothing else on the page may borrow them.
 
 **The Tinted Panel Speaks In Its Own Tone Rule.** Secondary text on a verdict-tinted panel (counts, criterion labels, section labels) takes that panel's `*-fg`, not grey. Grey on a tinted background reads as disabled and fails contrast.
 
@@ -378,9 +386,10 @@ Soft, consistent rounding that steps with size: 2px for search-match highlights,
 Quiet and solid; one primary per area.
 - **Shape:** 38px tall, 8px radius; 32px small variant; 36px inside the selection bar.
 - **Primary:** `accent` with white 600 text, 16px side padding, may carry a mono count chip (white at 20%). Hover `accent-strong`. Disabled `disabled-bg` with `faint` text.
-- **Secondary:** white with a `control-line` border, `ink` text; hover deepens the border and fills `hover`. Pressed decision buttons (Shortlist, Drop) take the eligible or not tone fill and a tone-mixed border.
+- **Secondary:** white with a `control-line` border, `ink` text; hover deepens the border and fills `hover`. Pressed decision buttons (Shortlist, Drop) take the eligible or not tone fill and a tone-mixed border. While what it started loads (Default filters), its text turns `faint` and it stays focusable (`aria-disabled`), so the keyboard focus stays on it.
+- **Danger:** the secondary shape in red, for deleting only (Delete in Closed tenders): `not-fg` text and icon, a border of `not-dot` mixed 45% into white; hover fills `not-bg` with a full `not-dot` border.
 - **Icon button:** 32px, transparent, `muted` glyph; hover gains a border and white fill. Bordered 38px variant sits in the toolbar.
-- **Link button:** `accent` underlined text at 12px (Retry, inline actions).
+- **Link button:** `accent` underlined text at 12px (Retry, inline actions, Clear filters). In the filters' footer, Clear filters sits before the small secondary Default filters and the small primary Apply filters.
 - **Focus:** every interactive element shows a 2px `accent` outline at 2px offset on `:focus-visible`.
 - **Transitions:** background, border and colour at 0.15s on `cubic-bezier(.16, 1, .3, 1)`.
 
@@ -409,7 +418,7 @@ A select that opens a list you can search, like select2 (Tom Select over a real 
 - **Options:** 13px, 8px 12px padding, kept in their own (alphabetical) order while searching. The highlighted option fills `accent-wash`; the chosen one is `accent-strong` 600; matched text sits on `accent-soft` with a 2px radius. No match reads "No organisation matches" in `meta`.
 
 ### Navigation
-- **App bar:** 56px `chrome` band; 28px `accent` square mark with "TP", 15px 600 title; right side "Checking against" in `chrome-muted`, the company name in 600, and the Edit profile button: 28px, transparent, `chrome-link` 12px 500 text with a pencil icon, 7px radius and a white 18% border; hover turns the text white and the border 36%. It opens the Company Profile Editor. At the far right, a 28px square ? button in the same style opens "How the eligibility check works" in a large modal (help items in an auto-fit grid of 240px minimum columns, two across; full screen on phones). On a phone it stays at the right of the brand's line while the company line wraps below.
+- **App bar:** 56px `chrome` band; 28px `accent` square mark with "TP", 15px 600 title; right side "Checking against" in `chrome-muted`, the company name in 600, and the Edit profile button: 28px, transparent, `chrome-link` 12px 500 text with a pencil icon, 7px radius and a white 18% border; hover turns the text white and the border 36%. It opens the Company Profile Editor. At the far right, 8px apart, Closed tenders in the same style (folder icon and label; below 992px the icon alone in a 28px square, so the company name is never cut short, with the label kept for screen readers) opens the Closed Tenders popup, and a 28px square ? button opens "How the eligibility check works" in a large modal (help items in an auto-fit grid of 240px minimum columns, two across; full screen on phones). On a phone both stay at the right of the brand's line while the company line wraps below.
 - **Verdict tabs:** toggle buttons (`aria-pressed`) on a `track` well with 4px inset; each tab is a tone dot, a 13px 500 label and a mono count; the active tab is white with the tab-lift shadow.
 - **Page size:** "Per page" in 13px `meta` beside a compact 32px, 76px-wide select (20, 50, 100, 500) with the page's chevron, always in the footer's right-hand group, before the hint or the pager. A new size opens the page holding the first tender shown, and the browser remembers it.
 - **Pager:** in the tender panel's footer, on the right (on its own line when narrow), once the list runs past one page; until then the footer keeps its hint. Small secondary Previous and Next buttons 12px either side of a 13px `meta` status, "**Page 2** · tenders 21–40", the page in `ink` 500. TenderTiger gives no total, so there is no "of N": Next is offered while a page comes back full, and an empty next page leaves the list where it is with a short toast. While a page loads, the status reads "Loading page 3…" (or "Loading 100 per page…") and the rows fade to 50%; the new page brings the top of the list into view. Sorting (the Value and Closes headers) is TenderTiger's, over the whole list, and starts again from page 1 with the same loading state; tabs, search and the summary line cover the page shown. A selection carries across pages and orders, and the selection bar counts those "on other pages".
@@ -427,6 +436,14 @@ A form, not a document: the company's figures are edited as fields, and the file
 - **Tables:** each table is a 10px-radius grid with a 1px `line` border: a `surface-sunk` header row of flush 34px column-name fields in 13px 500 `muted`, then rows of flush 38px fields, every column split by `line-3` hairlines. The first column names the row (Company Name, FY24, Package A) in `ink-2` 500; figures use tabular numbers. Hover fills a field with `hover`; focus is the inset accent outline. Each row ends in a quiet `faint` remove icon button. Each column name carries a 26px `faint` remove button that, with a mouse, appears only while that column is pointed at or focused; touch screens show it always.
 - **Table footer:** "Add row" and "Add column" accent link buttons with plus icons on the left; "Remove table", a `muted` link button with a trash icon, set apart on the right. Removing is quieter than adding.
 - **Footer:** the sunk modal footer with a 13px `meta` note on when changes apply, then Cancel and the primary "Save profile" (Ctrl+S). A click outside does not close the editor, and closing with unsaved edits asks first.
+
+### Closed Tenders
+A large popup (full screen on phones) listing the closed tenders whose documents are still in the download folder, so the team can free the space.
+- **Header:** the 18px title, then a 13px `muted` line with the count and size of the closed tenders (none while no tender has closed).
+- **Tables:** a 10px-radius block with a 1px `line` border and a `surface-sunk` header row of 12px 500 `meta` labels. Each row: the title (two lines, the whole title as its tooltip) over its TCNO in 12px mono `meta`; the closing date over "8 days ago"; the file count over the size, right-aligned; and a small red Delete with a trash icon (the danger button). It asks first, and its toast says what went.
+- **No closing date on record:** the tenders checked before closing dates were kept follow under a section label with a 13px `muted` note.
+- **Phone:** each tender is a block, the title with Delete beside it, then one line under them, "03 Nov 2026 · 8 days ago" at the left and "3 files · 2.3 MB" at the right (the files take the left when there is no date).
+- **States:** "Looking through the download folder…" with a spinner while it scans; a failed scan says so in `not-fg` with Try again; an empty list says so in `muted`, centred.
 
 ### Run Panel and Selection Bar
 The run panel is a page panel with a 15px status title, a single-line detail and stage line, actions on the right, and a 4px round `accent` progress bar on a `track`. A finished run lists its outcome as tone-dotted counts that filter the list. The selection bar is a floating `chrome` bar with 12px corners centred 24px above the bottom, sliding up 8px on entry; below 768px it spans the width and wraps.
@@ -450,7 +467,7 @@ When a tender finishes while the page is watched, its row starts from `accent-so
 
 ### Don't:
 - **Don't** use Unicode characters as icons.
-- **Don't** use the verdict greens, ochres or reds for anything that is not a verdict, criterion status, urgency or decision.
+- **Don't** use the verdict greens, ochres or reds for anything that is not a verdict, criterion status, urgency or decision; red alone also marks errors and deleting.
 - **Don't** set grey secondary text on a tinted panel.
 - **Don't** put shadows on in-flow panels or rows.
 - **Don't** use `faint` for readable text; it is for disabled states and quiet icons.
