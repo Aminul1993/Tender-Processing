@@ -187,7 +187,8 @@ When a requirement depends on the estimated cost or tender value and the excerpt
 # pipeline no longer calls: the documents are indexed in Pinecone instead of summarised.
 SUMMARY_MODEL = os.getenv('SUMMARY_MODEL', 'openai/gpt-oss-20b')
 ASSESSMENT_MODEL = os.getenv('ASSESSMENT_MODEL', 'openai/gpt-oss-120b')
-# The Groq model that reads the pages of a scanned PDF (markitdown-ocr); it must accept images ('vision')
+# The Groq model that reads the pages of a scanned PDF that PaddleOCR is unsure of or that hold a table
+# (services/ocr_service.py); it must accept images ('vision')
 OCR_MODEL = os.getenv('OCR_MODEL', 'qwen/qwen3.8-27b')
 # The models of the LLM agents of a deep analysis (services/deep_analysis_service.py), each ASSESSMENT_MODEL unless
 # set: the profiler checks the company data, the audit matches it against every criterion, the status review
@@ -219,9 +220,9 @@ def make_model(model=SUMMARY_MODEL):
     Returns the Groq chat model named model, with retries. The API key is read from GROQ_API_KEY.
     A reply cut off at LLM_MAX_OUTPUT_TOKENS raises AnswerCutOff (not retried: it would be cut off again).
     """
-    # Qwen models put their reasoning in the reply between <think> tags unless told to hide it; gpt-oss models
-    # refuse the option and keep their reasoning out of the reply anyway
-    reasoning = {'reasoning_format': 'hidden'} if model.startswith('qwen/') else {}
+    # Qwen models think before answering unless told not to; hiding the thinking (reasoning_format='hidden') still
+    # spends and bills its tokens. gpt-oss models refuse the option and keep their reasoning out of the reply anyway.
+    reasoning = {'reasoning_effort': 'none'} if model.startswith('qwen/') else {}
     llm = ChatGroq(model=model, temperature=0, timeout=120, max_tokens=LLM_MAX_OUTPUT_TOKENS, **reasoning)
     return llm.with_retry(stop_after_attempt=3) | RunnableLambda(_whole_reply)
 

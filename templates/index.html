@@ -38,6 +38,9 @@
     <button type="button" class="tab" data-verdict="Not Eligible" aria-pressed="false">
       <span class="dot dot-not" aria-hidden="true"></span>Not eligible <span class="tab-count" data-count="Not Eligible">0</span>
     </button>
+    <button type="button" class="tab" data-verdict="awaiting_approval" aria-pressed="false">
+      <span class="dot dot-approval" aria-hidden="true"></span>Needs approval <span class="tab-count" data-count="awaiting_approval">0</span>
+    </button>
     <button type="button" class="tab" data-verdict="failed" aria-pressed="false">
       <span class="dot dot-failed" aria-hidden="true"></span>Failed <span class="tab-count" data-count="failed">0</span>
     </button>
@@ -285,10 +288,13 @@
           <h3>01 · Analysis</h3>
           <p>Every document in a selected tender is downloaded and read, including files inside ZIP archives. Each
             eligibility criterion is compared with the company profile. A tender usually takes a few minutes.</p>
-          <p>All of a tender's documents are indexed in its own Pinecone namespace (tcno-&lt;number&gt;), and
+          <p>All of a tender's documents are indexed in its own Pinecone namespace (<span class="mono">tcno-&lt;number&gt;</span>), and
             the passages on each kind of requirement are retrieved from it for the check. Checking the tender again
             retrieves them from the namespace without downloading the documents; switch on <strong>Regenerate
-            criteria</strong> to delete the namespace, download the documents again and rebuild it.</p>
+            criteria</strong> to delete the namespace, download the documents again and rebuild it. Before a
+            regenerate, the page shows how many scanned pages need OCR and what they could cost.</p>
+          <p>A tender whose scans need more OCR than its budget stops before reading them and shows
+            <strong>Needs approval</strong>; <strong>Approve OCR</strong> reads them.</p>
         </div>
         <div class="help-item">
           <h3>02 · Runs in background</h3>
@@ -305,6 +311,8 @@
               not met; the row names it.</span></li>
             <li><span class="dot dot-review" aria-hidden="true"></span><span><strong>Needs review</strong> — a criterion
               couldn't be determined, a file was unreadable, or no criteria were found. Open it before deciding.</span></li>
+            <li><span class="dot dot-approval" aria-hidden="true"></span><span><strong>Needs approval</strong> — not a
+              verdict yet: the scans need more OCR than the budget allows. Approve the OCR to check the tender.</span></li>
           </ul>
           <p>The verdict is for the company bidding alone. The line under it gives the outcome as lead member of a
             joint venture (JV), when one may bid. The analysis compares the two criterion by criterion; a green row is
@@ -320,7 +328,7 @@
             afresh, question the statuses marked by user, and settle their disagreements in a final determination with
             confidence scores, data gaps and an audit log.</p>
           <p>It takes a few minutes, never changes the verdict, and is saved beside the result as
-            <strong>deep_analysis.json</strong>.</p>
+            <span class="mono">deep_analysis.json</span>.</p>
         </div>
       </div>
     </div>
@@ -343,6 +351,31 @@
       <!-- Filled by app.js from /api/closed-downloads; not a live region, as a delete would read out the whole list
            again (its toast says what was deleted) -->
       <div class="modal-body" id="closed-body"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Before a bulk regenerate: what its OCR could cost, from the documents already downloaded -->
+<div class="modal fade" id="estimate-modal" tabindex="-1" aria-labelledby="estimate-title" aria-hidden="true">
+  <div class="modal-dialog modal-lg modal-dialog-scrollable modal-fullscreen-sm-down">
+    <div class="modal-content">
+      <div class="modal-header align-items-start">
+        <div class="details-heading">
+          <h2 class="details-title" id="estimate-title">Regenerate the criteria?</h2>
+          <p class="details-facts" id="estimate-facts"></p>
+        </div>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="modal-body" id="estimate-body"></div>
+      <div class="modal-footer">
+        <button type="button" class="button button-secondary" data-bs-dismiss="modal">Cancel</button>
+        <div class="footer-group">
+          <button type="button" class="button button-secondary" id="estimate-approve" hidden>Regenerate and approve OCR</button>
+          <button type="button" class="button button-primary" id="estimate-go">Regenerate</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>

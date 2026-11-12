@@ -24,9 +24,12 @@
     'Eligible': {label: 'Eligible', tone: 'eligible'},
     'Requires Review': {label: 'Needs review', tone: 'review'},
     'Not Eligible': {label: 'Not eligible', tone: 'not'},
+    'awaiting_approval': {label: 'Needs approval', tone: 'approval'},
     'failed': {label: 'Failed', tone: 'failed'},
   };
-  const OUTCOME_ORDER = ['Eligible', 'Requires Review', 'Not Eligible', 'failed'];
+  const OUTCOME_ORDER = ['Eligible', 'Requires Review', 'Not Eligible', 'awaiting_approval', 'failed'];
+  // Result statuses that are not a verdict: they fall under a tab of their own
+  const OPEN_STATUSES = ['failed', 'awaiting_approval'];
   // Status column of the criteria table: class and sort rank, so Not met rows come first
   const STATUS_STYLES = [
     [/\bnot\s+met\b/, 'status-not-met', 0],
@@ -113,10 +116,16 @@
     closedModal: $('closed-modal'),
     closedFacts: $('closed-facts'),
     closedBody: $('closed-body'),
+    estimateModal: $('estimate-modal'),
+    estimateFacts: $('estimate-facts'),
+    estimateBody: $('estimate-body'),
+    estimateApprove: $('estimate-approve'),
+    estimateGo: $('estimate-go'),
   };
   const detailsModal = new bootstrap.Modal(els.modal);
   const companyModal = new bootstrap.Modal(els.companyModal);
   const closedModal = new bootstrap.Modal(els.closedModal);
+  const estimateModal = new bootstrap.Modal(els.estimateModal);
   // The organisation filter with a search box in its list, like select2. Tom Select keeps the <select>'s value
   // and fires its change event, so the rest of the page reads els.orgFilter as before. Without the library the
   // plain select still works.
@@ -150,7 +159,7 @@
     results: new Map(),       // tcno -> last result summary {status (completed/failed), verdict, checks, ...}
     active: new Map(),        // tcno -> 'queued' / 'processing' in the current job
     decisions: new Map(),     // tcno -> {decision, decided_at}
-    verdictFilter: '',        // the selected tab: a verdict, 'failed', 'pending', or '' for all
+    verdictFilter: '',        // the selected tab: a verdict, 'awaiting_approval', 'failed', 'pending', or '' for all
     searchFilters: {},        // the TenderTiger filters the list was loaded with, as /api/tenders query parameters
     sort: {key: 'closing', order: 'asc'},  // how TenderTiger sorts the list: closing soonest first
     job: null,                // last /api/progress response, null while no job has run
@@ -170,6 +179,7 @@
     company: {blocks: [], saved: '[]'},
     companyError: null,       // the editor's last save problem, closed again on the next save
     closed: null,             // the Closed tenders popup: {directory, closed, unknown} from /api/closed-downloads
+    estimate: null,           // the OCR estimate before a bulk regenerate: {tcnos, data from /api/ocr-estimate}
   };
 
   /* ---------- helpers ---------- */
@@ -200,6 +210,11 @@
   }
 
   const icon = (name, cls = '') => el('i', {cls: `bi ${name} ${cls}`.trim(), attrs: {'aria-hidden': 'true'}});
+
+  /** What a popup is waiting for, with a spinner: "Loading analysis…". */
+  const loadingLine = (text) => el('p', {cls: 'modal-loading'}, [
+    el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}), document.createTextNode(text),
+  ]);
 
   /** Success toasts fade after 6 s; warnings and errors stay until closed, so they cannot be missed. */
   function toast(message, variant = 'danger') {
@@ -363,12 +378,17 @@
     ]);
   }
 
-  /** The verdict tab a tender falls under: a verdict, 'failed', or 'pending' (not processed, or in the queue). */
+  /** The tab a result falls under: its verdict, or 'awaiting_approval' / 'failed' for a run that gave none. */
+  const outcomeOf = (result) => (OPEN_STATUSES.includes(result.status) ? result.status : result.verdict || 'Requires Review');
+
+  /**
+   * The verdict tab a tender falls under: a verdict, 'awaiting_approval', 'failed', or 'pending' (not processed, or in
+   * the queue).
+   */
   function category(tcno) {
     if (state.active.has(tcno)) return 'pending';
     const result = state.results.get(tcno);
-    if (!result) return 'pending';
-    return result.status === 'failed' ? 'failed' : result.verdict || 'Requires Review';
+    return result ? outcomeOf(result) : 'pending';
   }
 
   const tenderOf = (tcno) => state.seen.get(tcno);
@@ -636,23 +656,28 @@
       else if (tender && !tender.has_document) parts.push(note('Pre-qualification criteria only'));
     } else {
       const failed = result.status === 'failed';
-      const verdict = verdictOf(failed ? 'failed' : result.verdict);
+      const waiting = result.status === 'awaiting_approval';  // stopped at its OCR budget: approving it goes on
+      const verdict = verdictOf(outcomeOf(result));
       const button = el('button', {
         cls: 'pill-button',
         attrs: {type: 'button', 'aria-label': `${verdict.label}: open the analysis of tender ${tcno}`},
       }, [pill(verdict.tone, verdict.label), icon('bi-chevron-right', 'pill-chevron')]);
       button.dataset.tcno = tcno;
       parts.push(button, note(evidence(result)));
-      const marked = !failed && result.checks ? result.checks.user_marked : 0;
+      const completed = result.status === 'completed';
+      const marked = completed && result.checks ? result.checks.user_marked : 0;
       if (marked) {
         const text = `${marked} ${criteriaNoun(marked)} marked by user`;
         parts.push(el('div', {cls: 'verdict-note user-note', attrs: {title: text}}, [icon('bi-person-check'), document.createTextNode(text)]));
       }
-      const jv = failed ? null : jvLine(result.checks && result.checks.jv);
+      const jv = completed ? jvLine(result.checks && result.checks.jv) : null;
       if (jv) parts.push(jv);
-      if (failed) {
-        const retry = el('button', {cls: 'link-button retry-btn', text: 'Retry', attrs: {type: 'button', 'aria-label': `Retry tender ${tcno}`}});
+      if (failed || waiting) {
+        const retry = waiting
+          ? el('button', {cls: 'link-button retry-btn', text: 'Approve OCR', attrs: {type: 'button', 'aria-label': `Approve the OCR of tender ${tcno}`}})
+          : el('button', {cls: 'link-button retry-btn', text: 'Retry', attrs: {type: 'button', 'aria-label': `Retry tender ${tcno}`}});
         retry.dataset.tcno = tcno;
+        if (waiting) retry.dataset.approve = '1';
         parts.push(retry);
       }
     }
@@ -665,10 +690,24 @@
     return parts;
   }
 
+  /**
+   * The tenders being processed, each {tcno, name, stage, step, steps, elapsed_seconds}: several when several workers
+   * run (an older server reports only `current`).
+   */
+  function processing(job = state.job) {
+    if (!job) return [];
+    return job.active || (job.current ? [job.current] : []);
+  }
+
+  const processingOf = (tcno) => processing().find((tender) => tender.tcno === tcno);
+
+  /** How far a tender being processed has got, 0 to 1, from its step: each file, then the final check. */
+  const doneFraction = (tender) => (tender.steps ? Math.max(tender.step - 1, 0) / tender.steps : 0);
+
   /** What the tender being processed is doing, short enough for its row: "Reading file 2 of 5…". */
   function stageLabel(tcno) {
-    const current = state.job && state.job.current;
-    if (!current || current.tcno !== tcno) return 'Processing…';
+    const current = processingOf(tcno);
+    if (!current) return 'Processing…';
     if (current.steps && current.step === current.steps) return 'Comparing criteria…';
     if (current.steps) return `Reading file ${current.step} of ${current.steps - 1}…`;
     return `${current.stage}…`;
@@ -676,6 +715,7 @@
 
   /** Why a tender got its verdict, in one line, so it can be judged from the table. */
   function evidence(result) {
+    if (result.status === 'awaiting_approval') return `${ocrCost(result.ocr_estimate)}: over the OCR budget`;
     if (result.status === 'failed') return result.error_title || 'Processing failed';
     const checks = result.checks;
     let unreadable = '';
@@ -1094,9 +1134,11 @@
    * Queues tenders: starts a run, or adds them to the running one. Tenders with a Pinecone namespace are re-checked
    * against them unless regenerate is true. Returns true on success.
    */
-  async function queue(tcnos, regenerate = false) {
+  async function queue(tcnos, regenerate = false, approveOcr = false) {
     try {
-      applyProgress(await api('/api/process-tenders', {method: 'POST', body: JSON.stringify({tcnos, regenerate})}));
+      applyProgress(await api('/api/process-tenders', {
+        method: 'POST', body: JSON.stringify({tcnos, regenerate, approve_ocr: approveOcr}),
+      }));
       schedulePoll();
       return true;
     } catch (error) {
@@ -1105,23 +1147,128 @@
     }
   }
 
-  async function processSelected() {
-    // Process in the order the table shows, then the tenders selected on other pages
+  /** The selected tenders, in the order the table shows them, then those selected on other pages. */
+  function selectedInOrder() {
     const shown = [...state.rows.values()].map((row) => row.dataset.tcno).filter((tcno) => state.selected.has(tcno));
-    const tcnos = [...new Set([...shown, ...state.selected])];
+    return [...new Set([...shown, ...state.selected])];
+  }
+
+  /** Check eligibility: queues the selection; with Regenerate criteria on, shows what its OCR could cost first. */
+  async function processSelected() {
+    const tcnos = selectedInOrder();
     if (!tcnos.length) return;
+    if (state.regenerate) {
+      openEstimate(tcnos);
+      return;
+    }
     els.processBtn.disabled = els.barProcess.disabled = true;
-    const queued = await queue(tcnos, state.regenerate);
+    const queued = await queue(tcnos);
     els.barProcess.disabled = false;
     if (queued) clearSelection();
     else updateSelectionUI();
   }
 
-  async function retry(tcno, button, regenerate = false) {
+  async function retry(tcno, button, regenerate = false, approveOcr = false) {
     if (button) button.disabled = true;
     // Reload the list first, so the retry uses the tender as TenderTiger lists it now
-    if (await loadTenders({quiet: true})) await queue([tcno], regenerate);
+    if (await loadTenders({quiet: true})) await queue([tcno], regenerate, approveOcr);
     else if (button) button.disabled = false;
+  }
+
+  /* ---------- OCR cost ---------- */
+
+  /** A cost in US dollars as the team reads it: "$0.42", "under $0.01", "$0". */
+  function dollars(cost) {
+    if (!cost) return '$0';
+    return cost < 0.01 ? 'under $0.01' : `$${cost.toFixed(2)}`;
+  }
+
+  /** "120 pages to OCR, up to $0.67": an ocr_estimate in one line. */
+  const ocrCost = (estimate) => `${plural(estimate.pages, 'page')} to OCR, up to ${dollars(estimate.cost)}`;
+
+  /** The budget as set: "50 pages or $0.50". */
+  function budgetText(budget) {
+    const limits = [budget.pages ? plural(budget.pages, 'page') : '', budget.usd ? dollars(budget.usd) : ''];
+    return limits.filter(Boolean).join(' or ') || 'no limit';
+  }
+
+  /** Before a bulk regenerate: opens the estimate of its OCR, from the documents already downloaded. */
+  async function openEstimate(tcnos) {
+    state.estimate = {tcnos, data: null};
+    els.estimateFacts.textContent = '';
+    els.estimateApprove.hidden = true;
+    els.estimateGo.disabled = true;
+    els.estimateBody.setAttribute('aria-busy', 'true');
+    els.estimateBody.replaceChildren(loadingLine('Counting the scanned pages to read…'));
+    estimateModal.show();
+    try {
+      const data = await api('/api/ocr-estimate', {method: 'POST', body: JSON.stringify({tcnos})});
+      if (state.estimate && state.estimate.tcnos === tcnos) {
+        state.estimate.data = data;
+        renderEstimate(data);
+      }
+    } catch (error) {
+      // Without an estimate the run can still go ahead: the budget stops any tender over it
+      els.estimateBody.replaceChildren(el('p', {cls: 'message-error', text: `Could not estimate the OCR: ${error.message}`}));
+    } finally {
+      els.estimateBody.removeAttribute('aria-busy');
+      els.estimateGo.disabled = false;
+    }
+  }
+
+  function renderEstimate(data) {
+    const count = data.tenders.length;
+    els.estimateFacts.textContent = [
+      plural(count, 'tender'), ocrCost(data), data.over_budget ? `${data.over_budget} over the OCR budget` : '',
+    ].filter(Boolean).join(' · ');
+    els.estimateApprove.hidden = !data.over_budget;
+    const note = (tender) => {
+      if (!tender.downloaded) return 'Not downloaded yet: counted after the download';
+      if (!tender.pages) return 'Nothing to OCR: no scans, or read before';
+      const files = tender.files.map((file) => `${file.name} (${file.pages})`).join(', ');
+      return tender.over_budget ? `Over the budget, so it will wait for approval · ${files}` : files;
+    };
+    const rows = data.tenders.map((tender) => {
+      const name = tenderOf(tender.tcno) ? tenderOf(tender.tcno).name : '';
+      return el('tr', {cls: tender.over_budget ? 'estimate-over' : ''}, [
+        el('td', {}, [
+          el('div', {cls: 'closed-name', text: sentenceStart(name) || `Tender ${tender.tcno}`, attrs: {title: name}}),
+          el('div', {cls: 'closed-tcno mono', text: tender.tcno}),
+          el('div', {cls: 'closed-meta', text: note(tender)}),
+        ]),
+        el('td', {cls: 'closed-num text-nowrap'}, [
+          el('div', {text: tender.downloaded ? plural(tender.pages, 'page') : '—'}),
+          el('div', {cls: 'closed-meta', text: tender.downloaded ? `up to ${dollars(tender.cost)}` : ''}),
+        ]),
+      ]);
+    });
+    els.estimateBody.replaceChildren(
+      el('p', {cls: 'closed-note', text: `Counted from the documents already downloaded; a file read before is in the `
+        + `cache and costs nothing. Most scanned pages are read on this computer for free; a page sent to the vision `
+        + `model costs at most $${data.page_cost} (the "up to" figures assume every page goes there). A tender `
+        + `over the OCR budget of ${budgetText(data.budget)} stops before its OCR and waits for approval, unless you `
+        + `approve it now. Each tender also makes its usual eligibility check.`}),
+      el('div', {cls: 'closed-wrap'}, [
+        el('table', {cls: 'closed-table', attrs: {'aria-label': 'OCR each tender needs'}}, [
+          el('thead', {}, [el('tr', {}, [
+            el('th', {text: 'Tender', attrs: {scope: 'col'}}),
+            el('th', {cls: 'closed-num', text: 'OCR', attrs: {scope: 'col'}}),
+          ])]),
+          el('tbody', {}, rows),
+        ]),
+      ]),
+    );
+  }
+
+  /** The estimate's Regenerate / Regenerate and approve OCR: queues the tenders it was made for. */
+  async function confirmEstimate(approveOcr) {
+    if (!state.estimate) return;
+    els.estimateGo.disabled = els.estimateApprove.disabled = true;
+    const queued = await queue(state.estimate.tcnos, true, approveOcr);
+    els.estimateGo.disabled = els.estimateApprove.disabled = false;
+    if (!queued) return;  // the toast says why; the estimate stays open to try again or cancel
+    estimateModal.hide();
+    clearSelection();
   }
 
   /** The details modal's Re-check / Regenerate criteria: a re-check needs nothing from TenderTiger. */
@@ -1174,7 +1321,7 @@
     state.active.clear();
     for (const item of progress.items || []) {
       if (item.status === 'queued' || item.status === 'processing') state.active.set(item.tcno, item.status);
-      else if (item.status === 'completed' || item.status === 'failed') state.results.set(item.tcno, item);
+      else if (item.status === 'completed' || OPEN_STATUSES.includes(item.status)) state.results.set(item.tcno, item);
       // A cancelled tender keeps its previous result
     }
     state.rows.forEach((row, tcno) => updateRow(tcno, row));
@@ -1197,7 +1344,7 @@
   function runOutcome(job) {
     const counts = new Map();
     for (const item of job.items) {
-      const key = item.status === 'failed' ? 'failed' : item.status === 'completed' ? item.verdict || 'Requires Review' : null;
+      const key = item.status === 'completed' || OPEN_STATUSES.includes(item.status) ? outcomeOf(item) : null;
       if (key) counts.set(key, (counts.get(key) || 0) + 1);
     }
     return OUTCOME_ORDER.filter((key) => counts.get(key)).map((key) => ({key, ...verdictOf(key), count: counts.get(key)}));
@@ -1250,21 +1397,23 @@
 
   /**
    * Seconds left in the run, from the average time per tender of each kind (documents read, or Pinecone namespace
-   * re-checked); null until a tender of every kind still to come has completed.
+   * re-checked), shared among the tenders being processed at once; null until a tender of every kind still to come
+   * has completed.
    */
   function remainingSeconds(job) {
     const averageOf = (item) => (item.rechecked ? state.averageRecheckSeconds : state.averageSeconds);
     const waiting = job.items.filter((item) => item.status === 'queued' || item.status === 'processing');
     if (waiting.some((item) => !averageOf(item))) return null;
-    const current = job.current;
-    return waiting.reduce((left, item) => {
+    const active = processing(job);
+    const total = waiting.reduce((left, item) => {
       const average = averageOf(item);
-      if (item.status === 'queued') return left + average;
+      const current = item.status === 'processing' && active.find((tender) => tender.tcno === item.tcno);
       if (!current) return left + average;
       return left + (current.steps
-        ? average * (1 - (current.step - 1) / current.steps)
+        ? average * (1 - doneFraction(current))
         : Math.max(average - current.elapsed_seconds, 0));
     }, 0);
+    return total / Math.max(1, active.length);
   }
 
   function dismissedJob() {
@@ -1286,15 +1435,22 @@
     }
     els.runPanel.hidden = false;
     const active = job.total - job.cancelled;
-    const done = job.completed + job.failed;
+    const done = job.completed + job.failed + (job.awaiting_approval || 0);
 
     if (running) {
-      const current = job.current;
+      const tenders = processing(job);
+      const current = tenders[0];
       const position = Math.min(done + 1, active);
-      els.runTitle.textContent = current ? `Checking tender ${position} of ${active}` : 'Starting…';
+      // Several workers: how many are on the go, the first of them named
+      if (tenders.length > 1) {
+        els.runTitle.textContent = `Checking ${tenders.length} tenders at once · ${done} of ${active} done`;
+      } else {
+        els.runTitle.textContent = current ? `Checking tender ${position} of ${active}` : 'Waiting for a worker…';
+      }
       els.runDetail.classList.remove('run-outcome');
+      const more = tenders.length > 1 ? ` and ${plural(tenders.length - 1, 'other')}` : '';
       els.runDetail.replaceChildren(...(current
-        ? [el('span', {cls: 'tcno', text: current.tcno}), document.createTextNode(` · ${sentenceStart(current.name)}`)]
+        ? [el('span', {cls: 'tcno', text: current.tcno}), document.createTextNode(` · ${sentenceStart(current.name)}${more}`)]
         : []));
       els.runDetail.title = els.runDetail.textContent;
       els.runStage.textContent = current ? `${current.stage} · ${formatDuration(current.elapsed_seconds)} on this tender` : '';
@@ -1304,17 +1460,19 @@
       els.runEta.textContent = remaining === null ? '' : `About ${formatMinutes(remaining)} left`;
       els.stopBtn.hidden = false;
       els.stopBtn.disabled = job.stop_requested;
-      els.stopBtn.textContent = job.stop_requested ? 'Stopping after this tender…' : 'Stop after this tender';
+      const these = tenders.length > 1 ? 'these tenders' : 'this tender';
+      els.stopBtn.textContent = job.stop_requested ? `Stopping after ${these}…` : `Stop after ${these}`;
       els.runDismiss.hidden = true;
 
-      const fraction = current && current.steps ? Math.max(current.step - 1, 0) / current.steps : 0;
+      const fraction = tenders.reduce((sum, tender) => sum + doneFraction(tender), 0);
       const percent = active ? Math.min(100, Math.round(100 * (done + fraction) / active)) : 0;
       els.runProgress.hidden = false;
       els.runProgress.setAttribute('aria-valuenow', percent);
       els.runProgress.setAttribute('aria-valuetext', `${done} of ${plural(active, 'tender')} done`);
       els.runBar.style.width = `${percent}%`;
       document.title = `(${done}/${active}) Checking tenders · ${BASE_TITLE}`;
-      announce(current ? `Checking tender ${position} of ${active}: ${sentenceStart(current.name)}` : '');
+      announce(tenders.length > 1 ? els.runTitle.textContent
+        : current ? `Checking tender ${position} of ${active}: ${sentenceStart(current.name)}` : '');
     } else {
       els.runTitle.textContent = `${job.stop_requested ? 'Stopped' : 'Finished'} ${formatWhen(job.finished_at)}`;
       // The outcome as the shortlist it is: each count shows those tenders
@@ -1331,8 +1489,14 @@
       els.runDetail.classList.add('run-outcome');
       els.runDetail.replaceChildren(...parts);
       els.runDetail.title = '';
-      els.runStage.textContent = job.failed ? 'Failed tenders can be retried from their row.' : '';
-      els.runStage.hidden = !job.failed;
+      // What to do next, from the rows: retry a failure, approve the OCR of a tender waiting for it
+      const waiting = job.awaiting_approval || 0;
+      let next = '';
+      if (job.failed && waiting) next = 'Failed tenders can be retried, and the OCR of those needing approval approved, from their row.';
+      else if (job.failed) next = 'Failed tenders can be retried from their row.';
+      else if (waiting) next = 'Tenders needing approval can have their OCR approved from their row.';
+      els.runStage.textContent = next;
+      els.runStage.hidden = !next;
       els.runStage.title = '';
       els.runEta.textContent = '';
       els.stopBtn.hidden = true;
@@ -1378,10 +1542,7 @@
     els.modalDeep.hidden = true;
     els.modalDeep.replaceChildren();
     els.analysisSection.hidden = false;
-    els.modalContent.replaceChildren(el('div', {cls: 'text-center py-5', attrs: {style: 'color: var(--meta)'}}, [
-      el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}),
-      document.createTextNode('Loading analysis…'),
-    ]));
+    els.modalContent.replaceChildren(loadingLine('Loading analysis…'));
     els.modalFiles.replaceChildren();
     els.modalCriteria.replaceChildren();
     els.modalCriteria.className = '';
@@ -1402,9 +1563,9 @@
 
   function renderDetails(result) {
     els.modalSummary.replaceChildren(decisionSummary(result));
-    if (result.status !== 'failed' && result.jv) els.modalSummary.append(routeComparison(result));
+    if (result.status === 'completed' && result.jv) els.modalSummary.append(routeComparison(result));
     if (result.status === 'completed') loadDeep(result.tcno);
-    if (result.status === 'failed') {
+    if (result.status !== 'completed') {
       state.details.text = `${result.error_title || 'Processing failed'}. ${result.error_action || ''}\n\n${result.error || ''}`.trim();
       els.analysisSection.hidden = true;
     } else {
@@ -1429,9 +1590,12 @@
     if (result.processed_at) run.push(`Processed ${formatDateTime(result.processed_at)}`);
     if (result.duration_seconds !== undefined) run.push(`took ${formatDuration(result.duration_seconds)}`);
     if (result.rechecked) run.push(`checked against the Pinecone namespace ${result.namespace || ''}`.trim());
-    if (result.tokens) {
+    // "5,596 LLM tokens", split only when some went on reading scans; left out when the run made no LLM call
+    if (result.tokens && result.tokens.total.total) {
       const count = (step) => result.tokens[step].total.toLocaleString('en-IN');
-      run.push(`${count('total')} LLM tokens (${count('criteria')} reading scanned documents, ${count('assessment')} for the result)`);
+      run.push(result.tokens.criteria.total
+        ? `${count('total')} LLM tokens (${count('criteria')} reading scanned documents, ${count('assessment')} for the result)`
+        : `${count('total')} LLM tokens`);
     }
     els.modalRun.textContent = run.join(' · ');
   }
@@ -1458,8 +1622,28 @@
     );
   }
 
+  /** A tender stopped at its OCR budget: what its scans need and could cost, and Approve OCR to go on. */
+  function ocrApproval(result) {
+    const estimate = result.ocr_estimate;
+    const approve = el('button', {cls: 'button button-primary button-sm', text: 'Approve OCR and check', attrs: {type: 'button'}});
+    approve.addEventListener('click', () => {
+      detailsModal.hide();
+      retry(result.tcno, null, false, true);
+    });
+    return el('div', {cls: 'summary tone-approval'}, [
+      el('div', {cls: 'summary-head'}, [
+        pill('approval', 'Needs approval'),
+        el('span', {cls: 'summary-headline', text: `${ocrCost(estimate)}: over the OCR budget`}),
+      ]),
+      el('p', {cls: 'summary-action', text: estimate.files.map((file) => `${file.name}: ${plural(file.pages, 'page')}`).join(' · ')}),
+      el('p', {cls: 'summary-action', text: result.error_action || ''}),
+      approve,
+    ]);
+  }
+
   /** The decision first: the verdict and the criteria that decide it, with requirement, company figure and source. */
   function decisionSummary(result) {
+    if (result.status === 'awaiting_approval') return ocrApproval(result);
     if (result.status === 'failed') {
       const retryBtn = el('button', {cls: 'button button-primary button-sm', text: 'Retry this tender', attrs: {type: 'button'}});
       retryBtn.addEventListener('click', () => {
@@ -2174,10 +2358,7 @@
   async function loadClosed() {
     els.closedFacts.textContent = '';
     els.closedBody.setAttribute('aria-busy', 'true');
-    els.closedBody.replaceChildren(el('div', {cls: 'text-center py-5', attrs: {style: 'color: var(--meta)'}}, [
-      el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}),
-      document.createTextNode('Looking through the download folder…'),
-    ]));
+    els.closedBody.replaceChildren(loadingLine('Looking through the download folder…'));
     try {
       state.closed = await api('/api/closed-downloads');
       renderClosed();
@@ -2643,6 +2824,13 @@ Its ${plural(tender.files, 'downloaded file')} `
   });
   els.processBtn.addEventListener('click', processSelected);
   els.barProcess.addEventListener('click', processSelected);
+  els.estimateGo.addEventListener('click', () => confirmEstimate(false));
+  els.estimateApprove.addEventListener('click', () => confirmEstimate(true));
+  els.estimateModal.addEventListener('hidden.bs.modal', () => {
+    state.estimate = null;
+    // Back to where the run was started from, while the selection is still there
+    if (!els.selectionBar.hidden) els.barProcess.focus();
+  });
   els.clearSelection.addEventListener('click', clearSelection);
   els.stopBtn.addEventListener('click', stopRun);
   els.notifyBtn.addEventListener('click', toggleNotify);
@@ -2691,7 +2879,7 @@ Its ${plural(tender.files, 'downloaded file')} `
   els.body.addEventListener('click', (event) => {
     const retryBtn = event.target.closest('.retry-btn');
     if (retryBtn) {
-      retry(retryBtn.dataset.tcno, retryBtn);
+      retry(retryBtn.dataset.tcno, retryBtn, false, retryBtn.dataset.approve === '1');
       return;
     }
     const pillButton = event.target.closest('.pill-button');

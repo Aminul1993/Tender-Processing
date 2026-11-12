@@ -231,8 +231,10 @@ class PineconeService:
                  region='us-east-1', embed_model='llama-text-embed-v2', dimension=1024, metric='cosine',
                  chunk_size=1600, chunk_overlap=200, top_k=8, max_chars=60_000, upsert_batch=50, workers=4,
                  attempts=4, ready_timeout=300, freshness_timeout=120, cache_seconds=30, settle_seconds=5,
-                 client=None):
+                 client=None, cache=None):
         self._api_key = api_key
+        # A cache_service.Cache of chunk vectors, so a chunk embedded once is never embedded again; None embeds all
+        self.cache = cache
         self.index_name = index_name
         self.namespace_prefix = namespace_prefix
         self.cloud = cloud
@@ -264,15 +266,15 @@ class PineconeService:
         self._ready_lock = threading.Lock()
 
     @classmethod
-    def from_config(cls, config, client=None):
-        """A service with the PINECONE_* and retrieval settings of config (see config.Config)."""
+    def from_config(cls, config, client=None, cache=None):
+        """A service with the PINECONE_* and retrieval settings of config (see config.Config), and cache, if given."""
         return cls(api_key=config.PINECONE_API_KEY, index_name=config.PINECONE_INDEX_NAME,
                    namespace_prefix=config.PINECONE_NAMESPACE_PREFIX, cloud=config.PINECONE_CLOUD,
                    region=config.PINECONE_REGION, embed_model=config.PINECONE_EMBED_MODEL,
                    dimension=config.PINECONE_EMBED_DIMENSION, chunk_size=config.CHUNK_SIZE,
                    chunk_overlap=config.CHUNK_OVERLAP, top_k=config.RETRIEVAL_TOP_K,
                    max_chars=config.RETRIEVAL_MAX_CHARS, upsert_batch=config.PINECONE_UPSERT_BATCH,
-                   workers=config.INGEST_WORKERS, client=client)
+                   workers=config.INGEST_WORKERS, client=client, cache=cache)
 
     # ---------- configuration and names ----------
 
@@ -582,8 +584,9 @@ class PineconeService:
     def upsert_chunks(self, tcno, records, on_progress=None):
         """
         Embeds and upserts records (from chunk_documents()) into the tender's namespace: EMBED_BATCH records per
-        embedding request, upsert_batch vectors per upsert, workers groups at a time. Returns (the embedding tokens,
-        the highest log position Pinecone committed them at, or None when it gave none).
+        embedding request, upsert_batch vectors per upsert, workers groups at a time. A chunk whose vector is in the
+        cache is not embedded again. Returns (the embedding tokens, the highest log position Pinecone committed them
+        at, or None when it gave none).
         """
         report = on_progress or (lambda message: None)
         if not records:
@@ -592,7 +595,7 @@ class PineconeService:
         groups = [records[start:start + EMBED_BATCH] for start in range(0, len(records), EMBED_BATCH)]
 
         def store(group):
-            vectors, tokens = self._embed_batch([record['text'] for record in group], 'passage')
+            vectors, tokens = self._embed_passages([record['text'] for record in group])
             payload = [{'id': record['id'], 'values': vector, 'metadata': {**record['metadata'], 'text': record['text']}}
                        for record, vector in zip(group, vectors)]
             positions = [self._upsert(namespace, payload[start:start + self.upsert_batch],
@@ -862,6 +865,24 @@ class PineconeService:
                 return
             time.sleep(delay)
             delay = min(delay * 2, 5)
+
+    def _embed_passages(self, texts):
+        """
+        _embed_batch() of the passages texts, taking those already embedded from the cache and adding the rest to
+        it. Returns (vectors in input order, tokens of the passages embedded now).
+        """
+        if self.cache is None:
+            return self._embed_batch(texts, 'passage')
+        model = f'{self.embed_model}/{self.dimension}'
+        vectors = self.cache.vectors(model, texts)
+        missing = [number for number, vector in enumerate(vectors) if vector is None]
+        tokens = 0
+        if missing:
+            fresh, tokens = self._embed_batch([texts[number] for number in missing], 'passage')
+            for number, vector in zip(missing, fresh):
+                vectors[number] = vector
+            self.cache.save_vectors(model, [texts[number] for number in missing], fresh)
+        return vectors, tokens
 
     def _embed_batch(self, texts, input_type):
         parameters = {'input_type': input_type, 'truncate': 'END'}

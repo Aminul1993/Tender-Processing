@@ -1,8 +1,10 @@
+import base64
 import copy
 import io
 import json
 import os
 import tempfile
+import threading
 import time
 import unittest
 import zipfile
@@ -12,30 +14,35 @@ from unittest import mock
 
 import docx
 import openpyxl
+import pymupdf
 from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
-from PIL import Image
+from PIL import Image, ImageDraw
 from pptx import Presentation
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app import create_app
 from config import Config
 from ext import (NOT_RELEVANT, TENDERTIGER_BLOCKED, AnswerCutOff, TenderTigerBlocked, _whole_reply, company_details,
-                 save_company_details)
+                 make_model, save_company_details)
 from routes.api import BODY_ERRORS
 from services import tender_service
 from pinecone_fake import FakePinecone
-from services.analysis_service import (RESULT_FILE, TENDER_DATA_SOURCE, TokenUsage, compare_routes, jv_verdict,
-                                       parse_criteria, parse_jv, parse_score, parse_verdict, plain_maths,
-                                       process_tender_files, recheck_saved_criteria, tender_data_text, tender_files)
+from services.cache_service import Cache
+from services.analysis_service import (RESULT_FILE, TENDER_DATA_SOURCE, OcrBudgetExceeded, TokenUsage, compare_routes,
+                                       jv_verdict, ocr_estimate, parse_criteria, parse_jv, parse_score, parse_verdict,
+                                       plain_maths, process_tender_files, recheck_saved_criteria, tender_data_text,
+                                       tender_files)
 from services.company_service import (company_profile, parse_profile, profile_for_tender, record_mark, render_profile,
                                       unnamed_part)
 from services import deep_analysis_service as deep
 from services.deep_analysis_service import (DEEP_ANALYSIS_FILE, LLM_AGENTS, MAX_ROUNDS, DeepAnalysisError,
                                             parse_amount, parse_financial_year, parse_json_reply, run_deep_analysis)
 from services.download_service import DownloadError, download_tender_documents
-from services.pinecone_service import Document, NamespaceIncomplete, PineconeService
-from services.processing_service import explain_error, save_result
+from services.pinecone_service import Document, NamespaceIncomplete, PineconeService, chunk_text
+from services.job_state import JobState
+from services.processing_service import TenderProcessor, explain_error, save_result
 
 SAMPLE_TENDERS = {
     'KeywordList': [{'id': 1, 'keyword': 'india'}],
@@ -145,6 +152,14 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(criteria[0], {'criterion': 'Turnover', 'requirement': '10 Cr', 'company': '171 Cr (FY26)',
                                        'status': 'met', 'source': 'NIT.pdf'})
         self.assertEqual(parse_criteria('| a | b |\n|---|---|\n| 1 | 2 |'), [])
+
+    def test_a_row_of_dashes_for_no_criteria_is_no_criterion(self):
+        # What the model writes when the excerpts hold no criteria: not a criterion called "—" that went undetermined
+        table = '| Criterion | Requirement | Company | Status | Source |\n|---|---|---|---|---|\n'
+        self.assertEqual(parse_criteria(table + '| — | — | — | — | — |'), [])
+        self.assertEqual(parse_criteria(table + '| – | - | | — | -- |'), [])
+        self.assertEqual([c['criterion'] for c in parse_criteria(table + '| Turnover | 10 Cr | — | — | — |')],
+                         ['Turnover'])
 
     def test_a_revised_table_replaces_the_rows_it_corrects(self):
         assessment = ('| Criterion | Requirement | Company | Status |\n|---|---|---|---|\n'
@@ -276,6 +291,14 @@ class ParseTest(unittest.TestCase):
         with self.assertRaises(AnswerCutOff):
             _whole_reply(AIMessage(content='| Criterion | Sta', response_metadata={'finish_reason': 'length'}))
 
+    def test_qwen_models_answer_without_thinking(self):
+        with mock.patch('ext.ChatGroq') as chat:
+            make_model('qwen/qwen3.8-27b')
+            make_model('openai/gpt-oss-120b')
+        self.assertEqual(chat.call_args_list[0].kwargs['reasoning_effort'], 'none')
+        self.assertNotIn('reasoning_format', chat.call_args_list[0].kwargs)
+        self.assertNotIn('reasoning_effort', chat.call_args_list[1].kwargs)  # gpt-oss refuses it
+
     def test_empty_company_profile_fails_before_any_llm_call(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'}), \
                 mock.patch('services.analysis_service.make_model') as make_model:
@@ -285,10 +308,10 @@ class ParseTest(unittest.TestCase):
         self.assertEqual(explain_error(raised.exception)[0], 'The company profile is empty')
 
 
-def pinecone_service(client=None):
+def pinecone_service(client=None, cache=None):
     """A PineconeService over an in-memory FakePinecone, with small chunks so short test texts still split."""
     return PineconeService(api_key='test-key', client=client or FakePinecone(), dimension=64, chunk_size=400,
-                           chunk_overlap=50, freshness_timeout=1, settle_seconds=0)
+                           chunk_overlap=50, freshness_timeout=1, settle_seconds=0, cache=cache)
 
 
 class AnalysisTestCase(unittest.TestCase):
@@ -555,18 +578,42 @@ class FileSelectionTest(AnalysisTestCase):
         self.assertEqual(self.index.manifest('100091540')['unreadable'], result['unreadable_files'])
 
 
+def paddle_line(text, score=0.99, top=100, left=100):
+    """A line of text as PaddleOCR reads it: (text, score, [x1, y1, x2, y2])."""
+    return text, score, [left, top, left + 10 * len(text), top + 30]
+
+
+def png(width, height):
+    """A blank PNG image of width x height pixels."""
+    buffer = io.BytesIO()
+    Image.new('RGB', (width, height), 'white').save(buffer, 'PNG')
+    return buffer.getvalue()
+
+
+def scan_pdf(path, pages=2, ruled_page=None):
+    """Saves a scan of blank pages that are only images, with no text layer; ruled_page (1-based) gets a 3 x 3 grid."""
+    images = [Image.new('RGB', (850, 1100), 'white') for _ in range(pages)]
+    if ruled_page:
+        draw = ImageDraw.Draw(images[ruled_page - 1])
+        for step in range(4):
+            draw.line((100, 200 + 60 * step, 700, 200 + 60 * step), fill='black', width=3)
+            draw.line((100 + 200 * step, 200, 100 + 200 * step, 380), fill='black', width=3)
+    images[0].save(path, save_all=True, append_images=images[1:])
+
+
 class ScannedPdfTest(AnalysisTestCase):
-    """A PDF that MarkItDown finds no text in, such as a scan, is read by OCR_MODEL with markitdown-ocr."""
+    """
+    A PDF that MarkItDown finds no text in, such as a scan, is read page by page with PaddleOCR; a page it is unsure
+    of, or a table, is read by OCR_MODEL instead.
+    """
 
-    def setUp(self):
-        super().setUp()
-        # Two pages that are only images, with no text layer
-        pages = [Image.new('RGB', (850, 1100), 'white') for _ in range(2)]
-        pages[0].save(self.folder / 'scan.pdf', save_all=True, append_images=pages[1:])
-
-    def analyse(self, *page_texts):
-        """Checks the tender with the OCR of each page answered by page_texts in turn; an exception fails it."""
-        replies = iter(page_texts)
+    def analyse(self, local_pages, vision_replies=(), **options):
+        """
+        Checks the tender (with options for process_tender_files()) with PaddleOCR reading local_pages in turn (each a
+        list of paddle_line()s) and OCR_MODEL answering each page sent to it with vision_replies in turn; an exception
+        among them fails that page.
+        """
+        replies = iter(vision_replies)
 
         def invoke(messages):
             if isinstance(messages[0]['content'], list):  # a page image to read
@@ -577,29 +624,301 @@ class ScannedPdfTest(AnalysisTestCase):
             return mock.Mock(content='**Overall verdict:** Eligible')
 
         self.llm.invoke.side_effect = invoke
-        result = self.process()
+        with mock.patch('services.ocr_service._paddle_lines', side_effect=local_pages) as self.paddle:
+            result = self.process(**options)
         return result, list(self.indexed().values())
 
-    def test_a_scanned_pdf_is_read_with_ocr(self):
-        result, read = self.analyse('Turnover at least 5 Cr', 'Positive net worth')
+    def vision_calls(self):
+        return [call.args[0] for call in self.llm.invoke.call_args_list if isinstance(call.args[0][0]['content'], list)]
 
-        self.assertEqual(len(read), 1)
-        self.assertIn('Turnover at least 5 Cr', read[0])
-        self.assertIn('Positive net worth', read[0])
+    def test_clear_pages_are_read_locally_without_the_vision_model(self):
+        scan_pdf(self.folder / 'scan.pdf')
+        result, read = self.analyse([[paddle_line('Turnover at least 5 Cr')], [paddle_line('Positive net worth')]])
+
+        self.assertEqual(read, ['## Page 1\n\nTurnover at least 5 Cr\n\n## Page 2\n\nPositive net worth'])
         self.assertEqual((result['verdict'], result['unreadable_files']), ('Eligible', []))
-        image = self.llm.invoke.call_args_list[0].args[0][0]['content'][1]['image_url']['url']
-        self.assertTrue(image.startswith('data:image/'))
+        self.assertEqual(self.vision_calls(), [])
 
-    def test_a_scan_with_a_page_ocr_could_not_read_is_listed_as_not_checked(self):
-        with self.assertLogs('services.analysis_service', 'WARNING') as logs:
-            result, read = self.analyse('Turnover at least 5 Cr', ConnectionError('timed out'))
+    def test_unsure_and_table_pages_are_read_by_the_vision_model(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=4, ruled_page=3)
+        unsure = [paddle_line('Turnover at 1east 5 Cr', score=0.6), paddle_line('Net worth', top=200)]
+        borderless = [paddle_line(cell, left=left, top=top) for top in (100, 200, 300)
+                      for cell, left in (('1', 100), ('Road work', 300), ('12 Cr', 600))]
+        ruled = [paddle_line('Similar work 40 Cr')]
+        result, read = self.analyse([unsure, borderless, ruled, [paddle_line('Positive net worth')]],
+                                    ['Turnover at least 5 Cr', '| S.No | Work | Value |', '| Similar work | 40 Cr |'])
 
-        self.assertIn('Could not OCR every page of scan.pdf: timed out', logs.output[0])
+        self.assertEqual(read, ['## Page 1\n\nTurnover at least 5 Cr\n\n## Page 2\n\n| S.No | Work | Value |\n\n'
+                                '## Page 3\n\n| Similar work | 40 Cr |\n\n## Page 4\n\nPositive net worth'])
+        self.assertEqual(result['unreadable_files'], [])
+        calls = self.vision_calls()
+        self.assertEqual(len(calls), 3)
+        self.assertIn('markdown table', calls[0][0]['content'][0]['text'])
+        self.assertTrue(calls[0][0]['content'][1]['image_url']['url'].startswith('data:image/png;base64,'))
+
+    def test_a_scan_with_a_page_the_vision_model_could_not_read_is_listed_as_not_checked(self):
+        scan_pdf(self.folder / 'scan.pdf')
+        with self.assertLogs('services.ocr_service', 'WARNING') as logs:
+            result, read = self.analyse([[paddle_line('Turnover at least 5 Cr')], [paddle_line('N3t w0rth', 0.4)]],
+                                        [ConnectionError('timed out')])
+
+        self.assertIn('Could not OCR page 2 of scan.pdf: timed out', logs.output[0])
         self.assertEqual((read, result['unreadable_files']), ([], ['scan.pdf']))
 
-    def test_a_scan_ocr_finds_no_text_in_is_listed_as_not_checked(self):
-        result, read = self.analyse('', '')
+    def test_a_pdf_with_text_keeps_it_and_lists_only_the_image_ocr_could_not_read(self):
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 60), 'Annexure B: security clearance form')
+        page.insert_image(pymupdf.Rect(72, 100, 300, 290), stream=png(600, 500))
+        page.insert_image(pymupdf.Rect(72, 400, 300, 590), stream=png(600, 500))
+        document.save(self.folder / 'RFP.pdf')
+
+        with self.assertLogs('services.ocr_service', 'WARNING') as logs:
+            result, read = self.analyse([[paddle_line('N3t w0rth', 0.4)], [paddle_line('Positive net worth')]],
+                                        [ConnectionError('timed out')])
+
+        self.assertIn('Could not OCR page 1, image 1 of RFP.pdf: timed out', logs.output[0])
+        self.assertTrue(read[0].startswith('Annexure B: security clearance form'))
+        self.assertTrue(read[0].endswith('\n\n## Page 1, image 2\n\nPositive net worth'))
+        self.assertEqual(result['unreadable_files'], ['RFP.pdf (could not be read: page 1, image 1)'])
+        self.assertEqual(result['verdict'], 'Requires Review')  # the model said Eligible without seeing image 1
+
+    def test_a_scan_too_long_to_index_is_told_from_its_page_count_before_any_ocr(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=3)  # about 6,000 characters at CHARS_PER_PAGE (2,000)
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+
+        with mock.patch('services.ocr_service._paddle_lines') as paddle, \
+                self.assertLogs('services.analysis_service', 'WARNING'):
+            result = self.process(max_file_chars=5999)
+
+        paddle.assert_not_called()
+        self.assertEqual(self.vision_calls(), [])
+        self.assertEqual(list(self.indexed()), ['NIT.txt'])
+        self.assertEqual(result['unreadable_files'], [
+            'scan.pdf (too long: 3 scanned pages, about 6,000 characters; the MAX_FILE_CHARS limit is 5,999)'])
+
+        # At the limit, it is read
+        result, read = self.analyse([[paddle_line('Positive net worth')]] * 3, max_file_chars=6000)
+        self.assertEqual((len(read), result['unreadable_files']), (2, []))
+
+    def test_ocr_stops_at_the_page_where_the_text_passes_the_length_limit(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=3)
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        long_page = [paddle_line('x' * 3000)]  # 3,011 characters with its '## Page <n>' heading
+
+        # One part at a time: PaddleOCR may otherwise read up to OCR_CONCURRENCY parts ahead while page 2 is with the
+        # vision model, whose text is then dropped
+        with self.assertLogs('services.analysis_service', 'WARNING'), \
+                mock.patch('services.ocr_service.OCR_CONCURRENCY', 1):
+            result, read = self.analyse([long_page, [paddle_line('N3t w0rth', 0.4)], long_page], ['y' * 3000],
+                                        max_file_chars=6020)
+
+        self.assertEqual((self.paddle.call_count, len(self.vision_calls())), (2, 1))  # page 3 is never read
+        self.assertEqual(list(self.indexed()), ['NIT.txt'])
+        self.assertEqual(result['unreadable_files'], [
+            "scan.pdf (too long: 6,024 characters once page 2 of 3 was OCR'd; the MAX_FILE_CHARS limit is 6,020)"])
+
+    def test_pages_sent_to_the_vision_model_are_read_at_the_same_time_and_kept_in_order(self):
+        # Pages 400, 500, 600 and 700 points wide, so each image sent tells its page by its width
+        pages = [Image.new('RGB', (300 + 100 * number, 1100), 'white') for number in range(1, 5)]
+        pages[0].save(self.folder / 'scan.pdf', save_all=True, append_images=pages[1:])
+        lock, counts = threading.Lock(), {'now': 0, 'most': 0}
+
+        def invoke(messages):
+            if not isinstance(messages[0]['content'], list):
+                return mock.Mock(content='**Overall verdict:** Eligible')
+            png = base64.b64decode(messages[0]['content'][1]['image_url']['url'].split(',', 1)[1])
+            page = round((int.from_bytes(png[16:20], 'big') * 72 / 200 - 300) / 100)
+            with lock:
+                counts['now'] += 1
+                counts['most'] = max(counts['most'], counts['now'])
+            time.sleep(0.4 if page == 1 else 0.1)  # the first page back last
+            with lock:
+                counts['now'] -= 1
+            return mock.Mock(content=f'Reading {page}')
+
+        self.llm.invoke.side_effect = invoke
+        unsure = [paddle_line('Turn0ver', 0.5)]
+        with mock.patch('services.ocr_service._paddle_lines', side_effect=[unsure] * 4):
+            self.process()
+
+        self.assertGreater(counts['most'], 1)
+        self.assertEqual(self.indexed()['scan.pdf'], '\n\n'.join(f'## Page {n}\n\nReading {n}' for n in range(1, 5)))
+
+    def test_a_page_with_no_text_layer_is_ocrd_whole_not_read_as_its_logo(self):
+        document = pymupdf.open()
+        document.new_page().insert_text((72, 72), 'Turnover at least 5 Cr')
+        drawn = document.new_page()  # its text drawn as vector graphics, beside a logo
+        drawn.draw_rect(pymupdf.Rect(72, 120, 540, 400))
+        drawn.insert_image(pymupdf.Rect(72, 72, 144, 108), stream=png(400, 200))
+        document.save(self.folder / 'NIT.pdf')
+
+        result, read = self.analyse([[paddle_line('Positive net worth')]])
+
+        self.assertEqual(self.paddle.call_args.args[0].shape, (2339, 1653, 3))  # the whole A4 page at 200 DPI
+        self.assertTrue(read[0].startswith('Turnover at least 5 Cr'))
+        self.assertTrue(read[0].endswith('\n\n## Page 2\n\nPositive net worth'))
+        self.assertEqual(result['unreadable_files'], [])
+
+    def test_on_a_page_with_text_only_large_images_the_text_layer_does_not_cover_are_ocrd(self):
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 60), 'Annexure B: security clearance form')
+        page.insert_image(pymupdf.Rect(72, 100, 300, 290), stream=png(600, 500))  # a pasted scan
+        page.insert_image(pymupdf.Rect(400, 100, 450, 150), stream=png(600, 600))  # a logo, drawn at 139 px
+        page.insert_image(pymupdf.Rect(72, 400, 494, 600), stream=png(350, 166))  # a watermark across the page
+        page.insert_image(pymupdf.Rect(72, 620, 264, 780), stream=png(600, 500))  # a scan with its OCR'd text
+        for line in range(5):
+            page.insert_text((80, 640 + 25 * line), 'one two three four five', fontsize=8)
+        document.save(self.folder / 'RFP.pdf')
+
+        result, read = self.analyse([[paddle_line('Turnover at least 5 Cr')]])
+
+        self.assertEqual(self.paddle.call_count, 1)
+        self.assertEqual(self.paddle.call_args.args[0].shape, (529, 634, 3))  # the pasted scan as drawn, at 200 DPI
+        self.assertTrue(read[0].startswith('Annexure B: security clearance form'))
+        self.assertTrue(read[0].endswith('\n\n## Page 1, image 1\n\nTurnover at least 5 Cr'))
+        self.assertEqual(self.vision_calls(), [])
+
+    def test_blank_pages_are_left_out_and_a_scan_with_no_text_is_listed_as_not_checked(self):
+        scan_pdf(self.folder / 'scan.pdf')
+        result, read = self.analyse([[], [paddle_line('Positive net worth')]])
+        self.assertEqual(read, ['## Page 2\n\nPositive net worth'])
+
+        result, read = self.analyse([[], []])
         self.assertEqual((read, result['unreadable_files']), ([], ['scan.pdf']))
+        self.assertEqual(self.vision_calls(), [])
+
+
+class CacheTest(AnalysisTestCase):
+    """Files read and chunks embedded before come from the cache, so regenerating reads only the files that changed."""
+
+    def setUp(self):
+        super().setUp()
+        self.cache = Cache(Path(self.tmp.name) / 'cache.sqlite3')
+        self.index = pinecone_service(self.pinecone, cache=self.cache)
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+
+    def embedded(self):
+        """How many passages have been embedded so far."""
+        return sum(call[2] for call in self.pinecone.calls if call[:2] == ('embed', 'passage'))
+
+    def test_regenerating_reads_and_embeds_only_the_files_that_changed(self):
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr. ' * 40, encoding='utf-8')
+        (self.folder / 'BOQ.txt').write_text('Estimated cost 98 Cr. ' * 40, encoding='utf-8')
+        scan_pdf(self.folder / 'scan.pdf', pages=1)
+        with mock.patch('services.ocr_service._paddle_lines', return_value=[paddle_line('Positive net worth')]) as paddle:
+            first = self.process(cache=self.cache)
+            embedded = self.embedded()
+
+            changed = 'Estimated cost 120 Cr. ' * 40
+            (self.folder / 'BOQ.txt').write_text(changed, encoding='utf-8')
+            with self.assertLogs('services.analysis_service', 'INFO') as logs:
+                second = self.process(cache=self.cache)
+
+        self.assertEqual(paddle.call_count, 1)  # the scan is not OCR'd again
+        cached = sorted(line.split('Read ')[1].split(' from the cache')[0] for line in logs.output
+                        if 'from the cache' in line)
+        self.assertEqual(cached, ['NIT.txt', 'scan.pdf'])
+        # Only the changed file's chunks are embedded again
+        self.assertEqual(self.embedded() - embedded, len(chunk_text(changed, 400, 50)))
+        self.assertGreater(first['index']['embedding_tokens'], second['index']['embedding_tokens'])
+        self.assertIn('Estimated cost 120 Cr.', self.indexed()['BOQ.txt'])
+        self.assertEqual(self.indexed()['scan.pdf'], '## Page 1\n\nPositive net worth')
+
+    def test_a_reading_with_parts_ocr_could_not_read_is_not_kept(self):
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 60), 'Annexure B: security clearance form')
+        page.insert_image(pymupdf.Rect(72, 100, 300, 290), stream=png(600, 500))
+        document.save(self.folder / 'RFP.pdf')
+
+        with mock.patch('services.ocr_service._paddle_lines', side_effect=[RuntimeError('model download failed'),
+                                                                           [paddle_line('Positive net worth')]]), \
+                self.assertLogs('services.ocr_service', 'WARNING'):
+            first = self.process(cache=self.cache)
+            second = self.process(cache=self.cache)
+
+        self.assertEqual(first['unreadable_files'], ['RFP.pdf (could not be read: page 1, image 1)'])
+        self.assertEqual(second['unreadable_files'], [])  # read again, this time whole
+        self.assertTrue(self.indexed()['RFP.pdf'].endswith('## Page 1, image 1\n\nPositive net worth'))
+
+    def test_a_text_is_kept_by_file_and_reading_settings_and_a_vector_by_chunk_and_model(self):
+        self.cache.save_text('abc', 'reader 1', 'Turnover at least 5 Cr')
+        self.assertEqual(self.cache.text('abc', 'reader 1'), 'Turnover at least 5 Cr')
+        self.assertIsNone(self.cache.text('abc', 'reader 2'))
+        self.assertIsNone(self.cache.text('abd', 'reader 1'))
+
+        self.cache.save_vectors('model/3', ['one', 'two'], [[0.5, -1.0, 2.0], [1.0, 0.0, 0.25]])
+        self.assertEqual(self.cache.vectors('model/3', ['two', 'three', 'one']),
+                         [[1.0, 0.0, 0.25], None, [0.5, -1.0, 2.0]])
+        self.assertEqual(self.cache.vectors('model/4', ['one']), [None])
+
+    def test_a_cache_that_cannot_be_used_is_passed_over(self):
+        broken = Cache(Path(self.tmp.name))  # a folder, not a file
+        with self.assertLogs('services.cache_service', 'WARNING'):
+            self.assertIsNone(broken.text('abc', 'reader'))
+            self.assertEqual(broken.vectors('model/3', ['one']), [None])
+            broken.save_text('abc', 'reader', 'text')
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        self.index = pinecone_service(self.pinecone, cache=broken)
+        with self.assertLogs('services.cache_service', 'WARNING'):
+            result = self.process(cache=broken)
+        self.assertEqual((result['verdict'], list(self.indexed())), ('Eligible', ['NIT.txt']))
+
+
+class OcrBudgetTest(AnalysisTestCase):
+    """A tender whose scans need more OCR than its budget stops before any, to ask; approved, it is read."""
+
+    def test_a_tender_over_its_ocr_budget_stops_before_any_ocr(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=3)
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+        estimate = {'pages': 3, 'cost': 0.0168, 'files': [{'name': 'scan.pdf', 'pages': 3}]}
+
+        with mock.patch('services.ocr_service._paddle_lines') as paddle:
+            for budget in ({'pages': 2, 'usd': 0}, {'pages': 0, 'usd': 0.01}):
+                with self.assertRaises(OcrBudgetExceeded) as raised:
+                    self.process(ocr_budget=budget)
+                self.assertEqual(raised.exception.estimate, estimate)
+        paddle.assert_not_called()
+        self.llm.invoke.assert_not_called()
+        self.assertEqual(str(raised.exception),
+                         'The scans need 3 page(s) of OCR, up to $0.02: over the OCR budget of $0.01 a tender')
+        title, action = explain_error(raised.exception)
+        self.assertEqual(title, 'Waiting for approval of the OCR')
+        self.assertIn('Approve the OCR', action)
+
+    def test_within_budget_or_approved_or_read_before_a_scan_is_read(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=3)
+        self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
+        cache = Cache(Path(self.tmp.name) / 'cache.sqlite3')
+        with mock.patch('services.ocr_service._paddle_lines', return_value=[paddle_line('Positive net worth')]):
+            for budget in ({'pages': 3, 'usd': 0.5}, None):  # at the limit; approved (no budget)
+                self.assertEqual(self.process(ocr_budget=budget, cache=cache)['unreadable_files'], [])
+
+        # Read before, so in the cache: nothing left to OCR, whatever the budget
+        self.assertEqual(ocr_estimate(self.folder, cache), {'pages': 0, 'cost': 0.0, 'files': []})
+        self.process(ocr_budget={'pages': 1, 'usd': 0}, cache=cache)
+
+    def test_the_estimate_counts_what_ocr_would_read(self):
+        scan_pdf(self.folder / 'scan.pdf', pages=2)
+        scan_pdf(self.folder / 'Drawings.pdf', pages=5)  # not read at all
+        document = pymupdf.open()
+        page = document.new_page()
+        page.insert_text((72, 60), 'Annexure B')
+        page.insert_image(pymupdf.Rect(72, 100, 300, 290), stream=png(600, 500))  # a pasted scan
+        page.insert_image(pymupdf.Rect(400, 100, 450, 150), stream=png(600, 600))  # a logo
+        document.new_page()  # no text layer
+        document.save(self.folder / 'RFP.pdf')
+        (self.folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+
+        estimate = ocr_estimate(self.folder)
+        self.assertEqual(estimate['files'], [{'name': 'RFP.pdf', 'pages': 2}, {'name': 'scan.pdf', 'pages': 2}])
+        self.assertEqual(estimate['pages'], 4)
+        self.assertAlmostEqual(estimate['cost'], 4 * 0.0056)
+        # A scan too long to OCR is skipped, not counted
+        self.assertEqual(ocr_estimate(self.folder, max_file_chars=3000)['files'], [{'name': 'RFP.pdf', 'pages': 2}])
 
 
 class ModelChoiceTest(AnalysisTestCase):
@@ -647,11 +966,11 @@ class TokenUsageTest(AnalysisTestCase):
         self.assertEqual(usage.counts()['total'], {'input': 300, 'output': 150, 'total': 450})
 
     def test_tokens_spent_before_a_failure_are_still_counted(self):
-        pages = [Image.new('RGB', (850, 1100), 'white')]
-        pages[0].save(self.folder / 'scan.pdf')
+        scan_pdf(self.folder / 'scan.pdf', pages=1)
         usage = TokenUsage()
 
         with mock.patch('services.analysis_service.make_model', return_value=counting_model(('Turnover 5 Cr', 1000, 40))), \
+                mock.patch('services.ocr_service._paddle_lines', return_value=[paddle_line('Turn0ver', 0.5)]), \
                 mock.patch('services.analysis_service.assess_eligibility', side_effect=ConnectionError('timed out')), \
                 self.assertRaises(ConnectionError):
             self.process(usage=usage)
@@ -830,6 +1149,28 @@ class DownloadTest(unittest.TestCase):
             self.download(FakeResponse(b'<html>Session expired</html>', {'Content-Type': 'text/html; charset=utf-8'}))
 
 
+class JobStateTest(unittest.TestCase):
+    """The Redis client: an idle worker's wait must not outlast the client's patience for a reply."""
+
+    def test_a_redis_url_gets_a_reply_timeout_longer_than_a_wait(self):
+        state = JobState.connect('redis://default:secret@redis.invalid:6379/0')  # nothing is sent until used
+        options = state.redis.connection_pool.connection_kwargs
+        self.assertEqual((options['socket_timeout'], options['socket_connect_timeout']), (30, 10))
+
+    def test_a_wait_stays_under_the_socket_timeout_and_survives_one(self):
+        redis = mock.Mock()
+        redis.connection_pool.connection_kwargs = {'socket_timeout': 5}  # redis-py 8's default
+        state = JobState(redis)
+
+        state.wait(5)
+        self.assertEqual(redis.blpop.call_args.kwargs['timeout'], 3)
+
+        redis.connection_pool.connection_kwargs = {'socket_timeout': None}
+        redis.blpop.side_effect = RedisTimeoutError('Timeout reading from socket')
+        state.wait(5)  # as if nothing was queued
+        self.assertEqual(redis.blpop.call_args.kwargs['timeout'], 5)
+
+
 class ApiTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -838,6 +1179,8 @@ class ApiTest(unittest.TestCase):
             TARGET_DIRECTORY = Path(self.tmp.name) / 'downloads'
             LOG_DIRECTORY = Path(self.tmp.name) / 'logs'
             LOG_LEVEL = 'WARNING'
+            REDIS_URL = None  # an in-process Redis of its own, whatever .env says
+            JOB_WORKERS = 1
             COMPANY_DETAILS_FILE = Path(self.tmp.name) / 'company_details.md'
             DEFAULT_FILTERS_FILE = Path(self.tmp.name) / 'default_filters.json'
 
@@ -853,6 +1196,7 @@ class ApiTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         self.rechecked = []
+        self.ocr_needed = None  # an ocr_estimate() the documents give, to raise OcrBudgetExceeded when over budget
         tender_service._tenders.clear()
         self.config = TestConfig
         self.analysis_delay = 0
@@ -874,7 +1218,11 @@ class ApiTest(unittest.TestCase):
         return [folder / 'NIT.pdf']
 
     def fake_analysis(self, folder, index=None, tcno=None, on_progress=None, company_file=None,
-                      prequalification_link=None, tender=None, usage=None, max_file_chars=None, workers=None):
+                      prequalification_link=None, tender=None, usage=None, max_file_chars=None, workers=None,
+                      cache=None, ocr_budget=None):
+        self.ocr_budget = ocr_budget
+        if self.ocr_needed and ocr_budget:
+            raise OcrBudgetExceeded(self.ocr_needed, ocr_budget)
         self.company_file = company_file
         self.prequalification_link = prequalification_link
         self.max_file_chars = max_file_chars
@@ -936,6 +1284,128 @@ class ApiTest(unittest.TestCase):
                 return progress
             time.sleep(0.05)
         self.fail('job did not finish')
+
+    def app_with(self, **settings):
+        """A client of another app over the same downloads, with these Config settings (JOB_WORKERS, say)."""
+        config = type('Config', (self.config,), settings)
+        client = TestClient(create_app(config, vector_store=self.index))
+        return client, client.app.state.tender_processor
+
+    def both_download(self, delay):
+        """Downloads that succeed for both sample tenders after delay seconds, counting how many run at once."""
+        lock, counts = threading.Lock(), {'now': 0, 'most': 0}
+
+        def download(tender, folder, **kwargs):
+            with lock:
+                counts['now'] += 1
+                counts['most'] = max(counts['most'], counts['now'])
+            time.sleep(delay)
+            with lock:
+                counts['now'] -= 1
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / 'NIT.pdf').write_bytes(b'x')
+            return [folder / 'NIT.pdf']
+
+        return download, counts
+
+    def test_several_workers_process_tenders_at_the_same_time(self):
+        client, _ = self.app_with(JOB_WORKERS=2)
+        download, counts = self.both_download(0.6)
+        with mock.patch('services.processing_service.download_tender_documents', side_effect=download):
+            client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
+            deadline = time.monotonic() + 5
+            while len(client.get('/api/progress').json()['active']) < 2:
+                self.assertLess(time.monotonic(), deadline, 'the two tenders were never processed at once')
+                time.sleep(0.05)
+            active = client.get('/api/progress').json()['active']
+            while client.get('/api/progress').json()['status'] == 'running':
+                time.sleep(0.05)
+
+        self.assertEqual(sorted(tender['tcno'] for tender in active), ['100091540', '102309372'])
+        self.assertEqual(counts['most'], 2)
+        progress = client.get('/api/progress').json()
+        self.assertEqual((progress['completed'], progress['percent'], progress['active']), (2, 100, []))
+
+    def test_a_worker_process_takes_the_tenders_the_app_queues(self):
+        client, web = self.app_with(JOB_WORKERS=0)
+        web.job_workers = 0  # REDIS_URL is unset here, so the app made it 1: as with a real Redis
+        # Another process's processor would reach the same Redis; here it shares the app's in-process one
+        worker = TenderProcessor.from_config(self.config, index=self.index, load_results=False, job_workers=0)
+        worker.state = web.state
+        client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        time.sleep(0.3)
+        self.assertEqual(client.get('/api/progress').json()['items'][0]['status'], 'queued')  # nobody took it
+
+        stop = threading.Event()
+        threads = worker.work(1, stop)
+        try:
+            deadline = time.monotonic() + 5
+            while client.get('/api/progress').json()['status'] == 'running':
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(0.05)
+        finally:
+            stop.set()
+        self.assertEqual(client.get('/api/result/100091540').json()['verdict'], 'Eligible')
+        for thread in threads:
+            thread.join(10)
+            self.assertFalse(thread.is_alive())
+
+    def test_a_tender_whose_worker_stopped_is_failed(self):
+        client, web = self.app_with(JOB_WORKERS=0)
+        web.job_workers = 0
+        client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        item, _, _ = web._claim()  # as a worker would, which then dies: its lease runs out
+        web.state.redis.delete(web.state._key(f"lease:{item['id']}"))
+
+        progress = client.get('/api/progress').json()
+
+        self.assertEqual((progress['status'], progress['failed']), ('completed', 1))
+        self.assertEqual(progress['items'][0]['error_title'], 'Processing stopped unexpectedly')
+
+    def test_a_tender_over_its_ocr_budget_waits_for_approval(self):
+        self.ocr_needed = {'pages': 80, 'cost': 0.448, 'files': [{'name': 'scan.pdf', 'pages': 80}]}
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        progress = self.wait_for_job()
+
+        self.assertEqual(self.ocr_budget, {'pages': 50, 'usd': 0.5})
+        item = progress['items'][0]
+        self.assertEqual((item['status'], item['error_title']), ('awaiting_approval', 'Waiting for approval of the OCR'))
+        self.assertEqual(item['ocr_estimate'], self.ocr_needed)
+        # Counted on its own: not a failure
+        self.assertEqual((progress['completed'], progress['failed'], progress['awaiting_approval'],
+                          progress['processed'], progress['percent']), (0, 0, 1, 1, 100))
+        self.assertIsNone(self.client.get('/api/result/100091540').json()['namespace'])
+        # Saved like any result, so it is still waiting after a restart
+        restarted = TestClient(create_app(self.config, vector_store=self.index))
+        self.assertEqual(restarted.get('/api/result/100091540').json()['status'], 'awaiting_approval')
+
+        # Approved, it is read whatever the budget
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540'], 'approve_ocr': True})
+        progress = self.wait_for_job()
+        self.assertIsNone(self.ocr_budget)
+        self.assertEqual(progress['items'][0]['status'], 'completed')
+        self.assertIsNone(progress['items'][0]['ocr_estimate'])
+
+    def test_the_ocr_of_a_regenerate_is_estimated_from_the_documents_downloaded(self):
+        folder = self.config.TARGET_DIRECTORY / '100091540'
+        folder.mkdir(parents=True)
+        scan_pdf(folder / 'scan.pdf', pages=3)
+        (folder / 'NIT.txt').write_text('Turnover at least 5 Cr', encoding='utf-8')
+
+        class Tight(self.config):
+            OCR_BUDGET_PAGES = 2
+
+        for config, over in ((self.config, 0), (Tight, 1)):
+            data = TestClient(create_app(config, vector_store=self.index)).post(
+                '/api/ocr-estimate', json={'tcnos': ['100091540', '102309372']}).json()
+            self.assertEqual(data['tenders'], [
+                {'tcno': '100091540', 'downloaded': True, 'pages': 3, 'cost': 0.0168,
+                 'files': [{'name': 'scan.pdf', 'pages': 3}], 'over_budget': bool(over)},
+                {'tcno': '102309372', 'downloaded': False, 'pages': 0, 'cost': 0.0, 'files': [], 'over_budget': False},
+            ])
+            self.assertEqual((data['pages'], data['cost'], data['over_budget']), (3, 0.0168, over))
+            self.assertEqual(data['page_cost'], 0.0056)
+        self.assertEqual(data['budget'], {'pages': 2, 'usd': 0.5})
 
     def test_page_renders(self):
         response = self.client.get('/')
@@ -1304,6 +1774,15 @@ class ApiTest(unittest.TestCase):
         # Still open on its closing date
         self.assertEqual(self.closed_downloads(date(2026, 11, 18))['closed'], [])
 
+    def test_a_queued_tender_is_not_listed_as_closed(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
+        self.wait_for_job()
+        state = self.client.app.state.tender_processor.state
+        state.add_item({'tcno': '100091540', 'status': 'queued'}, {})
+        with mock.patch.object(state, 'items', wraps=state.items) as items:
+            self.assertEqual(self.closed_downloads(date(2026, 11, 20))['closed'], [])
+        items.assert_called_once()  # one read for all the folders, not one per folder
+
     def test_a_listed_tender_keeps_its_closing_date_in_its_result(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         self.wait_for_job()
@@ -1355,8 +1834,11 @@ class ApiTest(unittest.TestCase):
         row = self.client.get('/api/tenders').json()['tenders'][0]
         self.assertEqual((row['tcno'], row['result'], row['decision'], row['has_indexed_criteria']),
                          ('100091540', None, None, False))
-        # The last job no longer shows its verdict after a reload
-        self.assertEqual([item['status'] for item in self.client.get('/api/progress').json()['items']], ['deleted'])
+        # Nothing of it is left in Redis: the job that checked only this tender is gone too
+        state = self.client.app.state.tender_processor.state
+        self.assertEqual(sorted(key.removeprefix(state.prefix) for key in state.redis.scan_iter(f'{state.prefix}*')),
+                         ['seq'])
+        self.assertEqual(self.client.get('/api/progress').json()['status'], 'idle')
         self.assertEqual(self.config.COMPANY_DETAILS_FILE.read_text(encoding='utf-8'), profile)
         restarted = TestClient(create_app(self.config, vector_store=self.index))
         self.assertEqual(restarted.get('/api/result/100091540').status_code, 404)
@@ -1368,6 +1850,19 @@ class ApiTest(unittest.TestCase):
         (self.config.TARGET_DIRECTORY / '555' / 'old.pdf').write_bytes(b'12345')
         self.assertEqual(self.client.delete('/api/downloads/555').json()['files'], 1)
         self.assertFalse((self.config.TARGET_DIRECTORY / '555').exists())
+
+    def test_a_deleted_tender_leaves_the_last_job_and_the_others_stay(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
+        self.wait_for_job()
+
+        self.assertEqual(self.client.delete('/api/downloads/100091540').status_code, 200)
+        progress = self.client.get('/api/progress').json()
+        self.assertEqual(([item['tcno'] for item in progress['items']], progress['total'], progress['percent']),
+                         (['102309372'], 1, 100))
+        state = self.client.app.state.tender_processor.state
+        self.assertEqual([item['tcno'] for item in state.items()], ['102309372'])
+        self.assertEqual(len(state.redis.hkeys(state._key('payloads'))), 1)
+        self.assertEqual(list(state.briefs()), ['102309372'])
 
     def test_a_tender_cannot_be_deleted_while_it_is_checked_or_a_file_is_open(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})

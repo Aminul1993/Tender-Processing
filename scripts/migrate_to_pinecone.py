@@ -17,7 +17,8 @@ Run it from the project folder, with the app stopped:
     python scripts/migrate_to_pinecone.py --keep-criteria-files
 
 A tender folder with no documents and no pre-qualification text is skipped: the app downloads its documents the
-next time it is checked. Scanned PDFs are read with OCR again (GROQ_API_KEY), as the documents were never kept as
+next time it is checked. Scanned PDFs are read with OCR again (PaddleOCR, and OCR_MODEL with GROQ_API_KEY for pages
+with tables or that PaddleOCR is unsure of), as the documents were never kept as
 text. The run stops at the Pinecone plan's namespace limit and says how many tenders are left.
 """
 import argparse
@@ -36,6 +37,7 @@ load_dotenv(ROOT / '.env')
 from config import Config  # noqa: E402
 from services.analysis_service import (PREQUALIFICATION_SOURCE, TokenUsage, _NO_CRITERIA, read_documents,  # noqa: E402
                                        tender_files)
+from services.cache_service import Cache  # noqa: E402
 from services.pinecone_service import Document, PineconeService, QuotaExceeded  # noqa: E402
 
 # The criteria file of the app before Pinecone; read here for the last time, then deleted
@@ -73,7 +75,7 @@ def migrate(folder, index, force=False, keep_criteria_files=False, dry_run=False
         return 'indexed'
     documents = [Document(PREQUALIFICATION_SOURCE, prequalification, 'prequalification')] if prequalification else []
     read, unreadable = read_documents(folder, files, TokenUsage(), max_file_chars=Config.MAX_FILE_CHARS,
-                                      workers=Config.INGEST_WORKERS)
+                                      workers=Config.INGEST_WORKERS, cache=index.cache)
     try:
         built = index.rebuild_namespace(tcno, documents + read, unreadable,
                                         on_progress=lambda message: log.debug(message))
@@ -111,7 +113,9 @@ def main(argv=None):
     for noisy in ('httpx', 'pinecone'):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
-    index = PineconeService.from_config(Config)
+    # The app's cache, so a run stopped at the namespace limit and run again reads and embeds nothing twice
+    index = PineconeService.from_config(
+        Config, cache=Cache(Config.CACHE_FILE or Config.TARGET_DIRECTORY / 'cache.sqlite3'))
     index.require()
     folders = sorted(path for path in Config.TARGET_DIRECTORY.iterdir() if path.is_dir()) \
         if not args.tcnos else [Config.TARGET_DIRECTORY / tcno for tcno in args.tcnos]

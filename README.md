@@ -17,6 +17,7 @@ tender shortlisted or dropped. The company profile the tenders are checked again
 
 ```
 app.py                       Application factory (create_app) and uvicorn entry point
+worker.py                    A worker process: processes queued tenders from the job in Redis (REDIS_URL)
 config.py                    Settings, each overridable by an environment variable
 ext.py                       Existing helpers: the TenderTiger login session, tender_list(), prequalification_criteria(),
                              extract_zip_recursive(), LLM summarising, company_details() / save_company_details()
@@ -32,10 +33,16 @@ services/
   analysis_service.py        process_tender_files(tcno_folder, index=...) reads every source, indexes them in the
                              tender's namespace, retrieves the criteria and returns {"verdict", "details", "score",
                              "criteria", ...}; recheck_saved_criteria(tcno, index=...) retrieves and checks again
+  ocr_service.py             OCR of scans, PDF pages with no text layer and large images: PaddleOCR locally first;
+                             unsure and table pages go to OCR_MODEL
+  cache_service.py           SQLite cache of file texts (by SHA-256) and chunk vectors, so nothing is read or
+                             embedded twice
   company_service.py         Company profile markdown <-> the editor's form blocks; company name; the table of
                              criteria statuses marked by hand (record_mark(), profile_for_tender())
-  processing_service.py      Background job: runs queued tenders one by one, tracks progress and results;
-                             saves each result to eligibility_result.json and loads those at startup
+  processing_service.py      The job: queues tenders, runs them on the workers (threads of the app, worker.py
+                             processes), tracks progress and results; saves each result to
+                             eligibility_result.json and loads those at startup
+  job_state.py               The job, its items and the results in Redis (an in-process one without REDIS_URL)
   decision_service.py        Shortlisted / dropped decisions, saved to decisions.json
   deep_analysis_service.py   Deep analysis: five agents review a completed result, the criteria retrieved from
                              its Pinecone namespace, the company profile and the statuses marked by user; saved to
@@ -74,6 +81,10 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 ```
+
+The first scanned PDF downloads PaddleOCR's models (about 30 MB) to `~/.paddlex/official_models`. If that fails
+with "No available model hosting platforms detected", set `PADDLE_PDX_MODEL_SOURCE=modelscope` (or `huggingface`,
+`aistudio`, `bos`) in `.env`.
 
 Copy [.env.example](.env.example) to `.env` and put your TenderTiger login, Groq API key and Pinecone API key in
 it; the other settings in it are optional (see [Configuration](#configuration)). The keys are read from `.env` (or
@@ -132,12 +143,34 @@ uvicorn app:create_app --factory --host 0.0.0.0 --port 5000
 Behind a reverse proxy on another host, add `--proxy-headers --forwarded-allow-ips <proxy-ip>` so the page's
 links use the proxy's address and scheme.
 
-**Run a single process.** Job progress and results are kept in memory, so do not use several worker
-processes (uvicorn's `--workers`, `gunicorn -w 4`) or `--reload`. The endpoints run in uvicorn's thread pool, so
-requests are still served while a job runs. Job progress is lost on restart, but each tender's last result is
-saved as `eligibility_result.json` in its folder and loaded again at startup, and its Pinecone namespace is kept, so it
-can be re-checked quickly; the downloaded files stay in `downloads/`, and shortlisted / dropped decisions stay in
-`decisions.json`.
+**Run one web process.** The tender list, the deep analyses and (without `REDIS_URL`) the job live in its memory,
+so do not use uvicorn's `--workers`, `gunicorn -w 4` or `--reload`. The endpoints run in uvicorn's thread pool, so
+requests are still served while a job runs. Each tender's last result is saved as `eligibility_result.json` in its
+folder and loaded again at startup, and its Pinecone namespace is kept, so it can be re-checked quickly; the
+downloaded files stay in `downloads/`, and shortlisted / dropped decisions stay in `decisions.json`.
+
+**Several workers.** The processing job (the queue, each tender's status and stage) and the results are kept in
+Redis ([job_state.py](services/job_state.py)), so tenders can be processed by several workers at once. Without
+`REDIS_URL` an in-process Redis stands in: the web app processes `JOB_WORKERS` tenders at a time (default 1) and
+the job is lost on restart, as before. With `REDIS_URL` (a Redis database: `redis://default:<password>@<host>:<port>`,
+or `rediss://` for TLS; not a Redis Cloud account API key), the job survives a restart of the web app, and worker
+processes can take part:
+
+```powershell
+python worker.py --threads 2     # in another terminal, or on another machine sharing TARGET_DIRECTORY
+```
+
+Each worker takes the oldest queued tender, processes it and records the result in Redis and in its folder.
+Workers need the same `.env` as the web app and the same `TARGET_DIRECTORY` (the same machine, or a shared folder):
+the documents, results and OCR cache are there. Set `JOB_WORKERS=0` to leave all the processing to workers; the
+run panel then says "Waiting for a worker…" until one starts. A worker keeps a lease on the tender it processes,
+renewed every 22 seconds; a worker that dies leaves its tender failed ("Processing stopped unexpectedly") once the
+lease runs out after 90 seconds. Ctrl+C stops a worker after the tenders it is on. Each worker logs to
+`LOG_DIRECTORY/worker-<pid>.log`. Every change is made under one Redis lock, held for milliseconds.
+
+Several workers on one machine share its CPU: PaddleOCR already uses every core for one page, so OCR is no faster
+with more of them (see `OCR_CONCURRENCY`), and each worker that OCRs loads its own models (about 1 GB). Workers
+pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on machines of their own.
 
 ## Configuration
 
@@ -158,9 +191,15 @@ can be re-checked quickly; the downloaded files stay in `downloads/`, and shortl
 | `RETRIEVAL_TOP_K` | `8` | Chunks each retrieval query returns |
 | `RETRIEVAL_MAX_CHARS` | `60000` | The most document text sent to the LLM for one check or deep analysis (about 13k tokens). Groq's free tier refuses a request over 8,000 tokens per minute (error 413), and it counts the expected answer too, which for an eligibility check can be 7k tokens on its own: lowering this does not make the free tier enough |
 | `INGEST_WORKERS` | `4` | Files read, and chunk batches embedded and upserted, at the same time |
+| `REDIS_URL` | (none) | The Redis database the job and results are kept in, shared with worker processes (see [Several workers](#run)); unset, an in-process Redis is used |
+| `REDIS_PREFIX` | `tender-processing:` | Put before every Redis key, so one Redis can serve several installs |
+| `JOB_WORKERS` | `1` | Tenders the web app processes at the same time itself; `0` leaves them to `worker.py` processes (needs `REDIS_URL`) |
+| `OCR_CONCURRENCY` | `8` | Scanned pages and images sent to `OCR_MODEL` at the same time in a process, while PaddleOCR reads on, one page at a time |
 | `SUMMARY_MODEL` | `openai/gpt-oss-20b` | No longer used by the pipeline: the documents are indexed instead of summarised |
 | `ASSESSMENT_MODEL` | `openai/gpt-oss-120b` | Groq model that checks the company against the criteria, also on a re-check |
-| `OCR_MODEL` | `qwen/qwen3.8-27b` | Groq model that reads the pages of scanned PDFs; it must accept images (vision) |
+| `OCR_MODEL` | `qwen/qwen3.8-27b` | Groq model that reads the pages of scanned PDFs that PaddleOCR is unsure of or that hold a table; it must accept images (vision) |
+| `PADDLEOCR_MODEL` | `PP-OCRv6_small` | PaddleOCR models that read scanned pages locally (`<name>_det` and `<name>_rec`). `PP-OCRv6_tiny` is about three times faster on a CPU but makes more mistakes |
+| `OCR_MIN_CONFIDENCE` | `0.9` | A scanned page PaddleOCR is less sure of (its mean score per character, 0 to 1) is sent to `OCR_MODEL`; raise it to send more pages |
 | `DEEP_PROFILER_MODEL` | `ASSESSMENT_MODEL` | Groq model of the deep analysis's Company Profiler agent |
 | `DEEP_AUDIT_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Eligibility Audit agent, also for re-examinations |
 | `DEEP_STATUS_REVIEW_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Discrepancy & Status Review agent |
@@ -169,8 +208,12 @@ can be re-checked quickly; the downloaded files stay in `downloads/`, and shortl
 | `TARGET_DIRECTORY` | `./downloads` | Documents are stored in `TARGET_DIRECTORY/<tcno>/` |
 | `DOWNLOAD_TIMEOUT` | `120` | Seconds to wait for the document server |
 | `MAX_DOWNLOAD_MB` | `500` | Larger downloads are aborted |
-| `MAX_FILE_CHARS` | `300000` | A tender file with more text is not indexed and is listed as not checked |
+| `OCR_BUDGET_PAGES` | `50` | The most pages and images a tender's scans may need OCR for before the team is asked (files in the cache need none); 0 is no limit. See [OCR budget](#ocr-budget) |
+| `OCR_BUDGET_USD` | `0.5` | The most that OCR could cost a tender, in US dollars, every page at `OCR_PAGE_COST`, before the team is asked; 0 is no limit |
+| `OCR_PAGE_COST` | `0.0056` | The most one page sent to `OCR_MODEL` costs, in US dollars (2,644 input and 882 output tokens at qwen3.8-27b's $0.80 / $4.00 per million); update it when the model or its price changes |
+| `MAX_FILE_CHARS` | `300000` | A tender file with more text is not indexed and is listed as not checked. A scanned PDF is judged from its page count before OCR, at about 2,000 characters a page (150 pages at the default), and its OCR stops at the page where the text passes the limit |
 | `DECISIONS_FILE` | `TARGET_DIRECTORY/decisions.json` | Where shortlisted / dropped decisions are saved |
+| `CACHE_FILE` | `TARGET_DIRECTORY/cache.sqlite3` | The texts read from tender files (by SHA-256) and their chunks' vectors, so regenerating reads and embeds only changed files; delete it to start afresh |
 | `COMPANY_DETAILS_FILE` | `./company_details.md` | The company profile; edited on the page or by hand |
 | `DEFAULT_FILTERS_FILE` | `./default_filters.json` | The TenderTiger filters that **Default filters** applies; edited by hand (see `GET /api/default-filters`) |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
@@ -253,16 +296,36 @@ model gave even where the bid team has marked it since, and finds the reasons by
    each file to text with MarkItDown, `INGEST_WORKERS` files at a time: PDF, Word `.docx` (including `.doc` files saved in the `.docx` format),
    PowerPoint `.pptx`, and Excel `.xlsx` and `.xls`, each sheet as a table. The older Word and PowerPoint 97-2003
    formats, `.doc` and `.ppt`, cannot be read and are listed as unreadable. A PDF MarkItDown gets no text from,
-   such as a scan, is converted again with the [markitdown-ocr](https://pypi.org/project/markitdown-ocr/) plugin,
-   which sends each page image to `OCR_MODEL` to read; its tokens count towards the criteria step. If any page
-   cannot be read, or no text comes back, the PDF is listed as unreadable. If the link cannot be fetched,
+   such as a scan, is OCR'd page by page ([ocr_service.py](services/ocr_service.py)). So is what the text layer
+   of any other PDF leaves out, added after its text as `## Page <n>` and `## Page <n>, image <k>` sections:
+   - a page with no text layer, scanned or drawn as vector graphics, is OCR'd whole, not read as its logo;
+   - on a page with text, an image at least 300 px on each side, both in its own pixels and as drawn at 200 DPI
+     (a scanned form pasted into an RFP), unless at least 20 words of the text layer lie inside it (a scan that
+     kept its OCR'd text). Logos, stamps and signatures are smaller; the TenderTiger watermark is drawn across
+     the page but is only 350 x 166 pixels.
+
+   Each page or image is rendered at 200 DPI and read on this machine with
+   [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) (`PADDLEOCR_MODEL`), which costs no tokens. Only two
+   kinds go to the vision model `OCR_MODEL` instead: one PaddleOCR is unsure of (mean score per character below
+   `OCR_MIN_CONFIDENCE`), and one with a table (ruled lines crossing in at least 9 places, or 3 lines of text each
+   in 3 or more separate pieces), which the model writes as a markdown table. Their tokens count towards the
+   criteria step; the log says how many each read and why. Blank ones are left out. A scan with a page that cannot
+   be read, or with no text, is listed as unreadable. A PDF with a text layer keeps its text and everything else
+   OCR read, and is listed with only the pages or images that could not be read, such as
+   `RFP.pdf (could not be read: page 132, image 1)`, so the verdict cannot be Eligible until someone checks them.
+   If the link cannot be fetched,
    `TenderTiger Pre-Qualification` is listed with the files that could not be read. With no files and no
    pre-qualification criteria there is nothing to check, and the tender fails.
 
    Files with `drawing` in their name and `.csv` files (GeM item lists) are not read at all: they hold no
    criteria. A BOQ is still read, because it may give the estimated cost. A file whose text is longer than
    `MAX_FILE_CHARS` is not indexed either; it is listed as not checked, with its length, so the verdict cannot be
-   Eligible. Raise the limit in `.env`, restart and regenerate the criteria to read it.
+   Eligible. A scanned PDF is judged before OCR, from its page count at about 2,000 characters a page
+   (`CHARS_PER_PAGE` in [ocr_service.py](services/ocr_service.py), the average of real tender scans), and a scan
+   that passes that check is still OCR'd only up to the page where its text passes the limit, so no time or
+   tokens go on pages that would be dropped with the file. It is listed with its page count and the estimate, or
+   with the characters read and the page OCR stopped at. Raise the limit in `.env`, restart and regenerate the
+   criteria to read it.
 
    **Indexing.** All the sources of the tender go into one Pinecone namespace of its own, `tcno-<tcno>`, in the
    shared index `PINECONE_INDEX_NAME` (serverless, cosine, `PINECONE_EMBED_DIMENSION`; created on first use). The
@@ -278,7 +341,10 @@ model gave even where the bid team has marked it since, and finds the reasons by
    last (a long source list is split over `__manifest__-000`, ... parts written just before it): the sources with
    their chunk counts and the sources that could not be read. A namespace without it was left half-built; a failed
    run deletes it, and one left by a crash is rebuilt the next time the tender is checked. Files are read
-   `INGEST_WORKERS` at a time, but scanned PDFs are OCR'd one at a time, as before. Every read and write names the
+   `INGEST_WORKERS` at a time. PaddleOCR reads one page at a time in a process (one engine already uses every
+   core: 8 pages took 77 s in turn, 71 s on 8 threads and 77 s in 4 processes, and 8 processes ran out of memory),
+   while the pages sent to `OCR_MODEL` go `OCR_CONCURRENCY` (8) at a time, all PDFs together, and PaddleOCR reads on
+   meanwhile; the text keeps page order. Every read and write names the
    tender's namespace, so tenders never see each other's records.
 
    **Retrieval.** Before the LLM is called, the chunks on each kind of requirement are retrieved from the
@@ -338,6 +404,30 @@ view, next to **Re-check**. Regenerating deletes the namespace first, then empti
 reads and indexes the documents again; if the download fails, the tender is left with no namespace, and the next
 check reads the documents again.
 
+**OCR budget.** Before any OCR, a tender's downloaded files are counted for the pages and images OCR would read
+(files in the cache need none; see `ocr_estimate()` in [analysis_service.py](services/analysis_service.py)), and
+what that could cost at most, every one sent to `OCR_MODEL` at `OCR_PAGE_COST`. Over `OCR_BUDGET_PAGES` or
+`OCR_BUDGET_USD`, the tender stops there, before reading anything, and is saved with the status
+`awaiting_approval` (not a failure: nothing went wrong), "Waiting for approval of the OCR" and its `ocr_estimate`
+(`pages`, `cost`, `files`). The page lists it under its own **Needs approval** tab and run count, in a violet tone
+of its own, with **Approve OCR**, which queues it again with `approve_ocr` (its documents are downloaded again). The cost is a
+worst case: most scanned pages are read locally for nothing, and only unsure and table pages go to `OCR_MODEL`.
+Before a bulk regenerate (the **Regenerate criteria** switch), the page asks `/api/ocr-estimate` and shows each
+tender's pages and worst-case cost, counted from the documents already on disk, with **Regenerate** (tenders over
+the budget stop and ask) or **Regenerate and approve OCR**.
+
+**Cache.** Reading and embedding are cached in `CACHE_FILE` (SQLite, [cache_service.py](services/cache_service.py)),
+so regenerating reads and embeds only the files that changed. A file's text, after MarkItDown and OCR, is kept by
+the file's SHA-256 and the reading settings (the MarkItDown version, `PADDLEOCR_MODEL`, `OCR_MIN_CONFIDENCE`,
+`OCR_MODEL`): a file downloaded again unchanged, or the same file in another tender, is not read or OCR'd again,
+and spends no OCR tokens. Each chunk's vector is kept by the SHA-256 of the chunk's text and the embedding model
+and dimension, so an unchanged file's chunks are never embedded twice, and changing `CHUNK_SIZE`,
+`CHUNK_OVERLAP` or the model cannot serve a stale vector. The namespace is still rebuilt and every chunk upserted
+again; only the embedding is skipped, and `index.embedding_tokens` counts only the chunks embedded. A reading
+with pages or images OCR could not read is not kept, so the next run tries them again; nor is a PDF too long to
+OCR. A cache that cannot be read or written is logged and passed over. Delete the file to read and embed
+everything again.
+
 **Namespace limits.** All tenders share one index, each in its own namespace, because Pinecone allows far more
 namespaces per index (100 on Starter, 100,000 on Standard) than indexes per project (5 on Starter, 20 on
 Standard). Once an index's namespaces run out, a new tender fails with "The Pinecone namespace limit is reached":
@@ -346,7 +436,8 @@ checking them again rebuilds the namespace), or move to a larger plan. See
 [docs/pinecone-architecture.md](docs/pinecone-architecture.md).
 
 Expect a minute or two per tender whose documents are read: the documents are no longer summarised by the LLM, so
-the time goes on the download, scanned PDFs (OCR), creating the index (10 to 30 seconds) and embedding. A re-check
+the time goes on the download, scanned PDFs (OCR: PaddleOCR takes 5 to 15 seconds a page on a CPU, so a long scan
+adds minutes), creating the index (10 to 30 seconds) and embedding. A re-check
 takes one LLM call. A download or analysis error marks only that tender as failed, with a plain-language
 `error_title` and `error_action`; the job moves on. The exception is TenderTiger's firewall blocking the app:
 then the queued tenders that need TenderTiger are cancelled, and only re-checks against an index go on. Retrying a failed tender reloads the tender list first.
@@ -354,7 +445,7 @@ Stopping a run cancels the queued tenders; the one in progress
 finishes.
 
 **Token usage.** Every LLM call a tender makes is counted, as the input and output tokens the model reports, in
-two steps: `criteria`, reading the documents (now only the OCR of scanned PDFs), and `assessment`, the final check
+two steps: `criteria`, reading the documents (now only the scanned pages sent to `OCR_MODEL`), and `assessment`, the final check
 that gives the result. The counts are saved with the result as `tokens`, and logged. A failed tender keeps the
 tokens it spent before failing; a re-check spends none on `criteria`. Embedding tokens are billed by Pinecone, not
 counted here; the result's `index.embedding_tokens` gives them for the run that built the index.
@@ -512,13 +603,37 @@ holds an unknown filter or a bad value, naming it.
 Request:
 
 ```json
-{"tcnos": ["100091540", "102309372"], "regenerate": false}
+{"tcnos": ["100091540", "102309372"], "regenerate": false, "approve_ocr": false}
 ```
 
 Response `202`: the job's progress (same shape as `/api/progress`). Starts a job, or adds the tenders to
 the running one; tenders already queued or processing are skipped. A tender with a Pinecone namespace is
 re-checked against it; `regenerate` (optional, default `false`) deletes the namespace of every posted tender,
-downloads and reads its documents again and rebuilds the namespace. `400` for an empty list or an unknown TCNO.
+downloads and reads its documents again and rebuilds the namespace. `approve_ocr` (optional, default `false`)
+reads every scanned page even when the OCR is over the tender's budget (see [OCR budget](#ocr-budget)). `400` for
+an empty list or an unknown TCNO.
+
+### POST /api/ocr-estimate
+
+What regenerating the posted tenders, `{"tcnos": ["100091540", "102309372"]}`, would cost in OCR, counted from
+the documents already downloaded, without reading or queuing anything. The page asks for it before a bulk
+regenerate. Response `200`:
+
+```json
+{
+  "tenders": [
+    {"tcno": "100091540", "downloaded": true, "pages": 12, "cost": 0.0672,
+     "files": [{"name": "scan.pdf", "pages": 12}], "over_budget": false},
+    {"tcno": "102309372", "downloaded": false, "pages": 0, "cost": 0.0, "files": [], "over_budget": false}
+  ],
+  "pages": 12, "cost": 0.0672, "over_budget": 0,
+  "budget": {"pages": 50, "usd": 0.5}, "page_cost": 0.0056
+}
+```
+
+`pages` counts the pages and images OCR would read (files in the cache need none); `cost` is the most they could
+cost in US dollars, every one at `page_cost`; `downloaded` is `false` for a tender with no documents on disk yet,
+counted after its download; `over_budget` says the run will stop at that tender and ask.
 
 ### POST /api/stop
 
@@ -534,6 +649,7 @@ the job's progress, `409` if no job is running.
   "total": 2,
   "completed": 0,
   "failed": 0,
+  "awaiting_approval": 0,
   "cancelled": 0,
   "current": {
     "tcno": "100091540",
@@ -543,6 +659,10 @@ the job's progress, `409` if no job is running.
     "steps": 6,
     "elapsed_seconds": 74
   },
+  "active": [
+    {"tcno": "100091540", "name": "Providing Project General Management Services ...",
+     "stage": "Analysing file 2 of 5: NIT/Annexure-II.pdf", "step": 2, "steps": 6, "elapsed_seconds": 74}
+  ],
   "started_at": "2026-11-02T06:58:00+00:00",
   "finished_at": null,
   "stop_requested": false,
@@ -557,9 +677,11 @@ the job's progress, `409` if no job is running.
 }
 ```
 
-`status` is `idle` (nothing has run since the server started), `running` or `completed`.
-Item `status` is `queued`, `processing`, `completed`, `failed` or `cancelled`; finished items carry the same
-fields as `result` in `/api/tenders`. `step` / `steps` count each file plus the final check (null while
+`status` is `idle` (nothing has run since the server started), `running` or `completed`. `active` lists every
+tender being processed (several, with several workers), and `current` is the first of them, or `null`.
+Item `status` is `queued`, `processing`, `completed`, `failed`, `awaiting_approval` (stopped before any OCR, its
+scans over the [OCR budget](#ocr-budget); counted in `awaiting_approval`, not `failed`) or `cancelled`; finished
+items carry the same fields as `result` in `/api/tenders`. `step` / `steps` count each file plus the final check (null while
 downloading; 1 of 1 for a re-check; the step before the last is indexing). An item's `rechecked` says whether it
 is (or was) checked against its Pinecone namespace. `average_seconds` is the average time of the tenders whose documents were read (by this server or,
 in the saved results, an earlier one), and `average_recheck_seconds` that of the re-checks, used for time estimates
@@ -780,7 +902,9 @@ until the tender is listed again.
 ### DELETE /api/downloads/&lt;tcno&gt;
 
 **Delete** in that popup: deletes everything kept for the tender, so it reads as never checked: its Pinecone
-namespace, its folder (the downloaded documents, the saved result and the deep analysis) and the team's decision.
+namespace, its folder (the downloaded documents, the saved result and the deep analysis), all Redis holds of it
+(its result, and its place in the last run, which is forgotten too when it checked no other tender) and the team's
+decision.
 Only the statuses marked by hand stay, as they are recorded in the company profile. Checking the tender again
 starts from scratch.
 

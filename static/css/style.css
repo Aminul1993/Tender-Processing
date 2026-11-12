@@ -48,6 +48,9 @@
   --none-bg: #F1F1EE;
   --none-fg: #5E6066;
   --none-dot: #B0B2B6;
+  --approval-bg: oklch(0.955 0.035 300);
+  --approval-fg: oklch(0.45 0.13 300);
+  --approval-dot: oklch(0.6 0.15 300);
   --processing-bg: var(--accent-soft);
   --processing-fg: oklch(0.45 0.14 255);
   --processing-dot: oklch(0.6 0.14 255);
@@ -342,6 +345,7 @@ kbd {
 .dot-review { --dot: var(--review-dot); }
 .dot-not { --dot: var(--not-dot); }
 .dot-failed { --dot: var(--failed-dot); }
+.dot-approval { --dot: var(--approval-dot); }
 .dot-none { --dot: var(--none-dot); }
 .dot-processing { --dot: var(--processing-dot); }
 
@@ -1398,6 +1402,7 @@ tbody .cell-drop {
 .tone-review { --tone-bg: var(--review-bg); --tone-fg: var(--review-fg); --tone-dot: var(--review-dot); }
 .tone-not { --tone-bg: var(--not-bg); --tone-fg: var(--not-fg); --tone-dot: var(--not-dot); }
 .tone-failed { --tone-bg: var(--failed-bg); --tone-fg: var(--failed-fg); --tone-dot: var(--failed-dot); }
+.tone-approval { --tone-bg: var(--approval-bg); --tone-fg: var(--approval-fg); --tone-dot: var(--approval-dot); }
 .tone-processing { --tone-bg: var(--processing-bg); --tone-fg: var(--processing-fg); --tone-dot: var(--processing-dot); }
 
 @keyframes tp-pulse {
@@ -1922,6 +1927,15 @@ tbody .cell-drop {
   text-align: center;
 }
 
+/* What a popup is waiting for (the analysis, a folder scan, an OCR count): the empty line's place, in meta grey */
+.modal-loading {
+  margin: 0;
+  padding: 24px 0;
+  color: var(--meta);
+  font-size: 14px;
+  text-align: center;
+}
+
 /* A failed scan: what went wrong, then Try again */
 .closed-empty .message-error {
   margin: 0 0 14px;
@@ -1929,6 +1943,11 @@ tbody .cell-drop {
 
 .closed-unknown {
   margin-top: 28px;
+}
+
+/* The OCR estimate before a regenerate: a tender over the budget says it will wait for approval, in that tone */
+.estimate-over td:first-child .closed-meta:last-child {
+  color: var(--approval-fg);
 }
 
 .closed-subtitle {
@@ -1987,11 +2006,13 @@ tbody .cell-drop {
     text-align: left;
   }
 
+  /* Flush right, so a wide "5 files · 12.0 MB" under it never pulls one Delete out of line with the rest */
   .closed-table .closed-action {
     grid-row: 1;
     grid-column: 2;
     width: auto;
     align-self: start;
+    justify-self: end;
   }
 
   .closed-name {
@@ -2484,8 +2505,9 @@ select.select.status-select {
   overflow-wrap: anywhere;
 }
 
-/* The namespace's name, an identifier: mono at the source files' size */
-.details-criteria p .mono {
+/* The namespace's name, an identifier: mono at the source files' size (also the names in the help) */
+.details-criteria p .mono,
+.help-item .mono {
   color: var(--ink-3);
   font-size: 12px;
 }
@@ -3166,7 +3188,8 @@ input.profile-input {
   .tender-table tbody .cell-tender { grid-area: tender; padding-right: 0 !important; }
   .tender-table tbody .cell-verdict { grid-area: verdict; }
   .tender-table tbody .cell-closes { grid-area: closes; }
-  .tender-table tbody .cell-value { grid-area: value; align-self: end; padding-right: 0 !important; }
+  /* Top-aligned, so its label shares a line with Closes and the amount sits level with the date */
+  .tender-table tbody .cell-value { grid-area: value; align-self: start; padding-right: 0 !important; }
   .tender-table tbody .cell-drop { grid-area: drop; align-self: start; }
 
   .cell-closes::before,

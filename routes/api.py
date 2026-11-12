@@ -131,6 +131,15 @@ class ProcessRequest(BaseModel):
     # Delete the tender's Pinecone namespace, download and read the documents again and rebuild the namespace,
     # instead of re-checking against the namespace an earlier run built
     regenerate: bool = False
+    # Read every scanned page even when the OCR is over the tender's budget (OCR_BUDGET_PAGES / OCR_BUDGET_USD),
+    # instead of stopping before it to ask
+    approve_ocr: bool = False
+
+
+class EstimateRequest(BaseModel):
+    model_config = ConfigDict(coerce_numbers_to_str=True)
+
+    tcnos: list[str] = Field(min_length=1)
 
 
 class DecisionRequest(BaseModel):
@@ -260,16 +269,26 @@ def default_filters(path: DefaultFiltersFile):
 @api.post('/process-tenders', status_code=202)
 def process_tenders(payload: ProcessRequest, processor: Processor):
     """
-    Queues the tenders posted as {"tcnos": ["...", ...], "regenerate": false}, in that order. Starts a job, or
-    adds them to the running one. A tender with a Pinecone namespace is re-checked against it unless regenerate is
-    true (then the namespace is deleted and rebuilt from the documents). Returns 202 with the job's progress.
+    Queues the tenders posted as {"tcnos": ["...", ...], "regenerate": false, "approve_ocr": false}, in that order.
+    Starts a job, or adds them to the running one. A tender with a Pinecone namespace is re-checked against it unless
+    regenerate is true (then the namespace is deleted and rebuilt from the documents). A tender whose scans need more
+    OCR than the budget stops before it, unless approve_ocr is true. Returns 202 with the job's progress.
     """
     tcnos = list(dict.fromkeys(payload.tcnos))  # drop duplicates, keep order
     tenders = [tender_service.get_tender(tcno) for tcno in tcnos]
     unknown = [tcno for tcno, tender in zip(tcnos, tenders) if tender is None]
     if unknown:
         raise HTTPException(400, f"Unknown TCNO(s): {', '.join(unknown)}. Reload the tender list and try again.")
-    return processor.start(tenders, regenerate=payload.regenerate)
+    return processor.start(tenders, regenerate=payload.regenerate, approve_ocr=payload.approve_ocr)
+
+
+@api.post('/ocr-estimate')
+def ocr_estimate(payload: EstimateRequest, processor: Processor):
+    """
+    What regenerating the posted tenders, {"tcnos": [...]}, would cost in OCR, from the documents already
+    downloaded: see TenderProcessor.ocr_estimates(). Nothing is queued or read.
+    """
+    return processor.ocr_estimates(payload.tcnos)
 
 
 @api.post('/stop', status_code=202)
@@ -380,7 +399,7 @@ def closed_downloads(processor: Processor):
 def delete_downloads(tcno: str, processor: Processor, decisions: Decisions, deep: DeepAnalyses):
     """
     Deletes everything kept for the tender: its Pinecone namespace, its downloaded documents, saved result and deep
-    analysis, and the team's decision, so it reads as never checked. Only the statuses marked by hand stay, recorded
+    analysis, all Redis holds of it, and the team's decision, so it reads as never checked. Only the statuses marked by hand stay, recorded
     in the company profile. Returns {"tcno", "files", "bytes", "namespace_deleted"}: how many documents went, their
     size, and whether there was a namespace.
     """

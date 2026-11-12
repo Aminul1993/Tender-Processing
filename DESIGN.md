@@ -21,6 +21,9 @@ colors:
   none-bg: "#F1F1EE"
   none-fg: "#5E6066"
   none-dot: "#B0B2B6"
+  approval-bg: "oklch(0.955 0.035 300)"
+  approval-fg: "oklch(0.45 0.13 300)"
+  approval-dot: "oklch(0.6 0.15 300)"
   processing-fg: "oklch(0.45 0.14 255)"
   processing-dot: "oklch(0.6 0.14 255)"
   bg: "#F5F5F2"
@@ -280,7 +283,7 @@ Depth is almost absent. Panels are separated by a 1px warm line and a 14px radiu
 **Key Characteristics:**
 - Warm-grey paper ground (#F5F5F2) with white bordered panels; no decorative imagery.
 - IBM Plex Sans for reading, IBM Plex Mono for identifiers and money, tabular figures everywhere numbers line up.
-- One blue accent for action and selection; five verdict tones that each own a bg / fg / dot triple.
+- One blue accent for action and selection; six status tones that each own a bg / fg / dot triple.
 - Near-black chrome only for the app bar and floating transient bars.
 - Flat at rest; shadow only on things floating above the page.
 - Every narrow layout keeps the verdict on screen.
@@ -302,6 +305,7 @@ Each verdict owns a triple: a pale background, an AA-legible foreground, and a m
 - **Brick Red** (`not-*`): Not eligible (API value "Not Eligible"); also "Not met", errors, closing within 7 days, and the one destructive action (Delete in Closed tenders).
 - **Slate** (`failed-*`): a run that failed for this tender; neutral, because a failure says nothing about eligibility.
 - **Unread Grey** (`none-*`): not processed yet; also the default days-left pill.
+- **Approval Violet** (`approval-*`): a tender waiting for the team to approve its OCR (status `awaiting_approval`): no verdict yet, and not a failure, so neither the verdict hues nor slate; also the over-budget note in the OCR estimate before a regenerate.
 - **Processing Blue** (`processing-fg`, `processing-dot` on `accent-soft`): a tender being checked right now.
 
 ### Neutral
@@ -394,7 +398,7 @@ Quiet and solid; one primary per area.
 - **Transitions:** background, border and colour at 0.15s on `cubic-bezier(.16, 1, .3, 1)`.
 
 ### Chips (verdict pills)
-- **Style:** fully round, 4px 10px padding, a 6px tone dot then the label, 600 12px in the tone's fg on the tone's bg. Labels are the display forms "Eligible", "Not eligible", "Needs review", "Failed", "Not processed", "Processing".
+- **Style:** fully round, 4px 10px padding, a 6px tone dot then the label, 600 12px in the tone's fg on the tone's bg. Labels are the display forms "Eligible", "Not eligible", "Needs review", "Needs approval", "Failed", "Not processed", "Processing".
 - **State:** a pill with a result is a button that opens the analysis; hover adds an inset 1px ring mixed from its fg and nudges a chevron 2px right. The processing dot pulses (1s, opacity 1 to .35).
 - **Days-left pill:** 11px 600 on `none` by default; ochre within 20 days, red within 7 days and "Closes today".
 

@@ -16,7 +16,6 @@ from routes.api import EXCEPTION_HANDLERS, api  # noqa: E402
 from routes.pages import pages  # noqa: E402
 from services.decision_service import DecisionStore  # noqa: E402
 from services.deep_analysis_service import DeepAnalysisRunner  # noqa: E402
-from services.pinecone_service import PineconeService  # noqa: E402
 from services.processing_service import TenderProcessor  # noqa: E402
 from utils.logging_setup import configure_logging  # noqa: E402
 
@@ -32,15 +31,13 @@ def create_app(config_object=Config, vector_store=None):
     app = FastAPI(title='Tender Processing', exception_handlers=EXCEPTION_HANDLERS)
 
     config_object.TARGET_DIRECTORY.mkdir(parents=True, exist_ok=True)
-    app.state.tender_processor = TenderProcessor(
-        config_object.TARGET_DIRECTORY,
-        download_timeout=config_object.DOWNLOAD_TIMEOUT,
-        max_download_bytes=config_object.MAX_DOWNLOAD_MB * 1024 * 1024,
-        max_file_chars=config_object.MAX_FILE_CHARS,
-        company_file=config_object.COMPANY_DETAILS_FILE,
-        index=vector_store or PineconeService.from_config(config_object),
-        workers=config_object.INGEST_WORKERS,
-    )
+    job_workers = config_object.JOB_WORKERS
+    if job_workers < 1 and not config_object.REDIS_URL:
+        log.warning('JOB_WORKERS is 0 but REDIS_URL is not set, so no worker process can reach the job: the app '
+                     'processes one tender at a time itself')
+        job_workers = 1
+    app.state.tender_processor = TenderProcessor.from_config(config_object, index=vector_store,
+                                                             job_workers=job_workers)
     app.state.company_file = config_object.COMPANY_DETAILS_FILE
     app.state.default_filters_file = config_object.DEFAULT_FILTERS_FILE
     app.state.decisions = DecisionStore(
@@ -67,6 +64,7 @@ def create_app(config_object=Config, vector_store=None):
 if __name__ == '__main__':
     import uvicorn
 
-    # Processing state lives in memory, so keep one process: no reload, no workers. The thread pool serves
-    # requests during a job. log_config=None keeps the logging set up by create_app().
+    # One web process: the tender list, the deep analyses and the default in-process Redis live in its memory. Scale
+    # the processing with worker processes instead (worker.py, with REDIS_URL). log_config=None keeps the logging set
+    # up by create_app().
     uvicorn.run(create_app(), host='127.0.0.1', port=int(os.getenv('PORT', '5000')), log_config=None)

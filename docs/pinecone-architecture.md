@@ -28,7 +28,7 @@ namespace never returns another namespace's records. Each chunk also carries its
 flowchart LR
     TT[TenderTiger] -->|documents zip,<br/>pre-qualification, tender row| DL[download_service]
     DL --> FS[(downloads/&lt;tcno&gt;/<br/>files, eligibility_result.json,<br/>deep_analysis.json)]
-    FS --> EX[analysis_service.read_documents<br/>MarkItDown, OCR fallback,<br/>INGEST_WORKERS in parallel]
+    FS --> EX[analysis_service.read_documents<br/>MarkItDown; OCR of scans, pages<br/>with no text layer, large images:<br/>PaddleOCR, unsure/table ones<br/>to OCR_MODEL; INGEST_WORKERS<br/>in parallel]
     EX --> PS[pinecone_service.PineconeService<br/>chunk, embed, batch upsert,<br/>manifest last]
     PS <-->|inference.embed<br/>llama-text-embed-v2| PC
     subgraph PC[Pinecone index: tender-processing]
@@ -89,7 +89,7 @@ sequenceDiagram
     P->>TT: download documents (folder emptied first)
     P->>A: process_tender_files(folder, index, tender)
     A->>TT: pre-qualification text
-    A->>A: read_documents (parallel, one OCR at a time)
+    A->>A: read_documents (parallel; PaddleOCR a page at a time, vision pages 8 at a time)
     A->>S: ingest(tcno, documents, unreadable)
     loop batches of 96 chunks, INGEST_WORKERS at a time
         S->>PC: inference.embed (passage)
@@ -194,7 +194,7 @@ get `namespace`.
 2. **Dry run:** `python scripts/migrate_to_pinecone.py --dry-run`, then run it for real. It reads the documents
    already on disk and takes the pre-qualification text from the old `eligibility_criteria.md`, so no TenderTiger
    request is made. It builds each namespace, then deletes the `.md` file. A tender with no readable text keeps
-   its file. Scanned PDFs are OCR'd again, which costs Groq tokens. Complete namespaces are skipped, so the script
+   its file. Scanned PDFs are OCR'd again: PaddleOCR locally, and Groq tokens for their unsure and table pages. Complete namespaces are skipped, so the script
    can be re-run. It stops cleanly at the namespace limit.
 3. **Start the app.** Saved results load with `namespace` filled in. A tender that was not migrated is downloaded
    and indexed the next time it is checked.
@@ -212,7 +212,7 @@ get `namespace`.
 | **Recall.** Retrieval sends excerpts, where the old pipeline summarised every page | An unusually worded criterion may be missed | 13 searches over 6 kinds of requirement; the pre-qualification text is always included; 60k-character budget. Tune `ASSESSMENT_QUERIES`, `RETRIEVAL_TOP_K` and `RETRIEVAL_MAX_CHARS`, and compare verdicts on a sample of tenders |
 | **Partial failure** | Half-built namespace | A failed run deletes it. One left by a crash is never trusted and is rebuilt on the next check. Calls are retried with backoff on 408/429/5xx and network errors |
 | **Pinecone unreachable** | Checks fail | The tender list still loads (`has_indexed_criteria` false; the failure is cached for 30 s). Processing fails fast, before any download |
-| **Rate limits** (embedding, upserts, `describe_namespace`) | Slower ingestion | Retries with jitter on top of the SDK's own; workers capped by `INGEST_WORKERS`; scanned PDFs OCR'd one at a time |
+| **Rate limits** (embedding, upserts, `describe_namespace`) | Slower ingestion | Retries with jitter on top of the SDK's own; workers capped by `INGEST_WORKERS`; PaddleOCR one page at a time per process, vision pages `OCR_CONCURRENCY` at a time |
 | **Manifest size** | Hundreds of files exceed 40 KB of metadata | Split over part records; a missing part means incomplete, never half-read |
 | **Changing the embedding model or dimension** | The index's dimension is fixed | The app refuses a mismatched index with a clear error. Set a new `PINECONE_INDEX_NAME` and run `migrate_to_pinecone.py --force` |
 | **Migration** deletes `eligibility_criteria.md` | Hand edits to those files are lost | The file is kept when nothing could be indexed, and `--keep-criteria-files` keeps all of them |

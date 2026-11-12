@@ -12,15 +12,18 @@ class _SkipProgressPolling(logging.Filter):
         return '/api/progress' not in record.getMessage()
 
 
-def configure_logging(level, log_directory):
-    """Sends log records to the console and to log_directory/app.log (rotated at 5 MB, 3 backups kept)."""
+def configure_logging(level, log_directory, filename='app.log'):
+    """
+    Sends log records to the console and to log_directory/filename (rotated at 5 MB, 3 backups kept). Each process
+    needs a file of its own: a file shared by processes cannot be rotated on Windows.
+    """
     log_directory.mkdir(parents=True, exist_ok=True)
     formatter = logging.Formatter(LOG_FORMAT)
 
     console = logging.StreamHandler()
     console.setFormatter(formatter)
     file_handler = RotatingFileHandler(
-        log_directory / 'app.log', maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
+        log_directory / filename, maxBytes=5 * 1024 * 1024, backupCount=3, encoding='utf-8'
     )
     file_handler.setFormatter(formatter)
 

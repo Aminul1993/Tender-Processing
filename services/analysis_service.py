@@ -14,14 +14,15 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from types import SimpleNamespace
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
-from markitdown import MarkItDown
+from markitdown import MarkItDown, __version__ as MARKITDOWN_VERSION
 
 from ext import (ASSESSMENT_MODEL, COMPANY_DETAILS_FILE, OCR_MODEL, TenderTigerBlocked, assess_eligibility,
                  company_details, make_model, prequalification_criteria)
+from services.cache_service import file_sha256
 from services.company_service import profile_for_tender
+from services.ocr_service import OCR_PAGE_COST, OCR_SETTINGS, ScanTooLong, add_ocr, ocr_parts
 from services.pinecone_service import Document, document_type
 from services.tender_service import to_row
 
@@ -49,10 +50,9 @@ DEEP_ANALYSIS_FILE = 'deep_analysis.json'
 # tokens and held none) and GeM item lists (.csv of items, quantities and consignees). A BOQ is still read,
 # because it may give the estimated cost the criteria depend on.
 _NO_CRITERIA = re.compile(r'drawing|\.csv$', re.IGNORECASE)
-# What markitdown-ocr writes besides the text it reads: a heading per page, and notes on pages it could not read
-_OCR_FILLER = re.compile(r'^\s*(## Page \d+|\*\[(No text could be extracted|Error)\b.*\]\*)\s*$', re.MULTILINE)
-# Scanned PDFs are OCR'd one at a time, whatever the number of files read in parallel
-_OCR_SLOT = threading.Lock()
+# What a file's text depends on besides the file, the key of its cached text with the file's SHA-256: a text read
+# under other settings is read again. Bump the number when the reading code changes what it reads.
+_READER = f'1; MarkItDown {MARKITDOWN_VERSION}; OCR {OCR_SETTINGS}'
 
 # What the eligibility check retrieves from the tender's namespace before calling the LLM: a few searches for each kind
 # of requirement, so every kind gets its share of the excerpts (see PineconeService.retrieve())
@@ -86,9 +86,49 @@ ASSESSMENT_QUERIES = {
 }
 
 
+class OcrBudgetExceeded(RuntimeError):
+    """The OCR a tender's files need is over its budget; estimate is what ocr_estimate() found."""
+
+    def __init__(self, estimate, budget):
+        self.estimate = estimate
+        limits = [f"{budget['pages']} pages" if budget.get('pages') else '',
+                  f"${budget['usd']:.2f}" if budget.get('usd') else '']
+        super().__init__(f"The scans need {estimate['pages']} page(s) of OCR, up to ${estimate['cost']:.2f}: over "
+                         f"the OCR budget of {' or '.join(limit for limit in limits if limit)} a tender")
+
+
+def ocr_estimate(tcno_folder, cache=None, max_file_chars=300_000):
+    """
+    The OCR the tender's files would need, told without any OCR: {'pages', 'cost', 'files'}, where pages counts the
+    pages and images to OCR, cost is the most that can cost (every one sent to OCR_MODEL, at OCR_PAGE_COST, in US
+    dollars) and files is [{'name', 'pages'}] for each PDF that needs any. A file read before (in cache) needs none,
+    nor does one that is not read (_NO_CRITERIA) or that is too long to OCR (max_file_chars).
+    """
+    tcno_folder = Path(tcno_folder)
+    files = []
+    for path in tender_files(tcno_folder):
+        if path.suffix.lower() != '.pdf' or _NO_CRITERIA.search(path.name):
+            continue
+        if cache and cache.text(file_sha256(path), _READER) is not None:
+            continue
+        pages = ocr_parts(path, max_file_chars)
+        if pages:
+            files.append({'name': path.relative_to(tcno_folder).as_posix(), 'pages': pages})
+    pages = sum(file['pages'] for file in files)
+    return {'pages': pages, 'cost': round(pages * OCR_PAGE_COST, 4), 'files': files}
+
+
+def over_budget(estimate, budget):
+    """Whether an ocr_estimate() is over budget, {'pages', 'usd'}: a limit of 0 or None is no limit."""
+    budget = budget or {}
+    return bool((budget.get('pages') and estimate['pages'] > budget['pages'])
+                or (budget.get('usd') and estimate['cost'] > budget['usd']))
+
+
 class TokenUsage:
     """
-    Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents: the OCR of scanned PDFs)
+    Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents: the pages of scanned PDFs
+    sent to the vision model)
     and 'assessment' (checking the company against the criteria retrieved, for the final result). Given to
     process_tender_files() or recheck_saved_criteria(), it still holds the tokens spent before a failure. Other steps
     can be named instead, such as the agents of a deep analysis. Embedding tokens are Pinecone's, not counted here.
@@ -124,7 +164,8 @@ def tender_files(tcno_folder):
 
 
 def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, company_file=COMPANY_DETAILS_FILE,
-                         prequalification_link=None, tender=None, usage=None, max_file_chars=300_000, workers=4):
+                         prequalification_link=None, tender=None, usage=None, max_file_chars=300_000, workers=4,
+                         cache=None, ocr_budget=None):
     """
     Checks the company profile saved in company_file against the eligibility criteria of a tender: every file
     under tcno_folder, the pre-qualification criteria behind prequalification_link (the tender's TenderTiger
@@ -147,7 +188,11 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
 
     on_progress, if given, is called with a short status message before each step, plus step and steps
     (1-based position and total: one per file, then indexing, then the final check) when they are known.
-    usage, a TokenUsage, if given, counts the tokens of reading scanned files and of the final check.
+    usage, a TokenUsage, if given, counts the tokens of reading scanned files and of the final check. cache, a
+    cache_service.Cache, if given, holds the text of files read before, so an unchanged file is not read again (its
+    vectors are cached by index, when it has the cache too). ocr_budget, {'pages', 'usd'}, if given, is the most OCR
+    the files may need (see ocr_estimate(); 0 is no limit): over it, OcrBudgetExceeded is raised before anything is
+    read, so the team can approve the OCR first.
     Raises RuntimeError when GROQ_API_KEY is missing, the company profile is empty, or there is nothing to check
     (no files and no pre-qualification criteria); VectorStoreError when the index cannot be built or searched;
     errors from the final LLM call propagate (the namespace is kept, so a re-check can follow).
@@ -187,13 +232,21 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
         raise RuntimeError(f'No tender files to check, and the pre-qualification criteria {reason}.')
     if tender:
         documents.insert(0, Document(TENDER_DATA_SOURCE, tender_data_text(tender), 'tender_data'))
+    if ocr_budget:
+        report('Estimating the OCR of scanned pages')
+        estimate = ocr_estimate(tcno_folder, cache, max_file_chars)
+        if over_budget(estimate, ocr_budget):
+            log.warning('Tender %s: %d page(s) to OCR, up to $%.2f, is over the OCR budget %s; asking first', tcno,
+                        estimate['pages'], estimate['cost'], ocr_budget)
+            raise OcrBudgetExceeded(estimate, ocr_budget)
     # Before reading: a Pinecone plan with no room for the namespace fails the tender before any OCR is paid for
     # (TenderProcessor has already made it before downloading; this empties it again, which is quick)
     index.reset_namespace(tcno, on_progress=report)
 
     steps = len(files) + 2
     read, unreadable = read_documents(tcno_folder, files, usage, max_file_chars=max_file_chars, workers=workers,
-                                      on_progress=lambda message, number: report(message, step=number, steps=steps))
+                                      on_progress=lambda message, number: report(message, step=number, steps=steps),
+                                      cache=cache)
     documents += read
     skipped += unreadable
 
@@ -210,12 +263,16 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
     return analysis
 
 
-def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4, on_progress=None):
+def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4, on_progress=None, cache=None):
     """
-    Converts each of files (under tcno_folder) to text with MarkItDown, workers files at a time; a PDF with no text
-    layer, such as a scan, is read with OCR (OCR_MODEL, its tokens counted in usage under 'criteria').
+    Converts each of files (under tcno_folder) to text with MarkItDown, workers files at a time; what a PDF's text
+    layer leaves out (a scan, pages with no text layer, large images) is read with OCR (see ocr_service.add_ocr(); the
+    tokens of the parts sent to OCR_MODEL are counted in usage under 'criteria'). With cache (a cache_service.Cache),
+    a file read before, the same to the byte (SHA-256) and under the same settings, is not read again.
     Returns (documents, skipped) in the order of files: a Document for each file with text, and the names of the
-    files with none or too much (over max_file_chars). on_progress, if given, is called with (message, number) as
+    files with none or too much (over max_file_chars; a scan's OCR stops once it is known to be), or, for a PDF with
+    a text layer indexed without them, the pages and images OCR could not read. on_progress, if given, is called
+    with (message, number) as
     each file is done, number counting the files done so far.
     """
     report = on_progress or (lambda message, number: None)
@@ -225,19 +282,33 @@ def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4,
     def read(path):
         # Relative path, because nested zips often contain files with the same name
         name = path.relative_to(tcno_folder).as_posix()
-        if not hasattr(local, 'md'):
-            local.md = MarkItDown()
-        try:
-            text = (local.md.convert(path).markdown or '').strip()
-        except Exception:
-            log.warning('Could not read %s', path, exc_info=True)
-            text = ''
-        if not text and path.suffix.lower() == '.pdf':
-            # No text layer, as in a scan: read the page images with OCR (a reader per file: it keeps state). One
-            # scan at a time, as before files were read in parallel: OCR calls in parallel would hit Groq's rate
-            # limit, and one page refused makes the whole file unreadable
-            with _OCR_SLOT:
-                text = _OcrReader(usage.track(make_model(OCR_MODEL), 'criteria')).read(path)
+        digest = file_sha256(path) if cache else None
+        text = cache.text(digest, _READER) if cache else None
+        unread = []  # the pages and images of a PDF with a text layer that OCR could not read
+        if text is not None:
+            log.info('Read %s from the cache: unchanged since it was read', name)
+        else:
+            if not hasattr(local, 'md'):
+                local.md = MarkItDown()
+            try:
+                text = (local.md.convert(path).markdown or '').strip()
+            except Exception:
+                log.warning('Could not read %s', path, exc_info=True)
+                text = ''
+            if path.suffix.lower() == '.pdf' and len(text) <= max_file_chars:
+                # OCR what the text layer leaves out: every page of a scan, pages with no text layer, large images
+                # (one PDF at a time). add_ocr() stops as soon as the file is known to be too long, so no OCR is
+                # spent on pages that would only be dropped with it.
+                try:
+                    text, unread = add_ocr(path, text, usage.track(make_model(OCR_MODEL), 'criteria'),
+                                           max_chars=max_file_chars)
+                except ScanTooLong as error:
+                    log.warning('Not reading %s: %s is over MAX_FILE_CHARS (%d)', name, error, max_file_chars)
+                    return name, None, f'{name} (too long: {error}; the MAX_FILE_CHARS limit is {max_file_chars:,})'
+            # Only a whole reading is kept: one with parts OCR could not read (often a timeout) or no text is tried
+            # again next time, and so is a PDF too long to OCR, whose text so far is its text layer alone
+            if cache and text and not unread and len(text) <= max_file_chars:
+                cache.save_text(digest, _READER, text)
         if not text:
             log.info('No readable text in %s', name)
             return name, None, name
@@ -247,7 +318,9 @@ def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4,
             log.warning('Not reading %s: %d characters is over MAX_FILE_CHARS (%d)', name, len(text), max_file_chars)
             return name, None, f'{name} (too long: {len(text):,} characters; the MAX_FILE_CHARS limit is {max_file_chars:,})'
         log.info('Read %s: %d characters', name, len(text))
-        return name, Document(name, text, document_type(name)), None
+        # Indexed without the parts OCR could not read, which are listed so the check is not taken as complete
+        missing = f"{name} (could not be read: {'; '.join(unread)})" if unread else None
+        return name, Document(name, text, document_type(name)), missing
 
     results = {}
     if files:
@@ -275,48 +348,6 @@ def tender_data_text(tender):
          f"{row.get('currency') or 'INR'} {value:,.2f}" if value else 'not listed'),
     ]
     return '\n'.join(f'{label}: {text}' for label, text in lines if text)
-
-
-class _OcrReader:
-    """
-    Reads scanned PDFs with markitdown-ocr, which sends each page image to llm (an OCR_MODEL chat model) to read.
-    markitdown-ocr calls an OpenAI client, so this stands in for one: client.chat.completions.create().
-    """
-
-    def __init__(self, llm):
-        self._llm = llm
-        self._error = None  # the last failed call of the current read()
-        self.chat = SimpleNamespace(completions=self)
-        self._md = MarkItDown(enable_plugins=True, llm_client=self, llm_model=OCR_MODEL)
-
-    def create(self, model, messages, **options):
-        """OpenAI's chat.completions.create(), answered by llm (already set to OCR_MODEL)."""
-        try:
-            reply = self._llm.invoke(messages)
-        except Exception as error:
-            # markitdown-ocr leaves out a page it could not read without a word, so the failure is kept for read()
-            self._error = error
-            raise
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=reply.content))])
-
-    def read(self, path):
-        """
-        The text OCR'd from the PDF at path; '' when there is none, or when a page could not be read, so the
-        file is listed as not checked rather than checked with pages missing.
-        """
-        self._error = None
-        try:
-            text = (self._md.convert(path).markdown or '').strip()
-        except Exception:
-            log.warning('Could not OCR %s', path, exc_info=True)
-            return ''
-        if self._error or '*[Error' in text:
-            log.warning('Could not OCR every page of %s: %s', path.name, self._error or 'a page could not be rendered')
-            return ''
-        if not _OCR_FILLER.sub('', text).strip():
-            return ''
-        log.info('Read %s with OCR (%s)', path.name, OCR_MODEL)
-        return text
 
 
 def recheck_saved_criteria(tcno, *, index, on_progress=None, company_file=COMPANY_DETAILS_FILE, usage=None,
@@ -538,6 +569,8 @@ def parse_criteria(assessment):
         status_column = columns['status']
         if status_column >= len(cells) or set(cells[status_column]) <= set('-: '):
             continue  # the |---|---| separator row, or a malformed row
+        if all(set(cell) <= set('-–—: ') for cell in cells):
+            continue  # | — | — | — |: the model's way of saying the excerpts hold no criteria
         row = {key: cells[index] if index is not None and index < len(cells) else ''
                for key, index in columns.items()}
         row['status'] = _status(row['status'])

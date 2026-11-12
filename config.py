@@ -17,8 +17,17 @@ class Config:
     # A tender file whose text is longer is not sent to the LLM (300,000 characters is about 100k tokens) and is
     # listed as not checked
     MAX_FILE_CHARS = int(os.getenv('MAX_FILE_CHARS', '300000'))
+    # The most OCR a tender's scans may need before the team is asked: pages and images to OCR (files read before are
+    # cached and need none), and what they could cost at most, in US dollars, at OCR_PAGE_COST each. Over either, the
+    # tender stops before any OCR and waits for approval. 0 is no limit.
+    OCR_BUDGET_PAGES = int(os.getenv('OCR_BUDGET_PAGES', '50'))
+    OCR_BUDGET_USD = float(os.getenv('OCR_BUDGET_USD', '0.5'))
     # The team's shortlisted / dropped decisions; None means TARGET_DIRECTORY/decisions.json
     DECISIONS_FILE = os.getenv('DECISIONS_FILE')
+    # The texts read from tender files (by SHA-256) and the vectors of their chunks, so an unchanged file is never
+    # read or embedded twice (services/cache_service.py); SQLite. Delete it to read and embed everything again.
+    # None means TARGET_DIRECTORY/cache.sqlite3
+    CACHE_FILE = os.getenv('CACHE_FILE')
     # The company profile (markdown) every tender is checked against; edited on the page
     COMPANY_DETAILS_FILE = Path(os.getenv('COMPANY_DETAILS_FILE', BASE_DIR / 'company_details.md')).resolve()
     # The TenderTiger filters that Default filters on the page applies (JSON, edited by hand)
@@ -47,6 +56,15 @@ class Config:
     RETRIEVAL_MAX_CHARS = int(os.getenv('RETRIEVAL_MAX_CHARS', '60000'))
     # Files read, and chunk batches embedded and upserted, at the same time
     INGEST_WORKERS = int(os.getenv('INGEST_WORKERS', '4'))
+
+    # Where the processing job and the results live, so worker processes (worker.py) can share the work: a Redis URL
+    # such as redis://default:<password>@<host>:<port> (rediss:// for TLS). Unset, an in-process Redis is used: one
+    # process, and the job (not the results, saved in the tender folders) is lost on restart.
+    REDIS_URL = os.getenv('REDIS_URL') or None
+    # Put before every key, so one Redis can serve several installs
+    REDIS_PREFIX = os.getenv('REDIS_PREFIX', 'tender-processing:')
+    # Tenders the web app processes at the same time itself; 0 leaves them all to worker processes (REDIS_URL only)
+    JOB_WORKERS = int(os.getenv('JOB_WORKERS', '1'))
 
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
     LOG_DIRECTORY = Path(os.getenv('LOG_DIRECTORY', BASE_DIR / 'logs')).resolve()
