@@ -1,12 +1,11 @@
 """
 Runs download -> extract -> index in Pinecone -> retrieve -> assess for the queued tenders, on as many workers as
-run: threads of the web app and worker processes (worker.py), sharing the job's state in Redis. A tender whose documents an earlier run indexed (its Pinecone namespace tcno-<tcno> exists) is
-re-checked against that namespace instead, unless it is queued to regenerate: then its namespace is deleted, the
-documents downloaded again and the namespace rebuilt. Each result is saved in the tender's folder and read back when the app
-starts, so it survives a restart.
+run: threads of the web app and worker processes (worker.py), sharing the job's state in PostgreSQL. A tender whose
+documents an earlier run indexed (its Pinecone namespace tcno-<tcno> exists) is re-checked against that namespace
+instead, unless it is queued to regenerate: then the documents are downloaded and read again and the namespace
+brought up to date, only the sources that changed being upserted again. Each result is saved in the database.
 """
 import copy
-import json
 import logging
 import os
 import re
@@ -16,21 +15,22 @@ import threading
 import time
 import uuid
 from collections import Counter
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from pathlib import Path
 
-from ext import COMPANY_DETAILS_FILE, TENDERTIGER_BLOCKED, update_company_details
-from services.analysis_service import (RESULT_FILE, TENDER_DATA_SOURCE, OcrBudgetExceeded, TokenUsage, criterion_key,
+import psycopg
+
+from ext import TENDERTIGER_BLOCKED
+from services.analysis_service import (OcrBudgetExceeded, TokenUsage, criterion_key,
                                        jv_verdict, ocr_estimate, over_budget, process_tender_files,
                                        recheck_saved_criteria, statuses_verdict, tender_files)
 from services.cache_service import Cache
-from services.company_service import record_mark
+from services.company_service import CompanyStore
 from services.job_state import LEASE_SECONDS, JobState
 from services.ocr_service import OCR_PAGE_COST
 from services.download_service import DownloadError, download_tender_documents
 from services.pinecone_service import NamespaceIncomplete, PineconeService, QuotaExceeded, VectorStoreError
-from services.tender_service import closing_date, has_documents, prequalification_url
+from services.tender_service import closing_date, get_tender, has_documents, prequalification_url
 from utils.files import safe_name
 
 log = logging.getLogger(__name__)
@@ -48,8 +48,8 @@ IDLE_PROGRESS = {
 # ocr_estimate: for a tender awaiting approval, the OCR it needs (see analysis_service.ocr_estimate()).
 SUMMARY_KEYS = ('status', 'verdict', 'score', 'error', 'error_title', 'error_action', 'checks', 'processed_at',
                 'rechecked', 'namespace', 'ocr_estimate')
-# A result's brief in the state (see JobState.briefs()): its summary, and what the run estimates and the folder scan
-# need
+# A result's brief in the state (see JobState.briefs()): its summary, and what the run estimates and the closed
+# downloads need
 BRIEF_KEYS = SUMMARY_KEYS + ('tcno', 'name', 'closing_date', 'folder', 'duration_seconds')
 
 
@@ -63,16 +63,16 @@ class TenderBusy(Exception):
 
 class TenderProcessor:
     """
-    Owns the processing job and the latest result of every processed tender, in Redis (see services/job_state.py),
-    so several workers can process the tenders of a job at the same time: up to job_workers threads of this process,
-    started as tenders are queued and gone once none is left, and any number of worker processes (worker.py, see
-    work()) sharing the same Redis and the same target_directory. A tender is processed by one worker at a time.
-    Results are also saved in the tender folders, the record they are loaded from on creation (load_results).
+    Owns the processing job and the latest result of every processed tender, in PostgreSQL (state, a
+    services.job_state.JobState), so several workers can process the tenders of a job at the same time: up to
+    job_workers threads of this process, started as tenders are queued and gone once none is left, and any number of
+    worker processes (worker.py, see work()) sharing the same database and the same target_directory. A tender is
+    processed by one worker at a time.
     """
 
-    def __init__(self, target_directory, download_timeout=120, max_download_bytes=500 * 1024 * 1024,
-                 max_file_chars=300_000, company_file=COMPANY_DETAILS_FILE, index=None, workers=4, cache=None,
-                 ocr_budget=None, state=None, job_workers=1, load_results=True):
+    def __init__(self, target_directory, state, download_timeout=120, max_download_bytes=500 * 1024 * 1024,
+                 max_file_chars=300_000, company_store=None, index=None, workers=4, cache=None,
+                 ocr_budget=None, job_workers=1):
         self.target_directory = Path(target_directory)
         # The most OCR a tender may need before the team is asked, {'pages', 'usd'} (0 or None: no limit)
         self.ocr_budget = ocr_budget
@@ -81,35 +81,34 @@ class TenderProcessor:
         self.download_timeout = download_timeout
         self.max_download_bytes = max_download_bytes
         self.max_file_chars = max_file_chars
-        self.company_file = company_file
+        # The company profile every tender is checked against (a CompanyStore)
+        self.company_store = company_store
         # The Pinecone index of the tenders' namespaces; unconfigured (no API key), every analysis fails clearly
         self.index = index or PineconeService()
         # Files read at the same time
         self.workers = workers
-        # The job and the results (a JobState); an in-process Redis without one
-        self.state = state or JobState.connect()
+        # The job and the results (a JobState)
+        self.state = state
         # Tenders this process works on at the same time; 0 leaves them to worker processes
         self.job_workers = job_workers
         self.worker_name = f'{socket.gethostname()}:{os.getpid()}'
         self._threads = []  # this process's worker threads
         self._threads_lock = threading.Lock()
-        if load_results:
-            self._load_results()
 
     @classmethod
-    def from_config(cls, config, index=None, load_results=True, job_workers=None):
+    def from_config(cls, config, db, index=None, job_workers=None):
         """
-        The processor config (see config.Config) describes: its Redis (REDIS_URL), cache, Pinecone index (index, if
-        given, in place of the one config describes) and OCR budget. job_workers defaults to JOB_WORKERS.
+        The processor config (see config.Config) describes, with its job, results and cache in db (a
+        services.database.Database): its Pinecone index (index, if given, in place of the one config describes) and
+        OCR budget. job_workers defaults to JOB_WORKERS.
         """
-        cache = Cache(config.CACHE_FILE or config.TARGET_DIRECTORY / 'cache.sqlite3')
-        return cls(config.TARGET_DIRECTORY, download_timeout=config.DOWNLOAD_TIMEOUT,
+        cache = Cache(db)
+        return cls(config.TARGET_DIRECTORY, JobState(db), download_timeout=config.DOWNLOAD_TIMEOUT,
                    max_download_bytes=config.MAX_DOWNLOAD_MB * 1024 * 1024, max_file_chars=config.MAX_FILE_CHARS,
-                   company_file=config.COMPANY_DETAILS_FILE,
+                   company_store=CompanyStore(db),
                    index=index or PineconeService.from_config(config, cache=cache), workers=config.INGEST_WORKERS,
                    cache=cache, ocr_budget={'pages': config.OCR_BUDGET_PAGES, 'usd': config.OCR_BUDGET_USD},
-                   state=JobState.connect(config.REDIS_URL, config.REDIS_PREFIX),
-                   job_workers=config.JOB_WORKERS if job_workers is None else job_workers, load_results=load_results)
+                   job_workers=config.JOB_WORKERS if job_workers is None else job_workers)
 
     def namespace(self, tcno):
         """The tender's Pinecone namespace when it has one, else None. Never raises (see has_namespace())."""
@@ -126,35 +125,13 @@ class TenderProcessor:
         folder = self.target_directory / safe_name(tcno)
         return next((path for path in tender_files(folder) if path.relative_to(folder).as_posix() == name), None)
 
-    def _load_results(self):
-        """
-        Loads the results saved in the tender folders by earlier runs into the state, in place of those there: the
-        folders are the record. A file that cannot be read is skipped.
-        """
-        with self.state.lock():
-            results = {}
-            for path in sorted(self.target_directory.glob(f'*/{RESULT_FILE}')):
-                try:
-                    result = read_result(path)
-                except (OSError, ValueError):
-                    log.warning('Could not read the saved result %s; skipping it', path, exc_info=True)
-                    continue
-                # Where the folder is now, and whether its namespace is still there; results saved before Pinecone
-                # named a criteria file instead
-                result.pop('criteria_file', None)
-                result.pop('index_name', None)
-                result.update(folder=str(path.parent), namespace=self.namespace(result['tcno']))
-                results[str(result['tcno'])] = result
-            self.state.replace_results(results, {tcno: _brief(result) for tcno, result in results.items()})
-        if results:
-            log.info('Loaded %d saved result(s) from %s', len(results), self.target_directory)
-
     def start(self, tenders, regenerate=False, approve_ocr=False):
         """
         Queues the given raw tenders in order and returns the job's progress. Starts a new job when none is
         running, otherwise adds them to the running one. Tenders already queued or processing are skipped.
-        A tender with a Pinecone namespace is checked against it, unless regenerate is true: then its namespace is
-        deleted, its documents downloaded and read again, and the namespace rebuilt. A tender whose documents need
+        A tender with a Pinecone namespace is checked against it, unless regenerate is true: then its documents are
+        downloaded and read again, and its namespace brought up to date (only the sources that changed are upserted
+        again; see PineconeService.ingest()). A tender whose documents need
         more OCR than the OCR budget stops before any is done, as awaiting_approval with its 'ocr_estimate', unless
         approve_ocr is true. Up to job_workers threads of this process start on them; worker processes take the rest.
         """
@@ -182,7 +159,7 @@ class TenderProcessor:
                 self.state.update_job(stop_requested=False)  # new work overrides an earlier stop
             self._finish_if_done()
         log.info('Job %s: %d tender(s) %s', job['job_id'], added, 'queued in a new job' if new_job else 'added')
-        self._start_threads()
+        self.start_workers()
         return self.progress()
 
     def stop(self):
@@ -259,9 +236,9 @@ class TenderProcessor:
         Sets the status of the criterion at index in the tender's result by hand: 'met', 'not_met' or 'unknown',
         or None for the model's status again. Saves the result and returns it, with the score, counts and verdict
         worked out again (see _restatus()). A re-check keeps the marks: see _carry_marks(). The mark is also
-        recorded in the company profile, or removed from it with the mark (see _record_mark()).
-        Raises LookupError without a completed result or such a criterion, TenderBusy while it is queued or
-        being processed, and OSError when the result cannot be saved (then nothing changes).
+        recorded with the bid team's marks, or removed from them with the mark (see _record_mark()).
+        Raises LookupError without a completed result or such a criterion, and TenderBusy while it is queued or
+        being processed.
         """
         def change(result):
             if not 0 <= index < len(result['criteria']):
@@ -274,17 +251,15 @@ class TenderProcessor:
 
     def _record_mark(self, tcno, criterion):
         """
-        Records in the company profile the status the bid team marked by hand on the tender's criterion, or removes
-        it once the criterion is back to the model's status, so the other tenders checked from now on know it. A
-        profile that cannot be saved is only logged: the mark is saved in the result all the same.
+        Records with the bid team's marks (CompanyStore.mark()) the status it marked by hand on the tender's
+        criterion, or removes it once the criterion is back to the model's status, so the other tenders checked from
+        now on know it. A mark that cannot be recorded is only logged: it is saved in the result all the same.
         """
         status = criterion['status'] if criterion.get('marked_by_user') else None
         try:
-            update_company_details(lambda text: record_mark(text, tcno, criterion, status, date.today().isoformat()),
-                                   self.company_file)
-        except OSError:
-            log.exception('Tender %s: could not record the mark of criterion %r in the company profile %s', tcno,
-                          criterion['criterion'], self.company_file)
+            self.company_store.mark(tcno, criterion, status, date.today().isoformat())
+        except psycopg.Error:
+            log.exception('Tender %s: could not record the mark of criterion %r', tcno, criterion['criterion'])
 
     def check_unreadable(self, tcno, checked):
         """
@@ -303,28 +278,6 @@ class TenderProcessor:
             return f"{len(unreadable)} unreadable source(s) {'checked' if checked else 'no longer checked'}"
         return self._change(tcno, change)
 
-    def delete_namespace(self, tcno):
-        """
-        Deletes the tender's Pinecone namespace, to free a place under the Pinecone plan's namespace limit; the next
-        check of the tender downloads and indexes its documents again. Its last result is kept, with namespace None.
-        Returns whether there was an index. Raises TenderBusy while the tender is queued or being processed, and
-        VectorStoreError when Pinecone fails.
-        """
-        tcno = str(tcno)
-        if self.busy(tcno):
-            raise TenderBusy()
-        deleted = self.index.delete_namespace(tcno)
-        with self.state.lock():
-            result = self.state.result(tcno)
-            if result and result.get('namespace'):
-                result['namespace'] = None
-                try:
-                    save_result(result['folder'], result)
-                except OSError:
-                    log.exception('Could not save the result of tender %s', tcno)
-                self.state.put_result(result, _brief(result))  # gone from Pinecone, saved or not
-        return deleted
-
     def _change(self, tcno, change):
         """
         Applies change, a function editing a copy of the tender's completed result by hand and returning what it
@@ -339,8 +292,7 @@ class TenderProcessor:
                 raise TenderBusy()
             done = change(updated)
             _restatus(updated)
-            save_result(updated['folder'], updated)
-            self.state.put_result(updated, _brief(updated))
+            self.state.put_result(updated, result_brief(updated))
             # The job's item of this tender is what the page reads after a reload, so it shows the change too
             for item in self.state.items():
                 if item['tcno'] == tcno and item['status'] == 'completed':
@@ -393,12 +345,7 @@ class TenderProcessor:
             if not result or result.get('closing_date') == closing or self.busy(tcno):
                 return
             updated = {**result, 'closing_date': closing}
-            try:
-                save_result(updated['folder'], updated)
-            except OSError:
-                log.exception('Could not save the closing date of tender %s', tcno)
-                return
-            self.state.put_result(updated, _brief(updated))
+            self.state.put_result(updated, result_brief(updated))
 
     def ocr_estimates(self, tcnos):
         """
@@ -425,65 +372,60 @@ class TenderProcessor:
 
     def closed_downloads(self, today=None):
         """
-        The tenders whose documents are still in the download folder although they have closed, to tidy up:
-        {'directory', 'closed', 'unknown'}. closed holds those whose closing date is before today, longest closed
-        first; unknown those with documents but no closing date on record (results saved before closing dates were,
-        of tenders no longer listed, and not indexed in Pinecone either). Each is {'tcno', 'name', 'closing_date'
-        (21-Nov-2026, or None), 'days_closed', 'files', 'bytes'}. A closing date a result lacks is read from the
-        TenderTiger data indexed in the tender's Pinecone namespace, and saved.
+        The checked tenders on record whose closing date has passed, to tidy up: {'closed', 'unknown'}. closed holds
+        those closed before today, longest closed first; unknown those with no closing date on record (results saved
+        before closing dates were, of tenders TenderTiger no longer lists). Each is {'tcno', 'name', 'closing_date'
+        (21-Nov-2026, or None), 'days_closed'}. Read from the database alone, in two reads; a tender queued or being
+        checked is left out.
         """
         today = today or date.today()
-        results = {Path(brief['folder']).name: {key: brief.get(key) for key in ('tcno', 'name', 'closing_date')}
-                   for brief in self.state.briefs().values()}
-        # Read once, not once per folder (see busy()): each read is a round trip to Redis
         busy = {item['tcno'] for item in self.state.items() if item['status'] in ('queued', 'processing')}
-        folders = []  # (tcno, saved result fields or None, documents)
-        for folder in sorted(path for path in self.target_directory.iterdir() if path.is_dir()):
-            result = results.get(folder.name)
-            # A folder that is no tender's, such as a download's staging folder (TCNOs are numbers)
-            if result is None and not folder.name.isdigit():
-                continue
-            tcno = str(result['tcno']) if result else folder.name
-            files = tender_files(folder)
-            if files and tcno not in busy:
-                folders.append((tcno, result or {}, files))
-
-        missing = [tcno for tcno, result, _ in folders if not result.get('closing_date')]
-        found = {}
-        if missing and self.index.configured:
-            # Fetched by ID, in parallel; a date found is saved in the result, so it is fetched once per tender
-            with ThreadPoolExecutor(max_workers=self.workers) as pool:
-                found = dict(zip(missing, pool.map(self._indexed_closing_date, missing)))
-
         closed, unknown = [], []
-        for tcno, result, files in folders:
-            closing = result.get('closing_date')
-            if not closing and found.get(tcno):
-                closing = found[tcno]
-                self._save_closing_date(tcno, closing)
-            closing = date.fromisoformat(closing) if closing else None
-            if closing and closing >= today:
+        for tcno, brief in self.state.briefs().items():
+            closing = date.fromisoformat(brief['closing_date']) if brief.get('closing_date') else None
+            if tcno in busy or (closing and closing >= today):
                 continue
             (closed if closing else unknown).append({
-                'tcno': tcno, 'name': result.get('name') or '',
+                'tcno': tcno, 'name': brief.get('name') or '',
                 'closing_date': closing.strftime('%d-%b-%Y') if closing else None,
                 'days_closed': (today - closing).days if closing else None,
-                'files': len(files), 'bytes': sum(path.stat().st_size for path in files),
             })
         closed.sort(key=lambda tender: -tender['days_closed'])
-        return {'directory': str(self.target_directory), 'closed': closed, 'unknown': unknown}
+        return {'closed': closed, 'unknown': unknown}
+
+    def stray_downloads(self):
+        """
+        The tender folders in the download folder the database holds no result for, to tidy up: left by a check that
+        never finished, or by an older version. {'directory', 'tenders': [{'tcno', 'name', 'files', 'bytes'}]},
+        largest first, where files and bytes count every file in the folder and name is the tender's description when
+        the tender list has it ('' otherwise). Only folders named as a TCNO (digits) count, not a download's staging
+        folder, and a tender queued or being checked is left out: its folder is being filled.
+        """
+        known = set(self.state.briefs())
+        busy = {item['tcno'] for item in self.state.items() if item['status'] in ('queued', 'processing')}
+        tenders = []
+        for folder in sorted(path for path in self.target_directory.iterdir() if path.is_dir()):
+            tcno = folder.name
+            if not tcno.isdigit() or tcno in known or tcno in busy:
+                continue
+            files = [path for path in folder.rglob('*') if path.is_file()]
+            listed = get_tender(tcno)
+            tenders.append({'tcno': tcno, 'name': _name(listed) if listed else '', 'files': len(files),
+                            'bytes': sum(path.stat().st_size for path in files)})
+        tenders.sort(key=lambda tender: -tender['bytes'])
+        return {'directory': str(self.target_directory), 'tenders': tenders}
 
     def delete_tender(self, tcno):
         """
         Deletes everything this processor keeps for the tender, once it has closed: its Pinecone namespace, then its
-        folder (the downloaded documents, the saved result and deep analysis) and all Redis holds of it (its result
-        and brief, and its items in the last job, with the job itself if it had no other tender), so it reads as
-        never checked. The statuses the team marked by hand stay recorded in the company profile; the team's decision and
-        the deep analysis's memory are the caller's (see routes.api.delete_downloads()). The namespace goes first, so
-        a Pinecone failure leaves the rest for a retry.
-        Returns {'tcno', 'files', 'bytes', 'namespace_deleted'}: how many documents went (the result and deep
-        analysis not counted), their size, and whether there was a namespace. Raises LookupError when nothing is
-        kept for the tender, TenderBusy while it is queued or being checked, VectorStoreError when Pinecone fails,
+        folder of downloaded documents and all the database holds of it (its result and brief, and its items in the
+        last job, with the job itself if it had no other tender), so it reads as never checked. The statuses the team
+        marked by hand stay recorded (CompanyStore.mark()); the team's decision and the deep analysis's memory are the
+        caller's (see routes.api.delete_downloads()). The namespace goes first, so a Pinecone failure leaves the rest
+        for a retry, and without Pinecone nothing is deleted: no tender is deleted leaving its records in Pinecone.
+        Returns {'tcno', 'files', 'bytes', 'namespace_deleted'}: how many documents went, their size, and whether
+        there was a namespace. Raises LookupError when nothing is kept for the tender, VectorStoreNotConfigured
+        without a Pinecone key, TenderBusy while it is queued or being checked, VectorStoreError when Pinecone fails,
         and OSError when a file cannot be deleted (one open in another program, say).
         """
         tcno = str(tcno)
@@ -491,7 +433,10 @@ class TenderProcessor:
         known = self.state.result(tcno) is not None
         if not known and not folder.is_dir():
             raise LookupError(f'Nothing is kept for tender {tcno}.')
-        namespace_deleted = self.delete_namespace(tcno) if self.index.configured else False
+        self.index.require()
+        if self.busy(tcno):
+            raise TenderBusy()
+        namespace_deleted = self.index.delete_namespace(tcno)
         with self.state.lock():
             # Under the lock, so the tender cannot be queued and downloaded again while its folder goes
             if self.busy(tcno):
@@ -500,8 +445,8 @@ class TenderProcessor:
             size = sum(path.stat().st_size for path in files)
             if folder.is_dir():
                 shutil.rmtree(folder)
-            # Nothing of the tender stays in Redis: its result and brief, and its items in the last job (which the page
-            # reads after a reload); a job left with no tenders is forgotten, as if it had not run
+            # Nothing of the tender stays in the database: its result and brief, and its items in the last job (which
+            # the page reads after a reload); a job left with no tenders is forgotten, as if it had not run
             self.state.delete_result(tcno)
             self.state.remove_items([item['id'] for item in self.state.items() if item['tcno'] == tcno])
             if not self.state.items():
@@ -509,24 +454,6 @@ class TenderProcessor:
         log.info('Tender %s: deleted its folder (%d downloaded file(s), %d bytes) and result%s', tcno, len(files), size,
                  ', and its Pinecone namespace' if namespace_deleted else '')
         return {'tcno': tcno, 'files': len(files), 'bytes': size, 'namespace_deleted': namespace_deleted}
-
-    def _indexed_closing_date(self, tcno):
-        """
-        The closing date in the TenderTiger data indexed with the tender's documents (tender_data_text()), as
-        YYYY-MM-DD; None without a namespace or such a line, or when Pinecone fails (logged).
-        """
-        if not self.index.has_namespace(tcno):
-            return None
-        try:
-            text = self.index.first_chunk(tcno, TENDER_DATA_SOURCE) or ''
-        except VectorStoreError:
-            log.warning('Tender %s: could not read its closing date from Pinecone', tcno, exc_info=True)
-            return None
-        match = re.search(r'^Closing date: (\d{2}-[A-Za-z]{3}-\d{4})$', text, re.MULTILINE)
-        try:
-            return datetime.strptime(match.group(1), '%d-%b-%Y').date().isoformat() if match else None
-        except ValueError:
-            return None
 
     def busy(self, tcno):
         """True while the tender is queued or being processed, so its result is about to be replaced."""
@@ -548,7 +475,7 @@ class TenderProcessor:
             thread.start()
         return pool
 
-    def _start_threads(self):
+    def start_workers(self):
         """Starts worker threads of this process on the queued tenders, up to job_workers in all."""
         with self._threads_lock:
             for number in range(len(self._threads), self.job_workers):
@@ -567,7 +494,7 @@ class TenderProcessor:
                 self._reap()
                 claimed = self._claim()
                 if not claimed and until_empty:
-                    # Looked at again under the lock _start_threads() counts threads under, so a tender queued as this
+                    # Looked at again under the lock start_workers() counts threads under, so a tender queued as this
                     # thread leaves still gets one
                     with self._threads_lock:
                         claimed = self._claim()
@@ -579,7 +506,8 @@ class TenderProcessor:
                 else:
                     self.state.wait(timeout=5)
             except Exception:
-                # Redis out of reach, say; the tender a worker had is failed once its lease runs out (see _reap())
+                # The database out of reach, say; the tender a worker had is failed once its lease runs out (see
+                # _reap())
                 log.exception('Worker %s could not take or finish a tender', self.worker_name)
                 if until_empty:
                     with self._threads_lock:
@@ -628,7 +556,7 @@ class TenderProcessor:
         finally:
             done.set()
         with self.state.lock():
-            self.state.put_result(result, _brief(result))
+            self.state.put_result(result, result_brief(result))
             current = self.state.item(item_id)
             if current:  # gone only if a new job replaced this one
                 current.update(_summary(result))
@@ -686,9 +614,11 @@ class TenderProcessor:
     def _process(self, tender, regenerate=False, approve_ocr=False, set_stage=None):
         """
         Downloads, extracts, indexes and analyses one tender, or re-checks it against its Pinecone namespace when it
-        has one and regenerate is false. Regenerating deletes the namespace first, so a failed download leaves none
-        and the next check reads the documents again. A namespace left half-built by an earlier failure is rebuilt
-        from the documents. Never raises: failures become a 'failed' result, and a tender whose scans need more OCR
+        has one and regenerate is false. Regenerating keeps the namespace's unchanged sources (see
+        _analyse_documents()); it is marked as being built first, so a failed download leaves none (it is deleted, as
+        incomplete) and the next check reads the documents again. A namespace left half-built by an earlier failure
+        is rebuilt from the documents. Never raises: failures become a 'failed' result, and a tender whose scans need
+        more OCR
         than the budget an 'awaiting_approval' one. Its 'tokens' are the LLM tokens spent,
         failed or not: see TokenUsage.counts(). approve_ocr lifts the OCR budget. set_stage(stage, step=None,
         steps=None), if given, is told what it is doing.
@@ -719,14 +649,11 @@ class TenderProcessor:
                 result['files'] = [path.relative_to(folder).as_posix() for path in tender_files(folder)]
                 try:
                     analysis = recheck_saved_criteria(tcno, index=self.index, on_progress=set_stage,
-                                                      company_file=self.company_file, usage=usage, tender=tender)
+                                                      company_store=self.company_store, usage=usage, tender=tender)
                 except NamespaceIncomplete:
                     log.warning('Tender %s: its Pinecone namespace was left half-built; reading the documents again',
                                 tcno)
                     result['rechecked'] = False
-            elif regenerate:
-                set_stage(f'Deleting the Pinecone namespace {self.index.namespace(tcno)}')
-                self.index.delete_namespace(tcno)
             if analysis is None:
                 analysis = self._analyse_documents(tender, folder, result, set_stage, usage, approve_ocr)
             criteria = analysis.get('criteria') or []
@@ -758,22 +685,22 @@ class TenderProcessor:
                  result['tokens']['assessment']['total'])
         result['duration_seconds'] = round(time.monotonic() - started, 1)
         result['processed_at'] = _now()
-        try:
-            save_result(folder, result)
-        except OSError:
-            log.exception('Could not save the result of tender %s; it is lost on restart', tcno)
         return result
 
     def _discard_incomplete_namespace(self, tcno):
         """
         After a failed build: deletes the tender's namespace when it has no complete manifest (empty, or left
         half-built), so it neither counts as indexed nor holds a place under the Pinecone plan's namespace limit. A
-        complete namespace (the failure came after it was built, in the final check) is kept for a re-check.
+        complete namespace (the failure came after it was built, in the final check) is kept for a re-check, and so
+        is one a regenerate kept that failed before anything in it changed (a download TenderTiger refused, say).
         """
         if not self.index.configured:
             return
         try:
             if self.index.has_namespace(tcno, strict=True) and self.index.manifest(tcno) is None:
+                if self.index.restore_kept(tcno):
+                    log.info('Tender %s: nothing in its Pinecone namespace changed, so it is kept for re-checks', tcno)
+                    return
                 self.index.delete_namespace(tcno)
                 log.info('Tender %s: deleted its incomplete Pinecone namespace', tcno)
         except VectorStoreError:
@@ -783,15 +710,17 @@ class TenderProcessor:
     def _analyse_documents(self, tender, folder, result, set_stage, usage, approve_ocr=False):
         """
         Downloads the tender's documents into folder (emptied first), indexes them in the tender's Pinecone
-        namespace (rebuilt) and analyses them, counting the tokens in usage; sets result['files']. The OCR budget
-        applies unless approve_ocr is true.
+        namespace and analyses them, counting the tokens in usage; sets result['files']. A complete namespace (a
+        regenerate) keeps the chunks of the sources that have not changed; any other is rebuilt from scratch. The OCR
+        budget applies unless approve_ocr is true.
         """
         tcno = str(tender['tcno'])
         prequalification_link = prequalification_url(tender)
-        # Made (empty) before the download, so a Pinecone plan with no room for another namespace fails the tender
-        # before TenderTiger is asked for anything or any OCR is paid for
+        # Made before the download, so a Pinecone plan with no room for another namespace fails the tender before
+        # TenderTiger is asked for anything or any OCR is paid for; marked as being built, so a failure from here
+        # leaves it incomplete, and it is deleted (see _discard_incomplete_namespace())
         set_stage(f'Preparing the Pinecone namespace {self.index.namespace(tcno)}')
-        self.index.reset_namespace(tcno)
+        self.index.reset_namespace(tcno, keep=True)
         if has_documents(tender) or not prequalification_link:
             files = download_tender_documents(
                 tender, folder,
@@ -807,31 +736,10 @@ class TenderProcessor:
             files = []
         result['files'] = [path.relative_to(folder).as_posix() for path in files]
         return process_tender_files(folder, index=self.index, tcno=tcno, on_progress=set_stage,
-                                    company_file=self.company_file, prequalification_link=prequalification_link,
+                                    company_store=self.company_store, prequalification_link=prequalification_link,
                                     tender=tender, usage=usage, max_file_chars=self.max_file_chars,
                                     workers=self.workers, cache=self.cache,
                                     ocr_budget=None if approve_ocr else self.ocr_budget)
-
-
-def save_result(folder, result):
-    """Writes a tender's result to folder/RESULT_FILE as JSON, which read_result() reads back. Returns its path."""
-    path = Path(folder) / RESULT_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside and then moved, so a crash mid-write cannot leave a result that cannot be read back
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(result, indent=2, ensure_ascii=False), encoding='utf-8')
-    os.replace(temporary, path)
-    log.info('Saved the result of tender %s in %s', result['tcno'], path)
-    return path
-
-
-def read_result(path):
-    """Reads back the result saved by save_result(). Raises OSError, or ValueError when it holds no result."""
-    result = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    if not isinstance(result, dict) or result.get('status') not in ('completed', 'failed', 'awaiting_approval') \
-            or 'tcno' not in result or 'duration_seconds' not in result:
-        raise ValueError(f'{path} holds no tender result')
-    return result
 
 
 def explain_error(exc):
@@ -869,8 +777,8 @@ def explain_error(exc):
     if isinstance(exc, QuotaExceeded):
         return ('The Pinecone namespace limit is reached',
                 'Each tender needs its own Pinecone namespace, and the Pinecone plan allows only so many in an index. '
-                'Delete the namespaces of tenders no longer needed (DELETE /api/namespace/<tcno>), or move to a '
-                'larger plan, then retry.')
+                'Delete the closed tenders no longer needed (Closed tenders, in the app bar), or move to a larger '
+                'plan, then retry.')
     if 'PINECONE_API_KEY' in text:
         return ('The Pinecone API key is missing', 'Add PINECONE_API_KEY to .env, restart the app and retry.')
     if isinstance(exc, VectorStoreError):
@@ -887,8 +795,8 @@ def explain_error(exc):
         # Groq's 413: one request over the plan's tokens-per-minute limit can never pass, however often it is retried
         return ('The request is too large for the Groq plan',
                 "The check needs more tokens than the Groq plan's per-minute limit for the model (8,000 on the free "
-                'tier); a full eligibility check can need 12,000, prompt and answer together. Upgrade the Groq plan '
-                '(Dev tier) and retry.')
+                'tier), even with its excerpts split in batches. Upgrade the Groq plan (Dev tier), or lower '
+                'RETRIEVAL_MAX_CHARS in .env, and retry.')
     if 'LLM_MAX_OUTPUT_TOKENS' in text:
         return ("The model's answer was cut off",
                 'The answer needed more tokens than LLM_MAX_OUTPUT_TOKENS allows. Raise it in .env, restart the app '
@@ -983,7 +891,7 @@ def _summary(result):
     return {key: result.get(key) for key in SUMMARY_KEYS}
 
 
-def _brief(result):
+def result_brief(result):
     """The fields of a result the state keeps beside it, so lists and estimates need not read whole results."""
     return {key: result.get(key) for key in BRIEF_KEYS}
 

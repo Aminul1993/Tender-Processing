@@ -12,6 +12,6 @@ httpx==0.28.1
 requests==2.34.2
 python-dotenv==1.2.4
 pinecone==10.3.0
-# The processing job's state, shared with worker processes (REDIS_URL); fakeredis stands in without REDIS_URL
-redis==8.1.0
-fakeredis==2.40.0
+# PostgreSQL (DATABASE_URL): the job, results, decisions, watchlist and cache, shared with worker processes
+psycopg[binary]==3.3.9
+psycopg-pool==3.3.3

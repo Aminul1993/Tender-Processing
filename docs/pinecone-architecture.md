@@ -27,7 +27,7 @@ namespace never returns another namespace's records. Each chunk also carries its
 ```mermaid
 flowchart LR
     TT[TenderTiger] -->|documents zip,<br/>pre-qualification, tender row| DL[download_service]
-    DL --> FS[(downloads/&lt;tcno&gt;/<br/>files, eligibility_result.json,<br/>deep_analysis.json)]
+    DL --> FS[(downloads/&lt;tcno&gt;/<br/>files)]
     FS --> EX[analysis_service.read_documents<br/>MarkItDown; OCR of scans, pages<br/>with no text layer, large images:<br/>PaddleOCR, unsure/table ones<br/>to OCR_MODEL; INGEST_WORKERS<br/>in parallel]
     EX --> PS[pinecone_service.PineconeService<br/>chunk, embed, batch upsert,<br/>manifest last]
     PS <-->|inference.embed<br/>llama-text-embed-v2| PC
@@ -43,11 +43,12 @@ flowchart LR
     DA --> FS
     API[routes/api.py] --> PR
     API --> DA
-    API -->|GET / DELETE /api/namespace| PS
+    API -->|GET /api/namespace,<br/>DELETE /api/downloads| PS
 ```
 
 **Names.** The index is `PINECONE_INDEX_NAME` (default `tender-processing`). The app creates it, serverless, on
-first use and checks that its dimension matches `PINECONE_EMBED_DIMENSION`. Each tender's namespace is
+first use, with the metric `PINECONE_METRIC` (default `dotproduct`, see Hybrid retrieval below), and checks that
+its dimension matches `PINECONE_EMBED_DIMENSION`. Each tender's namespace is
 `PINECONE_NAMESPACE_PREFIX + TCNO`, which is `tcno-100091540` by default. The app, the API, the UI and the logs
 all use that name.
 
@@ -55,8 +56,8 @@ all use that name.
 
 | Record | ID | Metadata |
 |---|---|---|
-| chunk | `<sha1(source)[:16]>-<position>` | `record_type: chunk`, `tcno`, `source_file`, `document_type`, `chunk_id`, `chunk_index`, `overlap`, `created_at`, `text` |
-| manifest | `__manifest__` | `record_type: manifest`, `status: building` or `complete`, `schema_version`, `embed_model`, `dimension`, `chunks`, `parts`, `payload` (sources and unreadable sources, as JSON), `created_at` |
+| chunk | `<sha1(source)[:16]>-<position>` | `record_type: chunk`, `tcno`, `source_file`, `document_type`, `chunk_id`, `chunk_index`, `overlap`, `created_at`, `text`; `section`, `sections` and `section_titles` (the document sections it is in); sparse values on a `dotproduct` index |
+| manifest | `__manifest__` | `record_type: manifest`, `status: building` or `complete`, `kept` (building, its chunks kept for a regenerate), `schema_version` (3), `embed_model`, `dimension`, `chunk_size`, `chunk_overlap`, `hybrid` (the chunks hold sparse values), `chunks`, `parts`, `payload` (sources with their chunk counts and SHA-256s, and unreadable sources, as JSON), `created_at` |
 | manifest part | `__manifest__-000`, ... | `record_type: manifest_part`, `payload`. Used only when the source list exceeds 30,000 characters, because Pinecone allows 40 KB of metadata per record |
 
 Chunk IDs are derived from the source name and position, so the manifest alone gives every ID. `knowledge()`
@@ -103,11 +104,40 @@ sequenceDiagram
     A-->>P: verdict, criteria, JV, index stats
 ```
 
-Retrieval runs 13 searches over six kinds of requirement: eligibility, financial, technical, experience, JV and
-compliance. The TenderTiger pre-qualification text and tender data are always sent in full. The searches then
-take turns, each adding its next best chunk, until `RETRIEVAL_MAX_CHARS` is reached (60,000 characters, about 20k
-tokens). The chunks are sent in document order. Neighbouring chunks are joined without their overlap, and `[…]`
-marks a gap.
+Retrieval runs 2 section searches and 13 searches over six kinds of requirement: eligibility, financial,
+technical, experience, JV and compliance. The TenderTiger pre-qualification text and tender data are always sent in
+full. The qualification section comes next, whole (hierarchical retrieval, below). The searches then take turns,
+each adding its next best chunk, until `RETRIEVAL_MAX_CHARS` is reached (60,000 characters, about 20k tokens). The
+chunks are sent in document order. Neighbouring chunks are joined without their overlap, and `[…]` marks a gap.
+
+**Adaptive retrieval.** A search keeps its `RETRIEVAL_TOP_K` matches only down to `RETRIEVAL_SCORE_FLOOR` (0.85)
+times its best score, and none under `RETRIEVAL_MIN_SCORE` (0.2 cosine; times the dense weight in a hybrid search),
+two at least. Calibrated on the 35 namespaces in the index on 13 Nov 2026 (every assessment query's top 20 matches,
+replayed through the round robin): 24% less text at the defaults (8 per query, 60,000 characters), 9% at 5 and
+30,000. The best match of a kind the tender does not cover scores about 0.1, of one it covers 0.35 to 0.5.
+
+**Hierarchical retrieval.** Each chunk records the sections it is in, as ranges of its source's chunks
+(`sections: ["14-15", "12-19"]`, smallest first, with `section_titles`), told from the document's headings by
+`document_sections.py`: a major section (a part, section, annexure, or a short line in capitals) runs to the next
+major heading and holds the minor ones (numbered or lettered clause headings in capitals or title case) after it;
+running headers and footers (lines on three pages or more), table rows, contents lines and OCR's `## Page n` are
+never headings. The two `QUALIFICATION_SECTION` searches vote, with their matches' scores, for every section a match
+is in that fits `RETRIEVAL_SECTION_SHARE` (half) of the budget, so a major section gathers the votes of its minor
+ones. The winner is fetched by its chunk IDs and sent whole, and a second, non-overlapping section too if its votes
+are within the score floor of the first's. On the LIC Suri NIT (112,772 characters), the major section holding
+"A. WORKS EXPERIENCE" to "D. DISQUALIFICATION" is 7,587 characters. Namespaces built before (schema 2) have no
+sections, so retrieval skips this step for them.
+
+**Hybrid retrieval.** On a `dotproduct` index, every chunk also holds sparse values (`sparse_encoder.py`): the
+hashed terms of its section title and text, weighted 1 + ln(count) and twice that for a figure, at unit length.
+Amounts are one term however written (`Rs. 25 lakh`, `₹ 25,00,000`, `0.25 crore`: `amt:2500000`), and so are
+clause references (`clause 4.2.1`, a bare `4.2.1` heading; `Annexure-III` and `Annexure 3`), percentages and
+financial years (`FY 2023-2024`: `fy:2023-24`). Words every tender uses are stop words in place of IDF. A search's
+dense vector is scaled by `RETRIEVAL_HYBRID_ALPHA` (0.75) and its sparse one by the rest, so its score is a
+weighted sum of two cosines. Dense vectors are scaled to unit length, so `dotproduct` ranks them as `cosine` did.
+An index keeps the metric it was made with: on a `cosine` index (the one made before this change), sparse values
+are neither written nor sent, and a warning says so once. To switch, set a new `PINECONE_INDEX_NAME`; each tender
+is indexed into it the next time it is checked, its texts and vectors coming from the cache.
 
 If the run fails before the manifest is complete, the processor deletes the namespace. A failed tender then
 neither counts as indexed nor holds a place under the namespace limit.
@@ -121,11 +151,27 @@ flow. Because a re-check never calls TenderTiger, it still runs while TenderTige
 
 ## Regeneration flow
 
-1. `delete_namespace(tcno)`: see "Deleting a namespace" below.
-2. `reset_namespace(tcno)` recreates it, marked as building. It fails here, before any download, if the plan has no room.
-3. The folder is emptied and the documents are downloaded again.
-4. The documents are read again, and `ingest` uploads the embeddings again and writes the complete manifest.
+Regenerating keeps what has not changed, in the namespace and in the cache:
+
+1. `reset_namespace(tcno, keep=True)`. A complete namespace of the current schema, embedding model and dimension
+   keeps its chunks: its manifest is rewritten as `building` and `kept`, so it no longer counts as complete. Any
+   other is emptied. It fails here, before any download, if the plan has no room. The manifest write is waited on
+   until searches see it, so `ingest` reads this manifest back, never the one before.
+2. The folder is emptied and the documents are downloaded again.
+3. The documents are read again. A file unchanged to the byte comes from the text cache; a page or image whose
+   rendered image was read before comes from the page cache (a file whose OCR failed on some pages, or a reissued
+   scan, has only the other pages read).
+4. `ingest` compares each source's SHA-256 (of its text, type and everything else that shapes its records: schema,
+   section and sparse versions, chunk size and overlap) with the kept manifest's. Before changing anything, it marks
+   the manifest `building` without `kept`, so a build that fails from here on is never kept, only rebuilt. It then
+   deletes the chunks of sources gone or grown shorter (and manifest parts no longer needed), upserts the changed
+   and new sources (their vectors from the cache when their chunks were embedded before), and writes the complete
+   manifest. Unchanged sources are neither embedded nor upserted. The result's `index` counts `upserted`,
+   `kept_sources` and `deleted`.
 5. The criteria are retrieved and assessed.
+
+If a step fails, the processor deletes the namespace, as it has no complete manifest; the next check reads the
+documents again. Before this change, regenerating deleted the namespace first and upserted every chunk again.
 
 ## Deleting a namespace
 
@@ -138,7 +184,7 @@ after a build came back with the 2 records written last. `delete_namespace()` th
 3. Delete the namespace and wait until Pinecone reports it gone.
 4. Check again after `settle_seconds` (5 s). If it came back, repeat, up to 3 times.
 
-`DELETE /api/namespace/{tcno}` and regeneration therefore take a few seconds. In the live test, a build followed
+Deleting a tender (`DELETE /api/downloads/{tcno}`) and regeneration therefore take a few seconds. In the live test, a build followed
 at once by a delete left no namespace behind. In another run, a namespace came back once, was caught by step 4,
 and was deleted again.
 
@@ -161,14 +207,14 @@ recorded, with a warning. Report version 3: `inputs.criteria_source` is `Pinecon
 | `GET /api/tenders` row | `has_saved_criteria` | `has_indexed_criteria`: namespace `tcno-<tcno>` exists; false if Pinecone is unreachable |
 | Result / progress item | `criteria_file` | `namespace` (`tcno-<tcno>` or null) |
 | Full result | none | `index`: `{index, namespace, sources, chunks, embedding_tokens, retrieved_chunks, retrieved_characters}` |
-| `POST /api/process-tenders` | `regenerate` re-reads the documents | `regenerate` deletes the namespace, re-downloads and rebuilds it |
+| `POST /api/process-tenders` | `regenerate` re-reads the documents | `regenerate` re-downloads and re-reads the documents and upserts only the sources that changed |
 | New | none | `GET /api/namespace/{tcno}`: existence, completeness, sources, chunk and record counts |
-| New | none | `DELETE /api/namespace/{tcno}`: frees a place under the namespace limit; 409 while busy |
+| New, since removed | none | `DELETE /api/namespace/{tcno}` freed a place under the namespace limit; a namespace now goes only with its tender (`DELETE /api/downloads/{tcno}`) |
 | Errors | none | `503` without `PINECONE_API_KEY`, `502` when Pinecone fails (`{"error": ...}` as before) |
 | Deep analysis report | `version: 2` | `version: 3`, with `inputs.excerpts` |
 
-Saved results lose `criteria_file` (or the `index_name` of the brief index-per-tender version) when they load, and
-get `namespace`.
+Results saved in files by an older version lose `criteria_file` (or the `index_name` of the brief index-per-tender
+version) when `scripts/import_files_to_db.py` moves them into the database.
 
 ## Files changed
 
@@ -178,7 +224,7 @@ get `namespace`.
 | `services/analysis_service.py` | Criteria file and summarising removed. `read_documents` (parallel), `tender_data_text`, `ASSESSMENT_QUERIES`. `process_tender_files(folder, *, index, ...)` indexes then retrieves; `recheck_saved_criteria(tcno, *, index, ...)` retrieves only |
 | `services/processing_service.py` | Namespace reserved before download, regenerate deletes the namespace, half-built namespaces rebuilt and failed builds cleaned up, `namespace` field, `delete_namespace()`, Pinecone errors explained |
 | `services/deep_analysis_service.py` | `load_knowledge()` from the namespace replaces the criteria file; report version 3 |
-| `routes/api.py` | `has_indexed_criteria`, `GET` / `DELETE /api/namespace/{tcno}`, `VectorStoreError` handler |
+| `routes/api.py` | `has_indexed_criteria`, `GET /api/namespace/{tcno}` (and a `DELETE`, since removed), `VectorStoreError` handler |
 | `app.py`, `config.py`, `.env.example` | Service from config; `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`, `PINECONE_NAMESPACE_PREFIX=tcno-` and tuning settings |
 | `ext.py` | The assessment prompt speaks of retrieved excerpts |
 | `static/js/app.js`, `templates/index.html` | `has_indexed_criteria` / `namespace`, and wording |
@@ -196,7 +242,7 @@ get `namespace`.
    request is made. It builds each namespace, then deletes the `.md` file. A tender with no readable text keeps
    its file. Scanned PDFs are OCR'd again: PaddleOCR locally, and Groq tokens for their unsure and table pages. Complete namespaces are skipped, so the script
    can be re-run. It stops cleanly at the namespace limit.
-3. **Start the app.** Saved results load with `namespace` filled in. A tender that was not migrated is downloaded
+3. **Start the app.** A tender that was not migrated is downloaded
    and indexed the next time it is checked.
 4. **Roll back** by checking out the previous commit. Run the migration with `--keep-criteria-files` if rollback
    matters, because the old version reads those files.
@@ -205,7 +251,7 @@ get `namespace`.
 
 | Risk | Impact | Mitigation |
 |---|---|---|
-| **Namespace limit** (100 per index on Starter) | New tenders fail with "The Pinecone namespace limit is reached" | The namespace is reserved before the download, so no download or OCR is wasted. `DELETE /api/namespace/{tcno}` frees a place, and the migration stops cleanly. Above 100 tenders on Starter, delete the namespaces of closed or dropped tenders, or move to Standard (100,000) |
+| **Namespace limit** (100 per index on Starter) | New tenders fail with "The Pinecone namespace limit is reached" | The namespace is reserved before the download, so no download or OCR is wasted. Deleting a closed tender (Closed tenders) frees a place, and the migration stops cleanly. Above 100 tenders on Starter, delete the namespaces of closed or dropped tenders, or move to Standard (100,000) |
 | **Shared index** | All tenders depend on one index | Isolation is per namespace, and no operation crosses namespaces. Deleting the index loses every tender's namespace, but the app recreates the index on the next build and tenders re-index when next checked |
 | **Namespace resurrection** after a delete | A deleted tender comes back with stale records | Empty first with `delete_all`, wait on a marker's LSN, delete, then re-check and retry (see above) |
 | **Eventual consistency** | Retrieval could miss fresh chunks | The build waits on LSNs, before and after the manifest. Without LSN headers it falls back to record counts and fetches. The first retrieval uses the manifest just written |

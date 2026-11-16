@@ -25,7 +25,7 @@ The app checks the tender against the company's own figures, not against keyword
 - **Source of tenders:** the TenderTiger website, logged in with the company's account. The app lists the live tenders of a keyword search in pages of 20, 50, 100 or 500 (TenderTiger gives no total), which the team can narrow with the filters of TenderTiger's own search page.
 - **Documents:** each tender's documents download as one zip, often with zips nested inside. Typical contents are the NIT, annexures and the BOQ, as PDF, Excel and similar files. The tenders are Indian public-sector works (railways, PWD and others), with values in INR.
 - **Pace:** analysis takes a while. A typical tender takes a minute or two (download, OCR of scanned pages, indexing), so the team selects a batch, the server works through it one tender at a time, and the page shows live progress. All of a tender's documents are indexed in its own Pinecone index, so checking it again (after a profile change, say) retrieves the criteria from the index and takes one LLM call unless the team chooses to regenerate it.
-- **Hosting:** a single-process FastAPI app on the company's own machine or server. Job progress is kept in memory and lost on restart; each tender's last result is saved in its folder and loaded again at startup, and the downloaded files are kept.
+- **Hosting:** a FastAPI app on the company's own machine or server, with a PostgreSQL database that keeps the job, each tender's last result and deep analysis, the company profile, the decisions, the watchlist and the reading cache, so all of them survive a restart. The downloaded files are kept on disk. Worker processes can share the processing.
 - **LLM:** cloud models on Groq, which need an API key. Without the key the tender list still loads, but every analysis fails with a clear message.
 
 ## Capabilities and Constraints
@@ -36,7 +36,7 @@ The app checks the tender against the company's own figures, not against keyword
 - **Criterion status:** Met, Not met or Cannot determine. The model must use only the company details it is given and must never assume a value.
 - **The TenderTiger login stays on the server:** the server downloads with its own session, and the browser only ever sends TCNOs back.
 - **Terminology:** TCNO (the tender's ID), tender, NIT, BOQ, eligibility criterion, verdict, score, closing date, days left, organisation (British spelling).
-- **The company profile** is markdown in `company_details.md`, edited in the app as a form (Edit profile in the app bar: each table of the profile becomes rows of fields) and saved back as markdown, or edited by hand. Each tender's analysis reads it when it starts, so a saved change applies to the tenders checked after it; existing verdicts are not re-checked. A criterion status the bid team changes by hand is also recorded in the profile ("Criteria marked by the bid team"), so later tenders with the same requirement get it; a tender is never checked against its own marks. It still holds the sample ("ABC Infrastructure Ltd.") until the team enters the contractor's real profile.
+- **The company profile** is kept in the database (its blocks, and their table rows as child rows), edited in the app as a form (Edit profile in the app bar: each table of the profile becomes rows of fields) and saved back as markdown. Each tender's analysis reads it when it starts, so a saved change applies to the tenders checked after it; existing verdicts are not re-checked. A criterion status the bid team changes by hand is also recorded, apart from the profile, and given with it to the tenders checked later ("Criteria marked by the bid team"), so those with the same requirement get it; a tender is never checked against its own marks. It still holds the sample ("ABC Infrastructure Ltd.") until the team enters the contractor's real profile.
 
 ## Brand Commitments
 
@@ -44,7 +44,7 @@ None. This is an internal tool with no brand. "Tender Processing" is a working t
 
 ## Evidence on Hand
 
-- **Sample company profile:** in `company_details.md`. It is a sample, not the real company.
+- **Sample company profile:** in the database (imported from the former `company_details.md`). It is a sample, not the real company.
 - **A real downloaded tender:** `downloads/100091540/`, three PDFs.
 - **Sample API responses:** in `README.md`.
 - **No real company figures yet.** Future work must not invent turnover, net worth, experience or any other company figure, or present the sample profile as the real company.

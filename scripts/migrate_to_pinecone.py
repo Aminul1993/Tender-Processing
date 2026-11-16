@@ -4,9 +4,8 @@ One-off migration from the per-tender eligibility_criteria.md files to one Pinec
 For each tender folder under TARGET_DIRECTORY (or only the TCNOs given), it reads the documents already downloaded
 there, plus the TenderTiger pre-qualification text kept in the folder's old eligibility_criteria.md (so TenderTiger
 is not asked again), indexes them all in the tender's own namespace tcno-<tcno> of the shared index
-PINECONE_INDEX_NAME (made on first use), and then deletes eligibility_criteria.md. Saved results
-(eligibility_result.json) are left as they are: the app drops their old criteria_file field and finds the namespace
-when it starts.
+PINECONE_INDEX_NAME (made on first use), and then deletes eligibility_criteria.md. Saved results are left as they
+are (scripts/import_files_to_db.py moves those of an older version into the database).
 
 Run it from the project folder, with the app stopped:
 
@@ -15,6 +14,12 @@ Run it from the project folder, with the app stopped:
     python scripts/migrate_to_pinecone.py 100091540 102309372
     python scripts/migrate_to_pinecone.py --force            # rebuild namespaces that are already complete
     python scripts/migrate_to_pinecone.py --keep-criteria-files
+
+A complete namespace is left as it is, whatever version of the app built it: the app re-checks against it, and
+regenerating a tender in the app brings it up to date. Only the app has the TenderTiger texts it indexes beside the
+documents (the tender's data, and its pre-qualification text unless an old eligibility_criteria.md holds it), so this
+script never rebuilds a namespace that holds them, unless --force says to. A namespace a regenerate in the app kept
+and left unfinished, before anything in it changed, is given back as complete.
 
 A tender folder with no documents and no pre-qualification text is skipped: the app downloads its documents the
 next time it is checked. Scanned PDFs are read with OCR again (PaddleOCR, and OCR_MODEL with GROQ_API_KEY for pages
@@ -38,6 +43,7 @@ from config import Config  # noqa: E402
 from services.analysis_service import (PREQUALIFICATION_SOURCE, TokenUsage, _NO_CRITERIA, read_documents,  # noqa: E402
                                        tender_files)
 from services.cache_service import Cache  # noqa: E402
+from services.database import Database  # noqa: E402
 from services.pinecone_service import Document, PineconeService, QuotaExceeded  # noqa: E402
 
 # The criteria file of the app before Pinecone; read here for the last time, then deleted
@@ -57,9 +63,14 @@ def legacy_prequalification(path):
 
 
 def migrate(folder, index, force=False, keep_criteria_files=False, dry_run=False):
-    """Indexes one tender folder. Returns 'indexed', 'skipped' or 'up to date'."""
+    """
+    Indexes one tender folder. Returns 'indexed', 'skipped' or 'up to date'. A complete namespace is up to date,
+    unless force; one a regenerate kept and left unfinished is made complete again first.
+    """
     tcno = folder.name
     legacy = folder / LEGACY_CRITERIA_FILE
+    if not force and not dry_run:
+        index.restore_kept(tcno)
     if not force and index.manifest(tcno) is not None:
         if legacy.exists() and not keep_criteria_files and not dry_run:
             legacy.unlink()
@@ -115,7 +126,7 @@ def main(argv=None):
 
     # The app's cache, so a run stopped at the namespace limit and run again reads and embeds nothing twice
     index = PineconeService.from_config(
-        Config, cache=Cache(Config.CACHE_FILE or Config.TARGET_DIRECTORY / 'cache.sqlite3'))
+        Config, cache=Cache(Database.connect(Config.DATABASE_URL, Config.DATABASE_SCHEMA)))
     index.require()
     folders = sorted(path for path in Config.TARGET_DIRECTORY.iterdir() if path.is_dir()) \
         if not args.tcnos else [Config.TARGET_DIRECTORY / tcno for tcno in args.tcnos]

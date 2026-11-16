@@ -90,50 +90,6 @@ def summarize_for_goal(llm, document_markdown, goal, max_chars=8000, max_concurr
     ])
     return response.content.strip()
 
-# The company profile every tender is checked against, as markdown. Edited on the web page or by hand.
-COMPANY_DETAILS_FILE = Path(__file__).with_name('company_details.md')
-_company_lock = threading.Lock()
-
-def company_details(path=COMPANY_DETAILS_FILE):
-    """
-    Returns the company profile saved in path, as markdown, or an empty string if the file does not exist.
-    """
-    with _company_lock:
-        return _read_company(path)
-
-def save_company_details(text, path=COMPANY_DETAILS_FILE):
-    """
-    Saves the company profile to path. Writes a temporary file first, so a crash mid-write cannot leave
-    half a profile.
-    """
-    with _company_lock:
-        _write_company(text, path)
-
-def update_company_details(change, path=COMPANY_DETAILS_FILE):
-    """
-    Changes the company profile saved in path: change is given the profile as markdown and returns it changed,
-    saved unless it is the same. No other save can come between the read and the write.
-    """
-    with _company_lock:
-        text = _read_company(path)
-        changed = change(text)
-        if changed.strip() != text:
-            _write_company(changed, path)
-
-def _read_company(path):
-    try:
-        # utf-8-sig, because Windows editors may save the file with a BOM
-        return Path(path).read_text(encoding='utf-8-sig').strip()
-    except FileNotFoundError:
-        return ''
-
-def _write_company(text, path):
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(text.strip() + '\n', encoding='utf-8')
-    os.replace(temporary, path)
-
 ELIGIBILITY_GOAL = (
     'Find the eligibility / qualification criteria a bidder must meet, such as similar work experience, '
     'turnover, financial capacity, bid capacity and technical requirements. '
@@ -226,22 +182,25 @@ def make_model(model=SUMMARY_MODEL):
     llm = ChatGroq(model=model, temperature=0, timeout=120, max_tokens=LLM_MAX_OUTPUT_TOKENS, **reasoning)
     return llm.with_retry(stop_after_attempt=3) | RunnableLambda(_whole_reply)
 
-def assess_eligibility(llm, summaries, company=None, tender=None):
+def assess_eligibility(llm, summaries, company, tender=None, part=None):
     """
     Checks the company against the eligibility criteria found in summaries: the tender's document excerpts, one
     '## <source file>' section each, as retrieved from its Pinecone index.
-    company is the company profile as markdown; by default it is read from COMPANY_DETAILS_FILE.
+    company is the company profile as markdown.
     tender, if given, is the tender's data from the TenderTiger list as text (organisation, closing date, tender
     value and so on), sent with how to use its value and closing date (TENDER_DETAILS).
+    part, (number, of), says the excerpts are one batch of several, checked one at a time (a check too large for one
+    request): the model is to check only the criteria they state.
     Returns the model's assessment as markdown.
     """
-    if company is None:
-        company = company_details()
+    batch = (f'These excerpts are part {part[0]} of {part[1]} of the tender\'s: the other parts are checked '
+             'separately, so check only the criteria these excerpts state, and write "JV allowed: Not stated" when '
+             'they say nothing of a joint venture. ') if part else ''
     response = llm.invoke([
         {'role': 'system', 'content': (
             'You check tender eligibility. The document excerpts below, retrieved from the tender\'s documents, are '
             'the only source of eligibility criteria. "[…]" marks text left out between two excerpts. '
-            'Name the source file for each point.\n\n' + '\n\n'.join(summaries)
+            f'{batch}Name the source file for each point.\n\n' + '\n\n'.join(summaries)
         )},
         {'role': 'user', 'content': ELIGIBILITY_TASK.format(
             company_details=company, tender_details=TENDER_DETAILS.format(tender=tender) if tender else '')},

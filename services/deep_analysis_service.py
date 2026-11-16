@@ -19,7 +19,7 @@ one shared state (a blackboard), each reading what the agents before it wrote:
                  criteria for up to MAX_ROUNDS rounds, then gives each criterion's final status and confidence, the
                  determination, and the data gaps.
 
-The report, with an audit log of every step, is saved as DEEP_ANALYSIS_FILE in the tender's folder. It never
+The report, with an audit log of every step, is saved in the database (the deep_analyses table). It never
 changes the result it reviews. DeepAnalysisRunner runs one deep analysis at a time in a background thread.
 """
 import copy
@@ -31,12 +31,13 @@ import re
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
-from ext import (COMPANY_DETAILS_FILE, DEEP_AUDIT_MODEL, DEEP_PROFILER_MODEL, DEEP_STATUS_REVIEW_MODEL,
-                 DEEP_SUPERVISOR_MODEL, company_details, make_model)
-from services.analysis_service import DEEP_ANALYSIS_FILE, REQUIRES_REVIEW, TokenUsage, criterion_key, statuses_verdict
-from services.company_service import parse_profile, profile_for_tender
+from ext import DEEP_AUDIT_MODEL, DEEP_PROFILER_MODEL, DEEP_STATUS_REVIEW_MODEL, DEEP_SUPERVISOR_MODEL, make_model
+from psycopg.types.json import Json
+
+from services.analysis_service import (QUALIFICATION_SECTION, REQUIRES_REVIEW, TokenUsage,
+                                       criterion_key, statuses_verdict)
+from services.company_service import parse_profile
 from services.pinecone_service import NamespaceIncomplete, VectorStoreError
 from services.processing_service import TenderBusy, explain_error
 from utils.files import safe_name
@@ -266,9 +267,11 @@ def date_checks(facts, today):
 def load_knowledge(index, tcno, result):
     """
     What the agents read of the tender's documents, retrieved from its Pinecone namespace (index, a PineconeService):
-    the excerpts for each kind of requirement in KNOWLEDGE_QUERIES, and for each criterion of the result the excerpts
-    nearest its name and requirement (Supporting Evidence). Each excerpt is given once, numbered [E1], [E2], ... in
-    document order, followed by which excerpts answer each kind and each criterion.
+    the qualification section whole (QUALIFICATION_SECTION), the excerpts for each kind of requirement in
+    KNOWLEDGE_QUERIES, and for each criterion of the result the excerpts nearest its name and requirement (Supporting
+    Evidence; a hybrid search, where the index has sparse values, so its figures and clause numbers match exactly).
+    Each excerpt is given once, numbered [E1], [E2], ... in document order, followed by which excerpts answer each
+    kind and each criterion.
 
     Returns {'text', 'source', 'excerpts', 'warning'}; never raises: when the index is missing or Pinecone fails,
     text is empty and warning says why, so the audit works from the result's own requirements.
@@ -286,7 +289,7 @@ def load_knowledge(index, tcno, result):
     try:
         index.require()
         # Within the index's RETRIEVAL_MAX_CHARS, like the eligibility check, so one setting sizes every prompt
-        retrieval = index.retrieve(tcno, queries)
+        retrieval = index.retrieve(tcno, queries, section_queries=QUALIFICATION_SECTION)
     except NamespaceIncomplete:
         return {'text': '', 'source': None, 'excerpts': 0,
                 'warning': f'The Pinecone namespace {name} is missing or incomplete'}
@@ -313,6 +316,9 @@ def load_knowledge(index, tcno, result):
     pinned = labels.get('pinned')
     if pinned:
         guide.append(f"- TenderTiger's own data and pre-qualification criteria, given in full: {', '.join(pinned)}")
+    for label in QUALIFICATION_SECTION:
+        if labels.get(label):
+            guide.append(f"- The documents' qualification section, given whole: {', '.join(labels[label])}")
     unread = retrieval.unreadable
     text = ('### Excerpts\n' + '\n\n'.join(blocks) + '\n\n### Where each kind of requirement is found\n'
             + '\n'.join(guide))
@@ -654,7 +660,7 @@ def judge(llm, context, profile, audit, review, conflicts, round_number, rounds_
 
 def run_deep_analysis(result, knowledge, company, decision=None, on_progress=None, usage=None, today=None):
     """
-    Runs the five agents over a tender's completed result and returns the report saved as DEEP_ANALYSIS_FILE (see
+    Runs the five agents over a tender's completed result and returns the report DeepAnalysisRunner saves (see
     compile_report()). knowledge is what load_knowledge() retrieved from the tender's Pinecone namespace (None when it
     has none); company is the profile markdown; decision the team's shortlisted / dropped decision, if any.
 
@@ -920,30 +926,6 @@ def result_fingerprint(result, company):
     return hashlib.sha256(json.dumps(basis, sort_keys=True, ensure_ascii=False).encode('utf-8')).hexdigest()[:16]
 
 
-def save_report(folder, report):
-    """Writes the report to folder/DEEP_ANALYSIS_FILE, which read_report() reads back. Returns its path."""
-    path = Path(folder) / DEEP_ANALYSIS_FILE
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Written beside and then moved, so a crash mid-write cannot leave a report that cannot be read back
-    temporary = path.with_name(path.name + '.tmp')
-    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding='utf-8')
-    os.replace(temporary, path)
-    log.info('Saved the deep analysis of tender %s in %s', report['tcno'], path)
-    return path
-
-
-def read_report(path):
-    """The report saved by save_report(), or None when there is none or it cannot be read (logged)."""
-    try:
-        report = json.loads(Path(path).read_text(encoding='utf-8-sig'))
-    except FileNotFoundError:
-        return None
-    except (OSError, ValueError):
-        log.warning('Could not read the deep analysis %s', path, exc_info=True)
-        return None
-    return report if isinstance(report, dict) and report.get('status') == 'completed' else None
-
-
 def explain_deep_error(exc):
     """Returns (title, action): why a deep analysis failed and what to do, in the bid team's terms."""
     text = str(exc)
@@ -964,21 +946,29 @@ def explain_deep_error(exc):
 class DeepAnalysisRunner:
     """
     Runs deep analyses in background threads, one at a time (each makes several long LLM calls), and reports on
-    them. A tender's last report is read from its folder; only the run in progress, or the last failure, is kept
-    in memory. A failed run leaves the last saved report as it was.
+    them. A tender's last report is saved in db (a services.database.Database); only the run in progress, or the
+    last failure, is kept in memory. A failed run leaves the last saved report as it was.
     """
 
-    def __init__(self, processor, decisions=None, company_file=COMPANY_DETAILS_FILE):
+    def __init__(self, processor, db, decisions=None):
         self.processor = processor
+        self.db = db  # a services.database.Database: the reports are saved in it
         self.decisions = decisions
-        self.company_file = company_file
         self._lock = threading.Lock()
         self._runs = {}  # tcno -> {'status': 'queued' | 'running' | 'failed', ...}
         self._slot = threading.Semaphore(1)
 
-    def path(self, tcno):
-        """Where the tender's deep analysis is saved."""
-        return self.processor.target_directory / safe_name(tcno) / DEEP_ANALYSIS_FILE
+    def report(self, tcno):
+        """The tender's last saved report, or None."""
+        with self.db.connection() as connection:
+            row = connection.execute('SELECT report FROM deep_analyses WHERE tcno = %s', (str(tcno),)).fetchone()
+        return row[0] if row else None
+
+    def _save(self, report):
+        with self.db.connection() as connection:
+            connection.execute('INSERT INTO deep_analyses (tcno, report) VALUES (%s, %s) ON CONFLICT (tcno) DO UPDATE '
+                               'SET report = excluded.report, saved_at = now()', (str(report['tcno']), Json(report)))
+        log.info('Saved the deep analysis of tender %s', report['tcno'])
 
     def start(self, tcno):
         """
@@ -1010,11 +1000,13 @@ class DeepAnalysisRunner:
             return bool(run and run['status'] in ('queued', 'running'))
 
     def forget(self, tcno):
-        """Drops the tender's last failed run from memory, once the tender is deleted (its report goes with its folder)."""
+        """Forgets the tender's deep analysis once the tender is deleted: its saved report and a failed run."""
         with self._lock:
             run = self._runs.get(str(tcno))
             if run and run['status'] == 'failed':
                 del self._runs[str(tcno)]
+        with self.db.connection() as connection:
+            connection.execute('DELETE FROM deep_analyses WHERE tcno = %s', (str(tcno),))
 
     def state(self, tcno):
         """
@@ -1027,7 +1019,7 @@ class DeepAnalysisRunner:
         tcno = str(tcno)
         with self._lock:
             run = copy.deepcopy(self._runs.get(tcno))
-        analysis = read_report(self.path(tcno))
+        analysis = self.report(tcno)
         state = {'tcno': tcno, 'status': run['status'] if run else ('completed' if analysis else 'none'),
                  'progress': None, 'error': None, 'error_title': None, 'error_action': None,
                  'analysis': analysis, 'stale': False}
@@ -1046,10 +1038,10 @@ class DeepAnalysisRunner:
 
     def _company(self, tcno):
         """
-        The company profile the tender's agents review, without the tender's own marks (profile_for_tender()):
+        The company profile the tender's agents review, without the tender's own marks (CompanyStore.for_tender()):
         the audit judges afresh, and the status review sees the marks in the result.
         """
-        return profile_for_tender(company_details(self.company_file), tcno)
+        return self.processor.company_store.for_tender(tcno)
 
     def _update(self, tcno, **changes):
         with self._lock:
@@ -1075,8 +1067,10 @@ class DeepAnalysisRunner:
                 if not result or result['status'] != 'completed':
                     raise DeepAnalysisError(f'No completed result for TCNO {tcno}: it was checked again or failed.')
                 company = self._company(tcno)
-                entry =(self.decisions.all().get(tcno) if self.decisions else None) or {}
-                folder = self.processor.target_directory / safe_name(tcno)
+                entry = (self.decisions.all().get(tcno) if self.decisions else None) or {}
+                # Reviewed says the team looked, not what it thinks of the tender: nothing for the agents to review
+                if entry.get('decision') == 'reviewed':
+                    entry = {}
                 self._progress(tcno, 'ingestion', 'retrieving the criteria from the Pinecone namespace')
                 knowledge = load_knowledge(self.processor.index, tcno, result)
                 report = run_deep_analysis(result, knowledge, company, decision=entry.get('decision'), usage=usage,
@@ -1085,7 +1079,7 @@ class DeepAnalysisRunner:
                                       'fingerprint': result_fingerprint(result, company)}
                 with self._lock:
                     report['started_at'] = self._runs[tcno]['started_at']
-                save_report(folder, report)
+                self._save(report)
             except Exception as exc:
                 log.exception('Deep analysis of tender %s failed', tcno)
                 title, action = explain_deep_error(exc)

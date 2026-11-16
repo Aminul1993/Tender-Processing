@@ -3,12 +3,13 @@ import copy
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
 import unittest
 import zipfile
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -19,30 +20,30 @@ from fastapi.testclient import TestClient
 from langchain_core.language_models.fake_chat_models import GenericFakeChatModel
 from langchain_core.messages import AIMessage
 from PIL import Image, ImageDraw
+import psycopg
 from pptx import Presentation
-from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from app import create_app
 from config import Config
-from ext import (NOT_RELEVANT, TENDERTIGER_BLOCKED, AnswerCutOff, TenderTigerBlocked, _whole_reply, company_details,
-                 make_model, save_company_details)
+from ext import NOT_RELEVANT, TENDERTIGER_BLOCKED, AnswerCutOff, TenderTigerBlocked, _whole_reply, make_model
 from routes.api import BODY_ERRORS
 from services import tender_service
 from pinecone_fake import FakePinecone
 from services.cache_service import Cache
-from services.analysis_service import (RESULT_FILE, TENDER_DATA_SOURCE, OcrBudgetExceeded, TokenUsage, compare_routes,
-                                       jv_verdict, ocr_estimate, parse_criteria, parse_jv, parse_score, parse_verdict,
-                                       plain_maths, process_tender_files, recheck_saved_criteria, tender_data_text,
+from services import analysis_service
+from services.analysis_service import (LEGACY_DEEP_ANALYSIS_FILE, LEGACY_RESULT_FILE, OcrBudgetExceeded, TokenUsage,
+                                       compare_routes, jv_verdict, ocr_estimate, parse_criteria, parse_jv, parse_score,
+                                       parse_verdict, plain_maths, process_tender_files, recheck_saved_criteria,
                                        tender_files)
-from services.company_service import (company_profile, parse_profile, profile_for_tender, record_mark, render_profile,
+from services.company_service import (CompanyStore, company_profile, parse_profile, profile_for_tender, render_profile,
                                       unnamed_part)
 from services import deep_analysis_service as deep
-from services.deep_analysis_service import (DEEP_ANALYSIS_FILE, LLM_AGENTS, MAX_ROUNDS, DeepAnalysisError,
+from services.deep_analysis_service import (LLM_AGENTS, MAX_ROUNDS, DeepAnalysisError,
                                             parse_amount, parse_financial_year, parse_json_reply, run_deep_analysis)
 from services.download_service import DownloadError, download_tender_documents
 from services.pinecone_service import Document, NamespaceIncomplete, PineconeService, chunk_text
-from services.job_state import JobState
-from services.processing_service import TenderProcessor, explain_error, save_result
+from services.processing_service import TenderProcessor, explain_error, result_brief
+from test_database import scratch_database
 
 SAMPLE_TENDERS = {
     'KeywordList': [{'id': 1, 'keyword': 'india'}],
@@ -69,10 +70,11 @@ ASSESSMENT = """| Criterion | Requirement | Company | Status | Source |
 
 **Overall verdict:** Not eligible, because the net worth criterion is not met."""
 
+# As the profile reads back from the database: in the markdown render_profile() writes
 COMPANY = """# Company Eligibility Assessment (Sample Template)
 
 | Item | Value |
-|---|---|
+| --- | --- |
 | Company Name | ABC Infrastructure Ltd. |"""
 
 
@@ -303,7 +305,7 @@ class ParseTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {'GROQ_API_KEY': 'key'}), \
                 mock.patch('services.analysis_service.make_model') as make_model:
             with self.assertRaises(RuntimeError) as raised:
-                process_tender_files(tmp, index=pinecone_service(), company_file=Path(tmp) / 'missing.md')
+                process_tender_files(tmp, index=pinecone_service(), company_store=CompanyStore(scratch_database(self)))
         make_model.assert_not_called()
         self.assertEqual(explain_error(raised.exception)[0], 'The company profile is empty')
 
@@ -321,8 +323,9 @@ class AnalysisTestCase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.folder = Path(self.tmp.name) / '100091540'
         self.folder.mkdir()
-        self.company_file = Path(self.tmp.name) / 'company_details.md'
-        save_company_details(COMPANY, self.company_file)
+        self.db = scratch_database(self)
+        self.company_store = CompanyStore(self.db)
+        self.company_store.save(COMPANY)
         self.llm = mock.Mock()
         self.llm.with_config.return_value = self.llm  # TokenUsage.track() binds the token counter to it
         self.pinecone = FakePinecone()
@@ -336,10 +339,10 @@ class AnalysisTestCase(unittest.TestCase):
         self.tmp.cleanup()
 
     def process(self, **options):
-        return process_tender_files(self.folder, index=self.index, company_file=self.company_file, **options)
+        return process_tender_files(self.folder, index=self.index, company_store=self.company_store, **options)
 
     def recheck(self, **options):
-        return recheck_saved_criteria('100091540', index=self.index, company_file=self.company_file, **options)
+        return recheck_saved_criteria('100091540', index=self.index, company_store=self.company_store, **options)
 
     def indexed(self):
         """{source: its text} of everything in the tender's index, in the order it was indexed."""
@@ -467,10 +470,10 @@ class IndexedCriteriaTest(AnalysisTestCase):
         self.assertIn('## TenderTiger Tender Data', self.sources_sent())
         self.assertNotIn('Tender details, from the TenderTiger list', self.task_sent())
 
-    def test_result_and_deep_analysis_files_are_not_read_as_documents(self):
+    def test_an_old_versions_result_and_deep_analysis_files_are_not_read_as_documents(self):
         (self.folder / 'NIT.txt').write_text('x', encoding='utf-8')
-        (self.folder / RESULT_FILE).write_text('{}', encoding='utf-8')
-        (self.folder / DEEP_ANALYSIS_FILE).write_text('{}', encoding='utf-8')
+        (self.folder / LEGACY_RESULT_FILE).write_text('{}', encoding='utf-8')
+        (self.folder / LEGACY_DEEP_ANALYSIS_FILE).write_text('{}', encoding='utf-8')
         self.assertEqual([path.name for path in tender_files(self.folder)], ['NIT.txt'])
 
     def test_sources_with_no_text_make_an_empty_index_and_no_criteria(self):
@@ -519,8 +522,8 @@ class FileSelectionTest(AnalysisTestCase):
 
     def test_a_tender_is_checked_without_the_statuses_marked_on_its_own_criteria(self):
         net_worth = {'criterion': 'Net worth', 'requirement': '20 Cr'}
-        profile = record_mark(COMPANY, '100091540', net_worth, 'met', '2026-11-11')
-        save_company_details(record_mark(profile, '102309372', net_worth, 'not_met', '2026-11-11'), self.company_file)
+        self.company_store.mark('100091540', net_worth, 'met', '2026-11-11')
+        self.company_store.mark('102309372', net_worth, 'not_met', '2026-11-11')
         (self.folder / 'NIT.txt').write_text('Net worth at least 20 Cr', encoding='utf-8')
         self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
 
@@ -598,6 +601,16 @@ def scan_pdf(path, pages=2, ruled_page=None):
         for step in range(4):
             draw.line((100, 200 + 60 * step, 700, 200 + 60 * step), fill='black', width=3)
             draw.line((100 + 200 * step, 200, 100 + 200 * step, 380), fill='black', width=3)
+    images[0].save(path, save_all=True, append_images=images[1:])
+
+
+def marked_scan(path, marks):
+    """Saves a scan of blank pages with a black square at a place of its own on each: page n at marks[n - 1]."""
+    images = []
+    for mark in marks:
+        image = Image.new('RGB', (850, 1100), 'white')
+        ImageDraw.Draw(image).rectangle((100 + 40 * mark, 100, 130 + 40 * mark, 130), fill='black')
+        images.append(image)
     images[0].save(path, save_all=True, append_images=images[1:])
 
 
@@ -796,7 +809,7 @@ class CacheTest(AnalysisTestCase):
 
     def setUp(self):
         super().setUp()
-        self.cache = Cache(Path(self.tmp.name) / 'cache.sqlite3')
+        self.cache = Cache(self.db)
         self.index = pinecone_service(self.pinecone, cache=self.cache)
         self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
 
@@ -826,6 +839,10 @@ class CacheTest(AnalysisTestCase):
         self.assertGreater(first['index']['embedding_tokens'], second['index']['embedding_tokens'])
         self.assertIn('Estimated cost 120 Cr.', self.indexed()['BOQ.txt'])
         self.assertEqual(self.indexed()['scan.pdf'], '## Page 1\n\nPositive net worth')
+        # The namespace was kept: only the changed file's chunks were upserted again
+        self.assertNotIn(('delete_all', 'tcno-100091540'), self.pinecone.calls)
+        self.assertEqual((second['index']['kept_sources'], second['index']['upserted']),
+                         (2, len(chunk_text(changed, 400, 50))))
 
     def test_a_reading_with_parts_ocr_could_not_read_is_not_kept(self):
         document = pymupdf.open()
@@ -844,6 +861,50 @@ class CacheTest(AnalysisTestCase):
         self.assertEqual(second['unreadable_files'], [])  # read again, this time whole
         self.assertTrue(self.indexed()['RFP.pdf'].endswith('## Page 1, image 1\n\nPositive net worth'))
 
+    def test_a_scan_with_a_page_that_failed_reads_only_that_page_again(self):
+        marked_scan(self.folder / 'scan.pdf', [1, 2])
+        unsure = [paddle_line('N3t w0rth', 0.4)]
+        replies = iter([ConnectionError('timed out'), mock.Mock(content='Positive net worth')])
+
+        def invoke(messages):
+            if isinstance(messages[0]['content'], list):  # a page image to read
+                reply = next(replies)
+                if isinstance(reply, Exception):
+                    raise reply
+                return reply
+            return mock.Mock(content='**Overall verdict:** Eligible')
+
+        self.llm.invoke.side_effect = invoke
+        with mock.patch('services.ocr_service._paddle_lines',
+                        side_effect=[[paddle_line('Turnover at least 5 Cr')], unsure, unsure]) as paddle, \
+                self.assertLogs('services.ocr_service', 'WARNING'):
+            first = self.process(cache=self.cache)
+            # Page 1 is in the page cache, so only page 2 is left to OCR
+            self.assertEqual(ocr_estimate(self.folder, self.cache)['pages'], 1)
+            second = self.process(cache=self.cache)
+
+        self.assertEqual(first['unreadable_files'], ['scan.pdf'])
+        self.assertEqual(second['unreadable_files'], [])
+        self.assertEqual(paddle.call_count, 3)  # pages 1 and 2, then page 2 alone
+        self.assertEqual(self.indexed()['scan.pdf'],
+                         '## Page 1\n\nTurnover at least 5 Cr\n\n## Page 2\n\nPositive net worth')
+
+    def test_a_changed_scan_reads_only_its_new_pages(self):
+        marked_scan(self.folder / 'scan.pdf', [1, 2])
+        with mock.patch('services.ocr_service._paddle_lines',
+                        side_effect=[[paddle_line('Turnover at least 5 Cr')], [paddle_line('Positive net worth')],
+                                     [paddle_line('Corrigendum: closing date extended')]]) as paddle:
+            self.process(cache=self.cache)
+            marked_scan(self.folder / 'scan.pdf', [1, 2, 3])  # the same two pages and a new one: another file
+            self.assertEqual(ocr_estimate(self.folder, self.cache)['pages'], 1)
+            result = self.process(cache=self.cache)
+
+        self.assertEqual(paddle.call_count, 3)
+        self.assertEqual(self.indexed()['scan.pdf'], '## Page 1\n\nTurnover at least 5 Cr\n\n## Page 2\n\nPositive '
+                                                     'net worth\n\n## Page 3\n\nCorrigendum: closing date extended')
+        # The text changed, so its chunks were upserted again; nothing was deleted
+        self.assertEqual((result['index']['kept_sources'], result['index']['deleted']), (0, 0))
+
     def test_a_text_is_kept_by_file_and_reading_settings_and_a_vector_by_chunk_and_model(self):
         self.cache.save_text('abc', 'reader 1', 'Turnover at least 5 Cr')
         self.assertEqual(self.cache.text('abc', 'reader 1'), 'Turnover at least 5 Cr')
@@ -856,7 +917,7 @@ class CacheTest(AnalysisTestCase):
         self.assertEqual(self.cache.vectors('model/4', ['one']), [None])
 
     def test_a_cache_that_cannot_be_used_is_passed_over(self):
-        broken = Cache(Path(self.tmp.name))  # a folder, not a file
+        broken = Cache(mock.Mock(**{'connection.side_effect': psycopg.OperationalError('the database is down')}))
         with self.assertLogs('services.cache_service', 'WARNING'):
             self.assertIsNone(broken.text('abc', 'reader'))
             self.assertEqual(broken.vectors('model/3', ['one']), [None])
@@ -892,7 +953,7 @@ class OcrBudgetTest(AnalysisTestCase):
     def test_within_budget_or_approved_or_read_before_a_scan_is_read(self):
         scan_pdf(self.folder / 'scan.pdf', pages=3)
         self.llm.invoke.return_value = mock.Mock(content='**Overall verdict:** Eligible')
-        cache = Cache(Path(self.tmp.name) / 'cache.sqlite3')
+        cache = Cache(self.db)
         with mock.patch('services.ocr_service._paddle_lines', return_value=[paddle_line('Positive net worth')]):
             for budget in ({'pages': 3, 'usd': 0.5}, None):  # at the limit; approved (no budget)
                 self.assertEqual(self.process(ocr_budget=budget, cache=cache)['unreadable_files'], [])
@@ -939,6 +1000,112 @@ class ModelChoiceTest(AnalysisTestCase):
             self.recheck()
             self.assertEqual(models['assessment-model'].invoke.call_count, 2)
         models['summary-model'].invoke.assert_not_called()
+
+
+# Groq's answers when a request is over the plan's tokens per minute (413) and when the minute's tokens are used (429)
+TOO_LARGE = ("Error code: 413 - {'error': {'message': 'Request too large for model `openai/gpt-oss-120b` in organization "
+             "`org_x` service tier `on_demand` on tokens per minute (TPM): Limit 8000, Requested 9496, please reduce "
+             "your message size and try again.', 'type': 'tokens', 'code': 'rate_limit_exceeded'}}")
+RATE_LIMITED = ("Error code: 429 - {'error': {'message': 'Rate limit reached for model `openai/gpt-oss-120b` in "
+                "organization `org_x` on tokens per minute (TPM): Limit 8000, Used 7600, Requested 3000. Please try "
+                "again in 2.5s.', 'code': 'rate_limit_exceeded'}}")
+
+
+class BatchedCheckTest(AnalysisTestCase):
+    """A check too large for one request on the Groq plan is tried again with its excerpts in batches."""
+
+    def setUp(self):
+        super().setUp()
+        self.sent = []  # the excerpts of every request the model answered
+
+    def model(self, too_large, rate_limited=()):
+        """A fake model refusing, as Groq does, the requests whose excerpts too_large(excerpts) says are too large, and
+        the calls numbered in rate_limited (from 1) once each, as reaching the per-minute limit."""
+        calls = {'count': 0}
+
+        def invoke(messages):
+            excerpts = messages[0]['content']
+            calls['count'] += 1
+            if calls['count'] in rate_limited:
+                raise RuntimeError(RATE_LIMITED)
+            if too_large(excerpts):
+                raise RuntimeError(TOO_LARGE)
+            self.sent.append(excerpts)
+            rows = [row for marker, row in (
+                ('Turnover of', '| Turnover | 5 Cr | 171 Cr | Met | NIT.txt |'),
+                ('Net worth', '| Net worth | 20 Cr | 5 Cr | Not met | NIT.txt |'),
+                ('Similar work', '| Similar work | 1 work of 40 Cr | | Cannot determine | ATC.txt |'),
+                ('Turnover again', '| Turnover | 5 Cr | | Cannot determine | ATC.txt |'),
+            ) if marker in excerpts]
+            jv = ('JV allowed: Yes\nMaximum JV members: 2\n\n- The lead member holds at least 51%'
+                  if 'consortium' in excerpts else 'JV allowed: Not stated')
+            return mock.Mock(content='| Criterion | Requirement | Company | Status | Source |\n|---|---|---|---|---|\n'
+                             + '\n'.join(rows) + f'\n\n## Joint venture\n\n{jv}\n\n**Overall verdict:** Eligible')
+
+        self.llm.invoke.side_effect = invoke
+
+    def test_a_check_too_large_for_one_request_is_made_in_two_batches(self):
+        (self.folder / 'NIT.txt').write_text('Minimum average annual Turnover of 5 Cr. ' * 25, encoding='utf-8')
+        (self.folder / 'ATC.txt').write_text('Positive Net worth of 20 Cr. A consortium of two may bid. ' * 25,
+                                             encoding='utf-8')
+        self.model(lambda excerpts: False)
+        self.process()
+        whole = len(self.sent[0])
+        self.sent.clear()
+        # Too large in one request, as on the free tier; half of it passes
+        self.model(lambda excerpts: len(excerpts) >= whole)
+
+        with self.assertLogs('services.analysis_service', 'WARNING'):
+            result = self.recheck()
+
+        self.assertEqual(len(self.sent), 2)
+        self.assertIn('These excerpts are part 1 of 2', self.sent[0])
+        self.assertIn('These excerpts are part 2 of 2', self.sent[1])
+        # Each batch said Eligible for its part; joined, Net worth is not met
+        self.assertEqual(sorted((c['criterion'], c['status']) for c in result['criteria']),
+                         [('Net worth', 'not_met'), ('Turnover', 'met')])
+        self.assertEqual((result['verdict'], result['score']), ('Not Eligible', 50))
+        self.assertEqual((result['jv']['allowed'], result['jv']['max_members']), ('yes', 2))
+        self.assertEqual(result['jv']['conditions'], ['The lead member holds at least 51%'])
+        self.assertTrue(result['details'].startswith('**Checked in 2 batches.**'))
+        self.assertIn('Limit 8000, Requested 9496', result['details'])
+        self.assertIn('## Batch 2 of 2', result['details'])
+        self.assertEqual(result['index']['assessment_batches'], 2)
+
+    def batched(self, texts):
+        """_assess_in_batches() over chunks of these texts, in order, of one source."""
+        retrieval = mock.Mock(namespace='tcno-1', manifest={}, unreadable=[], chunks=[
+            {'source_file': 'NIT.txt', 'chunk_index': n * 2, 'overlap': 0, 'text': text} for n, text in enumerate(texts)])
+        progress = []
+        with mock.patch.object(analysis_service.time, 'sleep') as sleep:
+            analysis = analysis_service._assess_in_batches(self.llm, retrieval, None, COMPANY, None,
+                                                           RuntimeError(TOO_LARGE), progress.append)
+        return analysis, progress, sleep
+
+    def test_a_batch_still_too_large_is_split_again_and_the_per_minute_limit_waited_out(self):
+        # Turnover and Net worth together are too large; the second request reaches the per-minute limit once
+        self.model(lambda excerpts: 'Turnover' in excerpts and 'Net worth' in excerpts, rate_limited={3})
+        texts = ['Turnover of 5 Cr. ' * 10, 'Net worth of 20 Cr. ' * 10, 'Similar work of 40 Cr. ' * 5,
+                 'Turnover again, as stated. ' * 5]
+
+        analysis, progress, sleep = self.batched(texts)
+
+        self.assertEqual(analysis['batches'], 3)
+        self.assertEqual(len(self.sent), 3)
+        sleep.assert_called_once_with(3.5)  # Groq said 2.5 s
+        self.assertIn("Waiting 4 s for the Groq plan's per-minute token limit", progress)
+        # Turnover is in two batches, met in one and undetermined in the other: kept once, met
+        self.assertEqual([(c['criterion'], c['status']) for c in analysis['criteria']],
+                         [('Turnover', 'met'), ('Net worth', 'not_met'), ('Similar work', 'unknown')])
+        self.assertEqual((analysis['verdict'], analysis['score'], analysis['jv']['allowed']),
+                         ('Not Eligible', 33, 'unknown'))
+
+    def test_three_batches_still_too_large_fail_as_before(self):
+        self.model(lambda excerpts: True)
+        with self.assertRaises(RuntimeError) as raised:
+            self.batched(['Turnover of 5 Cr. ' * 5, 'Net worth of 20 Cr. ' * 5, 'Similar work of 40 Cr. ' * 5])
+        self.assertEqual(explain_error(raised.exception)[0], 'The request is too large for the Groq plan')
+        self.assertEqual(self.llm.invoke.call_count, 2)  # the first half, then its first half: the third batch
 
 
 class TokenUsageTest(AnalysisTestCase):
@@ -1025,36 +1192,18 @@ Figures in INR.
         blocks[6]['rows'].pop()
         self.assertEqual(parse_profile(markdown), blocks)
 
-    def test_statuses_marked_by_hand_are_recorded_in_their_own_section(self):
-        net_worth = {'criterion': 'Net worth', 'requirement': '20 Cr'}
-        gst = {'criterion': 'GST | registration', 'requirement': ''}
+    def test_the_marks_of_other_tenders_are_given_after_the_profile(self):
+        marks = [['Net worth', '20 Cr', 'Met', '100091540', '2026-11-11'],
+                 ['GST | registration', '', 'Cannot determine', '102309372', '2026-11-11']]
 
-        markdown = record_mark(COMPANY, '100091540', net_worth, 'met', '2026-11-11')
-        markdown = record_mark(markdown, '102309372', gst, 'unknown', '2026-11-11')
-
-        self.assertEqual(parse_profile(markdown), parse_profile(COMPANY) + [
+        self.assertEqual(parse_profile(profile_for_tender(COMPANY, marks)), parse_profile(COMPANY) + [
             {'type': 'rule'},
             {'type': 'heading', 'level': 2, 'text': 'Criteria marked by the bid team'},
-            {'type': 'table', 'columns': ['Criterion', 'Requirement', 'Status', 'TCNO', 'Marked on'], 'rows': [
-                ['Net worth', '20 Cr', 'Met', '100091540', '2026-11-11'],
-                ['GST | registration', '', 'Cannot determine', '102309372', '2026-11-11']]},
+            {'type': 'table', 'columns': ['Criterion', 'Requirement', 'Status', 'TCNO', 'Marked on'], 'rows': marks},
         ])
-        # Marked again, under a renumbered heading: the row is replaced where it is
-        markdown = record_mark(markdown.replace('## Criteria', '## 2. Criteria'), '100091540', net_worth, 'not_met',
-                               '2026-11-12')
-        self.assertEqual(parse_profile(markdown)[-1]['rows'],
-                         [['Net worth', '20 Cr', 'Not met', '100091540', '2026-11-12'],
-                          ['GST | registration', '', 'Cannot determine', '102309372', '2026-11-11']])
-        # Each tender is checked without its own marks; a profile with none is left exactly as it is
-        self.assertEqual(parse_profile(profile_for_tender(markdown, '100091540'))[-1]['rows'],
-                         [['GST | registration', '', 'Cannot determine', '102309372', '2026-11-11']])
-        self.assertEqual(profile_for_tender(COMPANY, '100091540'), COMPANY)
-
-        # Back to the AI's status: the row goes, and the section with its last row
-        markdown = record_mark(markdown, '100091540', net_worth, None, '2026-11-12')
-        markdown = record_mark(markdown, '102309372', gst, None, '2026-11-12')
-        self.assertEqual(parse_profile(markdown), parse_profile(COMPANY))
-        self.assertEqual(record_mark(COMPANY, '100091540', net_worth, None, '2026-11-12'), COMPANY)
+        # Without marks the profile is given exactly as it is, and an empty profile stays empty
+        self.assertEqual(profile_for_tender(COMPANY, []), COMPANY)
+        self.assertEqual(profile_for_tender('', marks), '')
 
     def test_rules_left_with_nothing_to_separate_are_dropped(self):
         blocks = [{'type': 'rule'}, {'type': 'heading', 'level': 2, 'text': '1. Basic'}, {'type': 'rule'},
@@ -1149,42 +1298,20 @@ class DownloadTest(unittest.TestCase):
             self.download(FakeResponse(b'<html>Session expired</html>', {'Content-Type': 'text/html; charset=utf-8'}))
 
 
-class JobStateTest(unittest.TestCase):
-    """The Redis client: an idle worker's wait must not outlast the client's patience for a reply."""
-
-    def test_a_redis_url_gets_a_reply_timeout_longer_than_a_wait(self):
-        state = JobState.connect('redis://default:secret@redis.invalid:6379/0')  # nothing is sent until used
-        options = state.redis.connection_pool.connection_kwargs
-        self.assertEqual((options['socket_timeout'], options['socket_connect_timeout']), (30, 10))
-
-    def test_a_wait_stays_under_the_socket_timeout_and_survives_one(self):
-        redis = mock.Mock()
-        redis.connection_pool.connection_kwargs = {'socket_timeout': 5}  # redis-py 8's default
-        state = JobState(redis)
-
-        state.wait(5)
-        self.assertEqual(redis.blpop.call_args.kwargs['timeout'], 3)
-
-        redis.connection_pool.connection_kwargs = {'socket_timeout': None}
-        redis.blpop.side_effect = RedisTimeoutError('Timeout reading from socket')
-        state.wait(5)  # as if nothing was queued
-        self.assertEqual(redis.blpop.call_args.kwargs['timeout'], 5)
-
-
 class ApiTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.db = db = scratch_database(self)
 
         class TestConfig(Config):
             TARGET_DIRECTORY = Path(self.tmp.name) / 'downloads'
             LOG_DIRECTORY = Path(self.tmp.name) / 'logs'
             LOG_LEVEL = 'WARNING'
-            REDIS_URL = None  # an in-process Redis of its own, whatever .env says
+            DATABASE_URL, DATABASE_SCHEMA = db.url, db.schema  # a database of its own, whatever .env says
             JOB_WORKERS = 1
-            COMPANY_DETAILS_FILE = Path(self.tmp.name) / 'company_details.md'
-            DEFAULT_FILTERS_FILE = Path(self.tmp.name) / 'default_filters.json'
+            WATCHLIST_REFRESH_HOURS = 0  # refreshed only when a test asks
 
-        save_company_details(COMPANY, TestConfig.COMPANY_DETAILS_FILE)
+        CompanyStore(db).save(COMPANY)
 
         patches = [
             mock.patch('services.tender_service.tender_list', return_value=SAMPLE_TENDERS),
@@ -1217,13 +1344,13 @@ class ApiTest(unittest.TestCase):
         (folder / 'NIT.pdf').write_bytes(b'x')
         return [folder / 'NIT.pdf']
 
-    def fake_analysis(self, folder, index=None, tcno=None, on_progress=None, company_file=None,
+    def fake_analysis(self, folder, index=None, tcno=None, on_progress=None, company_store=None,
                       prequalification_link=None, tender=None, usage=None, max_file_chars=None, workers=None,
                       cache=None, ocr_budget=None):
         self.ocr_budget = ocr_budget
         if self.ocr_needed and ocr_budget:
             raise OcrBudgetExceeded(self.ocr_needed, ocr_budget)
-        self.company_file = company_file
+        self.company_store = company_store
         self.prequalification_link = prequalification_link
         self.max_file_chars = max_file_chars
         self.analysed_with = (index, tcno, tender['tcno'] if tender else None)
@@ -1250,7 +1377,7 @@ class ApiTest(unittest.TestCase):
             ],
         }
 
-    def fake_recheck(self, tcno, index=None, on_progress=None, company_file=None, usage=None, tender=None):
+    def fake_recheck(self, tcno, index=None, on_progress=None, company_store=None, usage=None, tender=None):
         if index.manifest(tcno) is None:
             raise NamespaceIncomplete(f'Tender {tcno} has no complete Pinecone namespace')
         # A re-check is given the tender's row from the TenderTiger list, for its value, organisation and closing date
@@ -1262,6 +1389,10 @@ class ApiTest(unittest.TestCase):
                 'criteria': [{'criterion': 'Net worth', 'requirement': '20 Cr', 'company': '5 Cr',
                               'status': 'not_met', 'source': 'NIT.pdf'}],
                 'unreadable_files': []}
+
+    def profile(self):
+        """The company profile as saved."""
+        return CompanyStore(self.db).read()
 
     def index_tender(self, tcno):
         """Indexes a document for the tender, as an earlier run would have."""
@@ -1328,10 +1459,8 @@ class ApiTest(unittest.TestCase):
 
     def test_a_worker_process_takes_the_tenders_the_app_queues(self):
         client, web = self.app_with(JOB_WORKERS=0)
-        web.job_workers = 0  # REDIS_URL is unset here, so the app made it 1: as with a real Redis
-        # Another process's processor would reach the same Redis; here it shares the app's in-process one
-        worker = TenderProcessor.from_config(self.config, index=self.index, load_results=False, job_workers=0)
-        worker.state = web.state
+        # Another process's processor, over the same database
+        worker = TenderProcessor.from_config(self.config, web.state.db, index=self.index, job_workers=0)
         client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         time.sleep(0.3)
         self.assertEqual(client.get('/api/progress').json()['items'][0]['status'], 'queued')  # nobody took it
@@ -1350,12 +1479,25 @@ class ApiTest(unittest.TestCase):
             thread.join(10)
             self.assertFalse(thread.is_alive())
 
+    def test_tenders_left_queued_are_processed_after_a_restart(self):
+        client, _ = self.app_with(JOB_WORKERS=0)
+        client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.assertEqual(client.get('/api/progress').json()['items'][0]['status'], 'queued')
+
+        restarted, _ = self.app_with(JOB_WORKERS=1)
+
+        deadline = time.monotonic() + 5
+        while restarted.get('/api/progress').json()['status'] == 'running':
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.05)
+        self.assertEqual(restarted.get('/api/result/100091540').json()['verdict'], 'Eligible')
+
     def test_a_tender_whose_worker_stopped_is_failed(self):
         client, web = self.app_with(JOB_WORKERS=0)
-        web.job_workers = 0
         client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         item, _, _ = web._claim()  # as a worker would, which then dies: its lease runs out
-        web.state.redis.delete(web.state._key(f"lease:{item['id']}"))
+        with web.state.db.connection() as connection:
+            connection.execute('UPDATE job_items SET lease_until = NULL WHERE id = %s', (int(item['id']),))
 
         progress = client.get('/api/progress').json()
 
@@ -1465,7 +1607,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual([row['lead_status'] for row in result['comparison']], ['met', 'unknown'])
         self.assertNotIn('details', listed['result'])
         self.assertIsNotNone(self.client.get('/api/progress').json()['average_seconds'])
-        self.assertEqual(self.company_file, self.config.COMPANY_DETAILS_FILE)
+        self.assertEqual(self.company_store.read(), COMPANY)
         self.assertEqual(self.max_file_chars, self.config.MAX_FILE_CHARS)
         self.assertEqual(self.prequalification_link, PREQUALIFICATION_LINK)
         self.assertEqual(self.analysed_with, (self.index, '100091540', '100091540'))
@@ -1489,7 +1631,7 @@ class ApiTest(unittest.TestCase):
         result = self.client.get('/api/result/100091540').json()
         self.assertEqual((result['status'], result['verdict'], result['files']), ('completed', 'Eligible', []))
         self.assertEqual(self.prequalification_link, PREQUALIFICATION_LINK)
-        self.assertEqual(list(folder.iterdir()), [folder / RESULT_FILE])  # old.pdf is gone
+        self.assertEqual(list(folder.iterdir()), [])  # old.pdf is gone
         self.assertEqual(self.client.get('/api/result/102309372').json()['error_title'], 'No documents')
 
     def test_indexed_tenders_are_rechecked_unless_regenerated(self):
@@ -1497,8 +1639,9 @@ class ApiTest(unittest.TestCase):
         folder.mkdir(parents=True)
         (folder / 'NIT.pdf').write_bytes(b'kept from the first run')
         self.index_tender('100091540')
+        # The list says so from the results in the database alone, and this one has none yet; the check asks Pinecone
         rows = self.client.get('/api/tenders').json()['tenders']
-        self.assertEqual([row['has_indexed_criteria'] for row in rows], [True, False])
+        self.assertEqual([row['has_indexed_criteria'] for row in rows], [False, False])
         self.assertNotIn('has_saved_criteria', rows[0])
 
         queued = self.client.post('/api/process-tenders', json={'tcnos': ['100091540']}).json()
@@ -1521,10 +1664,26 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.rechecked, ['100091540'])  # not re-checked again: the documents were analysed
         self.assertEqual((result['verdict'], result['rechecked']), ('Eligible', False))
         self.assertEqual(self.prequalification_link, PREQUALIFICATION_LINK)
-        # Regenerating deleted the namespace before downloading again, then built it anew
-        self.assertIn(('delete_namespace', 'tcno-100091540'), self.pinecone.calls)
+        # Regenerating kept the namespace and upserted again the one source whose text changed
+        self.assertNotIn(('delete_namespace', 'tcno-100091540'), self.pinecone.calls)
+        self.assertNotIn(('delete_all', 'tcno-100091540'), self.pinecone.calls)
+        self.assertEqual([(meta['source_file'], meta['text']) for meta in self.pinecone.chunks('tcno-100091540').values()],
+                         [('NIT.pdf', 'Turnover 10 Cr')])
         self.assertEqual(result['namespace'], 'tcno-100091540')
         self.assertEqual(list(self.pinecone.indexes), ['tender-processing'])  # one shared index throughout
+
+    def test_a_regenerate_that_fails_before_indexing_keeps_the_namespace(self):
+        self.index_tender('100091540')
+        refused = DownloadError("TenderTiger's firewall is showing a browser check")
+        with mock.patch('services.processing_service.download_tender_documents', side_effect=refused):
+            self.client.post('/api/process-tenders', json={'tcnos': ['100091540'], 'regenerate': True})
+            self.wait_for_job()
+
+        self.assertEqual(self.client.get('/api/result/100091540').json()['status'], 'failed')
+        # Nothing in it changed, so it is complete again and can still be re-checked
+        self.assertNotIn(('delete_namespace', 'tcno-100091540'), self.pinecone.calls)
+        self.assertIsNotNone(self.index.manifest('100091540'))
+        self.assertEqual([meta['text'] for meta in self.pinecone.chunks('tcno-100091540').values()], ['Net worth 20 Cr'])
 
     def test_a_failed_build_leaves_no_namespace_behind(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['102309372']})  # its download fails
@@ -1563,7 +1722,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((result['status'], result['verdict'], result['rechecked']), ('completed', 'Eligible', False))
         self.assertEqual(self.rechecked, [])
 
-    def test_the_namespace_of_a_tender_can_be_inspected_and_deleted(self):
+    def test_the_namespace_of_a_tender_can_be_inspected(self):
         self.assertEqual(self.client.get('/api/namespace/100091540').json()['exists'], False)
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         self.wait_for_job()
@@ -1574,14 +1733,9 @@ class ApiTest(unittest.TestCase):
         self.assertEqual((status['index'], status['namespace'], status['exists'], status['complete']),
                          ('tender-processing', 'tcno-100091540', True, True))
         self.assertEqual([source['name'] for source in status['sources']], ['NIT.pdf'])
-
-        deleted = self.client.delete('/api/namespace/100091540').json()
-        self.assertEqual(deleted, {'tcno': '100091540', 'namespace': 'tcno-100091540', 'deleted': True})
-        self.assertFalse(self.client.get('/api/namespace/100091540').json()['exists'])
-        self.assertEqual([row['has_indexed_criteria'] for row in self.client.get('/api/tenders').json()['tenders']],
-                         [False, True])  # the other tender's namespace is untouched
-        self.assertIsNone(self.client.get('/api/result/100091540').json()['namespace'])
-        self.assertFalse(self.client.delete('/api/namespace/100091540').json()['deleted'])
+        # A namespace is deleted with its tender only (Delete in Closed tenders), never on its own
+        self.assertEqual(self.client.delete('/api/namespace/100091540').status_code, 405)
+        self.assertTrue(self.client.get('/api/namespace/100091540').json()['exists'])
 
     def test_without_pinecone_the_list_loads_and_each_check_fails_clearly(self):
         client = TestClient(create_app(self.config, vector_store=PineconeService(api_key=None)))
@@ -1595,23 +1749,6 @@ class ApiTest(unittest.TestCase):
         result = client.get('/api/result/100091540').json()
         self.assertEqual((result['status'], result['error_title']), ('failed', 'The Pinecone API key is missing'))
         self.assertEqual(client.get('/api/namespace/100091540').status_code, 503)
-
-    def test_results_saved_with_a_criteria_file_load_without_it(self):
-        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
-        self.wait_for_job()
-        path = self.config.TARGET_DIRECTORY / '100091540' / RESULT_FILE
-        saved = json.loads(path.read_text(encoding='utf-8'))
-        saved.pop('namespace')
-        saved['criteria_file'] = str(path.parent / 'eligibility_criteria.md')
-        saved['index_name'] = 'tcno-100091540'  # saved by the version with an index per tender
-        path.write_text(json.dumps(saved), encoding='utf-8')
-        self.index_tender('100091540')
-
-        restarted = TestClient(create_app(self.config, vector_store=self.index))
-        result = restarted.get('/api/result/100091540').json()
-        self.assertNotIn('criteria_file', result)
-        self.assertNotIn('index_name', result)
-        self.assertEqual(result['namespace'], 'tcno-100091540')
 
     def test_a_criterion_status_can_be_marked_by_hand_and_back(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
@@ -1633,17 +1770,17 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.get('/api/progress').json()['items'][0]['verdict'], 'Not Eligible')
         restarted = TestClient(create_app(self.config, vector_store=self.index))
         self.assertEqual(restarted.get('/api/result/100091540').json(), result)
-        # Recorded in the company profile too, for the tenders checked from now on
-        self.assertEqual(parse_profile(company_details(self.config.COMPANY_DETAILS_FILE))[-1]['rows'],
+        # Recorded with the bid team's marks too, for the tenders checked from now on, and not in the profile
+        self.assertEqual(CompanyStore(self.db).marks(),
                          [['Net worth', '20 Cr', 'Not met', '100091540', date.today().isoformat()]])
-        self.assertIn('Not met', self.client.get('/api/company').json()['details'])
+        self.assertEqual((self.profile(), self.client.get('/api/company').json()['details']), (COMPANY, COMPANY))
 
         result = self.client.put('/api/result/100091540/criteria/1', json={'status': None}).json()
 
         self.assertEqual((result['criteria'][1]['status'], result['verdict']), ('unknown', 'Eligible'))
         self.assertNotIn('marked_by_user', result['criteria'][1])
         self.assertNotIn('ai_verdict', result)
-        self.assertNotIn('marked by the bid team', company_details(self.config.COMPANY_DETAILS_FILE))
+        self.assertEqual(CompanyStore(self.db).marks(), [])
         self.assertEqual(self.client.put('/api/result/100091540/criteria/2', json={'status': 'met'}).status_code, 404)
         self.assertEqual(self.client.put('/api/result/999/criteria/0', json={'status': 'met'}).status_code, 404)
         refused = self.client.put('/api/result/100091540/criteria/0', json={'status': 'maybe'})
@@ -1666,7 +1803,7 @@ class ApiTest(unittest.TestCase):
         self.assertTrue(sheet.headers['content-disposition'].startswith('attachment'))
         # A web page among the files is downloaded, never shown as part of the app
         self.assertTrue(self.client.get('/api/files/100091540/page.html').headers['content-disposition'].startswith('attachment'))
-        for name in (RESULT_FILE, 'missing.pdf', '..%2F..%2Fcompany_details.md'):
+        for name in ('missing.pdf', '..%2F..%2Fcompany_details.md'):
             self.assertEqual(self.client.get(f'/api/files/100091540/{name}').status_code, 404, name)
 
     def test_files_the_ai_could_not_read_can_be_checked_by_hand(self):
@@ -1716,25 +1853,19 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.put('/api/result/100091540/criteria/0', json={'status': None}).status_code, 409)
         self.wait_for_job()
 
-    def test_results_are_saved_in_the_tender_folder_and_survive_a_restart(self):
+    def test_results_are_saved_in_the_database_and_survive_a_restart(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
         self.wait_for_job()
         before = {tcno: self.client.get(f'/api/result/{tcno}').json() for tcno in ('100091540', '102309372')}
-
-        for tcno, result in before.items():
-            saved = (self.config.TARGET_DIRECTORY / tcno / RESULT_FILE).read_text(encoding='utf-8')
-            self.assertEqual(json.loads(saved), result)
         self.assertEqual(before['100091540']['tokens']['total']['total'], 1740)  # saved with the result
-        broken = self.config.TARGET_DIRECTORY / '999' / RESULT_FILE
-        broken.parent.mkdir()
-        broken.write_text('{"tcno": "999"', encoding='utf-8')
+        # In the database alone: nothing is written beside the documents
+        self.assertEqual([path.name for path in (self.config.TARGET_DIRECTORY / '100091540').iterdir()], ['NIT.pdf'])
 
-        with self.assertLogs('services.processing_service', 'WARNING') as logs:
-            restarted = TestClient(create_app(self.config, vector_store=self.index))
+        restarted = TestClient(create_app(self.config, vector_store=self.index))
 
-        self.assertIn(str(broken), logs.output[0])
         for tcno, result in before.items():
             self.assertEqual(restarted.get(f'/api/result/{tcno}').json(), result)
+            self.assertEqual(list(restarted.get(f'/api/result/{tcno}').json()), list(result))  # keys in order
         rows = restarted.get('/api/tenders').json()['tenders']
         self.assertEqual([row['result']['status'] for row in rows], ['completed', 'failed'])
         self.assertEqual(rows[0]['result']['checks']['unknown'], ['Net worth'])
@@ -1747,32 +1878,62 @@ class ApiTest(unittest.TestCase):
             return (client or self.client).get('/api/closed-downloads').json()
 
     def saved_result(self, tcno):
-        return json.loads((self.config.TARGET_DIRECTORY / tcno / RESULT_FILE).read_text(encoding='utf-8'))
+        return self.client.app.state.tender_processor.state.result(tcno)
 
-    def test_closed_tenders_whose_documents_are_still_downloaded_are_listed(self):
+    def test_closed_tenders_are_listed_from_the_database_alone(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
         self.wait_for_job()
         self.assertEqual(self.saved_result('100091540')['closing_date'], '2026-11-18')
-        downloads = self.config.TARGET_DIRECTORY
-        # Documents with no result, so no closing date on record
-        (downloads / '555').mkdir()
-        (downloads / '555' / 'old.pdf').write_bytes(b'12345')
-        # A download's staging folder and a tender folder holding only its result are not listed
-        (downloads / 'tmp1x2y').mkdir()
-        (downloads / 'tmp1x2y' / 'all.zip').write_bytes(b'x')
-        (downloads / '777').mkdir()
-        (downloads / '777' / RESULT_FILE).write_text('{}', encoding='utf-8')
+        # The download folder is not looked at: a tender whose folder is gone is listed, a folder with no result is not
+        shutil.rmtree(self.config.TARGET_DIRECTORY / '100091540')
+        (self.config.TARGET_DIRECTORY / '777').mkdir()
+        (self.config.TARGET_DIRECTORY / '777' / 'old.pdf').write_bytes(b'12345')
+        # A result saved before closing dates were
+        old = {**self.saved_result('102309372'), 'tcno': '555', 'name': 'Hiring of vehicles'}
+        del old['closing_date']
+        self.client.app.state.tender_processor.state.put_result(old, result_brief(old))
 
         data = self.closed_downloads(date(2026, 11, 20))
-        self.assertEqual(data['directory'], str(downloads))
-        self.assertEqual(data['closed'], [{
-            'tcno': '100091540', 'name': 'Providing Project General Management Services',
-            'closing_date': '18-Nov-2026', 'days_closed': 2, 'files': 1, 'bytes': 1,
-        }])
-        self.assertEqual(data['unknown'], [{'tcno': '555', 'name': '', 'closing_date': None, 'days_closed': None,
-                                            'files': 1, 'bytes': 5}])
+        self.assertEqual(data, {
+            'closed': [{'tcno': '100091540', 'name': 'Providing Project General Management Services',
+                        'closing_date': '18-Nov-2026', 'days_closed': 2}],
+            'unknown': [{'tcno': '555', 'name': 'Hiring of vehicles', 'closing_date': None, 'days_closed': None}],
+        })
         # Still open on its closing date
         self.assertEqual(self.closed_downloads(date(2026, 11, 18))['closed'], [])
+
+    def test_tender_folders_with_no_result_are_found_and_deleted(self):
+        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
+        self.wait_for_job()
+        downloads = self.config.TARGET_DIRECTORY
+        # Left by a check that never finished, of a tender the list shows; and one holding an old version's result
+        (downloads / '102309372').mkdir()
+        (downloads / '102309372' / 'NIT.pdf').write_bytes(b'12345')
+        (downloads / '777').mkdir()
+        (downloads / '777' / LEGACY_RESULT_FILE).write_text('{}', encoding='utf-8')
+        # Not tenders' folders, or not stray: a download's staging folder, a tender with a result, one queued
+        (downloads / 'tmp1x2y').mkdir()
+        (downloads / 'tmp1x2y' / 'all.zip').write_bytes(b'x')
+        (downloads / '555').mkdir()
+        self.client.app.state.tender_processor.state.add_item({'tcno': '555', 'status': 'queued'}, {})
+        self.client.get('/api/tenders')  # so the list knows the tenders' names
+
+        data = self.client.get('/api/stray-downloads').json()
+
+        self.assertEqual(data, {'directory': str(downloads), 'tenders': [
+            {'tcno': '102309372', 'name': 'Construction of ROB', 'files': 1, 'bytes': 5},
+            {'tcno': '777', 'name': '', 'files': 1, 'bytes': 2}]})
+        # Without Pinecone nothing is deleted, as the tender's records there would be left behind
+        unconfigured = TestClient(create_app(self.config, vector_store=PineconeService(api_key=None)))
+        self.assertEqual(unconfigured.delete('/api/downloads/102309372').status_code, 503)
+        self.assertTrue((downloads / '102309372').exists())
+        # Delete takes the folder away, and the tender's records in Pinecone too; it is no longer found
+        self.index_tender('102309372')
+        deleted = self.client.delete('/api/downloads/102309372').json()
+        self.assertEqual((deleted['files'], deleted['namespace_deleted']), (1, True))
+        self.assertFalse((downloads / '102309372').exists())
+        self.assertFalse(self.client.get('/api/namespace/102309372').json()['exists'])
+        self.assertEqual([t['tcno'] for t in self.client.get('/api/stray-downloads').json()['tenders']], ['777'])
 
     def test_a_queued_tender_is_not_listed_as_closed(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540', '102309372']})
@@ -1795,22 +1956,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.get('/api/result/100091540').json()['closing_date'], '2026-11-25')
         self.assertEqual(self.closed_downloads(date(2026, 11, 20))['closed'], [])
 
-    def test_a_closing_date_missing_from_an_old_result_is_read_from_pinecone(self):
-        self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
-        self.wait_for_job()
-        # A result saved before closing dates were, of a tender whose TenderTiger data is indexed
-        result = self.saved_result('100091540')
-        del result['closing_date']
-        save_result(self.config.TARGET_DIRECTORY / '100091540', result)
-        tender = SAMPLE_TENDERS['TenderList'][0]
-        self.index.rebuild_namespace('100091540', [Document(TENDER_DATA_SOURCE, tender_data_text(tender), 'tender_data')])
-        restarted = TestClient(create_app(self.config, vector_store=self.index))
-
-        closed = self.closed_downloads(date(2026, 11, 20), restarted)['closed']
-        self.assertEqual([(row['tcno'], row['closing_date']) for row in closed], [('100091540', '18-Nov-2026')])
-        self.assertEqual(self.saved_result('100091540')['closing_date'], '2026-11-18')
-
-    def test_everything_kept_for_a_closed_tender_can_be_deleted_but_its_profile_marks(self):
+    def test_everything_kept_for_a_closed_tender_can_be_deleted_but_its_marks(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         self.wait_for_job()
         self.client.put('/api/result/100091540/criteria/1', json={'status': 'met'})
@@ -1819,9 +1965,9 @@ class ApiTest(unittest.TestCase):
         folder = self.config.TARGET_DIRECTORY / '100091540'
         (folder / 'unpacked').mkdir()
         (folder / 'unpacked' / 'BOQ.xlsx').write_bytes(b'xyz')
-        (folder / DEEP_ANALYSIS_FILE).write_text('{}', encoding='utf-8')
-        profile = self.config.COMPANY_DETAILS_FILE.read_text(encoding='utf-8')
-        self.assertIn('100091540', profile)  # the mark is recorded in the company profile
+        self.client.app.state.deep_analyses._save({'tcno': '100091540', 'status': 'completed'})
+        marks = CompanyStore(self.db).marks()
+        self.assertEqual([row[3] for row in marks], ['100091540'])  # the mark is recorded
 
         deleted = self.client.delete('/api/downloads/100091540')
         self.assertEqual(deleted.status_code, 200)
@@ -1834,12 +1980,11 @@ class ApiTest(unittest.TestCase):
         row = self.client.get('/api/tenders').json()['tenders'][0]
         self.assertEqual((row['tcno'], row['result'], row['decision'], row['has_indexed_criteria']),
                          ('100091540', None, None, False))
-        # Nothing of it is left in Redis: the job that checked only this tender is gone too
+        # Nothing of it is left in the database: the job that checked only this tender is gone too
         state = self.client.app.state.tender_processor.state
-        self.assertEqual(sorted(key.removeprefix(state.prefix) for key in state.redis.scan_iter(f'{state.prefix}*')),
-                         ['seq'])
+        self.assertEqual((state.result('100091540'), state.items(), state.job()), (None, [], None))
         self.assertEqual(self.client.get('/api/progress').json()['status'], 'idle')
-        self.assertEqual(self.config.COMPANY_DETAILS_FILE.read_text(encoding='utf-8'), profile)
+        self.assertEqual(CompanyStore(self.db).marks(), marks)
         restarted = TestClient(create_app(self.config, vector_store=self.index))
         self.assertEqual(restarted.get('/api/result/100091540').status_code, 404)
         self.assertIsNone(restarted.get('/api/tenders').json()['tenders'][0]['decision'])
@@ -1861,7 +2006,6 @@ class ApiTest(unittest.TestCase):
                          (['102309372'], 1, 100))
         state = self.client.app.state.tender_processor.state
         self.assertEqual([item['tcno'] for item in state.items()], ['102309372'])
-        self.assertEqual(len(state.redis.hkeys(state._key('payloads'))), 1)
         self.assertEqual(list(state.briefs()), ['102309372'])
 
     def test_a_tender_cannot_be_deleted_while_it_is_checked_or_a_file_is_open(self):
@@ -1944,21 +2088,33 @@ class ApiTest(unittest.TestCase):
         self.assertEqual([item['status'] for item in progress['items']], ['failed', 'completed'])
         self.assertEqual(self.rechecked, ['102309372'])
 
-    def test_decisions_are_saved_and_survive_a_restart(self):
-        response = self.client.put('/api/decision/100091540', json={'decision': 'dropped'})
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()['decision']['decision'], 'dropped')
+    def test_decisions_move_forward_only_and_survive_a_restart(self):
+        mark = lambda client, tcno, decision: client.put(f'/api/decision/{tcno}', json={'decision': decision})  # noqa: E731
+        # Pending by default; pending can be marked reviewed, shortlisted or dropped
+        self.assertEqual([row['decision'] for row in self.client.get('/api/tenders').json()['tenders']], [None, None])
+        reviewed = mark(self.client, '100091540', 'reviewed')
+        self.assertEqual((reviewed.status_code, reviewed.json()['decision']['decision']), (200, 'reviewed'))
+        # Reviewed can be shortlisted or dropped, and nothing before
+        self.assertEqual(mark(self.client, '100091540', 'reviewed').status_code, 409)
+        self.assertEqual(mark(self.client, '100091540', 'shortlisted').status_code, 200)
+        # Shortlisted can only be dropped
+        refused = mark(self.client, '100091540', 'reviewed')
+        self.assertEqual((refused.status_code, refused.json()['error']), (409, (
+            'Tender 100091540 is shortlisted, so it cannot be marked reviewed: it can only be marked dropped.')))
 
         restarted = TestClient(create_app(self.config, vector_store=self.index))
         rows = restarted.get('/api/tenders').json()['tenders']
-        self.assertEqual(rows[0]['decision']['decision'], 'dropped')
-        self.assertIsNone(rows[1]['decision'])
+        self.assertEqual((rows[0]['decision']['decision'], rows[1]['decision']), ('shortlisted', None))
+        self.assertEqual(mark(restarted, '100091540', 'dropped').json()['decision']['decision'], 'dropped')
+        # Dropped is final; a pending tender can be dropped straight away
+        refused = mark(restarted, '100091540', 'shortlisted')
+        self.assertEqual((refused.status_code, refused.json()['error']), (409, (
+            'Tender 100091540 is dropped, so it cannot be marked shortlisted: that is final.')))
+        self.assertEqual(mark(restarted, '102309372', 'dropped').status_code, 200)
 
-        self.assertIsNone(restarted.put('/api/decision/100091540', json={'decision': None}).json()['decision'])
-        self.assertIsNone(restarted.get('/api/tenders').json()['tenders'][0]['decision'])
-        self.assertEqual(restarted.put('/api/decision/100091540', json={'decision': 'maybe'}).status_code, 400)
-        self.assertEqual(restarted.put('/api/decision/100091540', json={}).status_code, 400)
-        self.assertEqual(restarted.put('/api/decision/999', json={'decision': 'dropped'}).status_code, 404)
+        for body in ({'decision': None}, {'decision': 'pending'}, {'decision': 'maybe'}, {}):
+            self.assertEqual(restarted.put('/api/decision/100091540', json=body).status_code, 400, body)
+        self.assertEqual(mark(restarted, '999', 'dropped').status_code, 404)
 
     def test_the_profile_gap_report_counts_this_month_s_cannot_determine_reasons(self):
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
@@ -1978,31 +2134,6 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.get('/api/profile-gaps', params={'month': '2020-01'}).json()['tenders'], 0)
         self.assertEqual(self.client.get('/api/profile-gaps', params={'month': '2026-13'}).status_code, 400)
 
-    def test_default_filters_come_from_the_json_file_as_query_parameters(self):
-        path = self.config.DEFAULT_FILTERS_FILE
-        response = self.client.get('/api/default-filters')
-        self.assertEqual(response.status_code, 404)
-        self.assertIn('default_filters.json', response.json()['error'])
-
-        path.write_text(json.dumps({'word': 'civil', 'closing_from': 'today', 'published_from': 'today-7',
-                                    'value': 5000000, 'emd_op': 'lt', 'bid_doc': True, 'msme': False,
-                                    'gem': 'non_gem'}), encoding='utf-8')
-        filters = self.client.get('/api/default-filters').json()
-        # Strings, as the form sends them; an unset flag and a comparison without its amount are left out, and an
-        # amount always comes with its comparison
-        self.assertEqual(filters, {'word': 'civil', 'closing_from': date.today().isoformat(),
-                                   'published_from': (date.today() - timedelta(days=7)).isoformat(),
-                                   'value': '5000000', 'value_op': 'gt', 'bid_doc': 'true', 'gem': 'non_gem'})
-        # What it returns is what the tender list takes
-        self.assertEqual(self.client.get('/api/tenders', params=filters).status_code, 200)
-
-        for content, problem in (('{"wrod": "civil"}', 'wrod'), ('{"closing_from": "soon"}', 'closing_from'),
-                                 ('["civil"]', 'one JSON object'), ('{"word": ', 'Could not read')):
-            path.write_text(content, encoding='utf-8')
-            response = self.client.get('/api/default-filters')
-            self.assertEqual(response.status_code, 500)
-            self.assertIn(problem, response.json()['error'])
-
     def test_company_profile_is_edited_as_a_form_and_saved_as_markdown(self):
         profile = self.client.get('/api/company').json()
         self.assertEqual((profile['details'], profile['name']), (COMPANY, 'ABC Infrastructure Ltd.'))
@@ -2018,7 +2149,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         saved = ('# Company Eligibility Assessment\n\n| Item | Value |\n| --- | --- |\n'
                  '| Company Name | XYZ Projects Pvt. Ltd. |\n| Turnover FY26 | 1710000000 |')
-        self.assertEqual(company_details(self.config.COMPANY_DETAILS_FILE), saved)
+        self.assertEqual(self.profile(), saved)
         self.assertEqual({key: response.json()[key] for key in ('details', 'name')},
                          {'details': saved, 'name': 'XYZ Projects Pvt. Ltd.'})
         self.assertEqual(len(response.json()['blocks'][1]['rows']), 2)
@@ -2028,7 +2159,7 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(self.client.put('/api/company', json=blank).json(), {'error': 'The company details cannot be empty.'})
         self.assertEqual(self.client.put('/api/company', json={'details': '# Markdown'}).status_code, 400)
         self.assertEqual(self.client.put('/api/company', json={'blocks': [{'type': 'chart'}]}).status_code, 400)
-        self.assertEqual(company_details(self.config.COMPANY_DETAILS_FILE), saved)
+        self.assertEqual(self.profile(), saved)
 
     def test_headings_and_sub_headings_are_added_and_renamed(self):
         blocks = self.client.get('/api/company').json()['blocks']
@@ -2046,7 +2177,7 @@ class ApiTest(unittest.TestCase):
         response = self.client.put('/api/company', json={'blocks': blocks})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(company_details(self.config.COMPANY_DETAILS_FILE), (
+        self.assertEqual(self.profile(), (
             '# Company Profile\n\n| Item | Value |\n| --- | --- |\n| Company Name | ABC Infrastructure Ltd. |\n\n---\n\n'
             '## 2. Key Personnel\n\n### Site Engineers\n\n| Item | Value |\n| --- | --- |\n| Civil engineers | 12 |'))
 
@@ -2063,13 +2194,14 @@ class ApiTest(unittest.TestCase):
         response = self.client.put('/api/company', json={'blocks': blocks})
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(company_details(self.config.COMPANY_DETAILS_FILE), (
+        self.assertEqual(self.profile(), (
             '# Company Eligibility Assessment (Sample Template)\n\n'
             '| Detail | Value | Status |\n| --- | --- | --- |\n| Company Name | ABC Infrastructure Ltd. | Verified |\n\n'
             '| Year | Turnover |\n| --- | --- |\n| FY26 | 1710000000 |'))
 
     def test_empty_company_profile_opens_a_starter_form(self):
-        self.config.COMPANY_DETAILS_FILE.unlink()
+        with self.db.connection() as connection:
+            connection.execute('DELETE FROM company_profile_blocks')
         profile = self.client.get('/api/company').json()
         self.assertEqual((profile['details'], profile['name']), ('', 'No company profile'))
         self.assertEqual(profile['blocks'][1]['rows'], [['Company Name', '']])
@@ -2197,7 +2329,7 @@ class ApiTest(unittest.TestCase):
             time.sleep(0.02)
         self.fail(f'the deep analysis did not reach {status}')
 
-    def test_a_deep_analysis_reviews_the_result_and_is_saved_beside_it(self):
+    def test_a_deep_analysis_reviews_the_result_and_is_saved(self):
         agents = self.deep_agents()
         self.client.post('/api/process-tenders', json={'tcnos': ['100091540']})
         self.wait_for_job()
@@ -2235,11 +2367,11 @@ class ApiTest(unittest.TestCase):
         self.assertEqual(report['inputs']['decision'], 'shortlisted')
         self.assertEqual([entry['agent'] for entry in report['audit_log']], list(deep.AGENTS))
 
-        folder = self.config.TARGET_DIRECTORY / '100091540'
-        self.assertEqual(json.loads((folder / DEEP_ANALYSIS_FILE).read_text(encoding='utf-8')), report)
-        # Saved beside the result, which it leaves as it was, and never listed as one of the tender's documents
+        # Saved in the database alone, leaving the result as it was
+        self.assertEqual(self.client.app.state.deep_analyses.report('100091540'), report)
+        self.assertEqual(list((self.config.TARGET_DIRECTORY / '100091540').iterdir()),
+                         [self.config.TARGET_DIRECTORY / '100091540' / 'NIT.pdf'])
         self.assertEqual(self.client.get('/api/result/100091540').json()['criteria'][1]['status'], 'met')
-        self.assertEqual(self.client.get(f'/api/files/100091540/{DEEP_ANALYSIS_FILE}').status_code, 404)
         download = self.client.get('/api/deep-analysis/100091540/file')
         self.assertEqual(download.json(), report)
         self.assertTrue(download.headers['content-disposition'].startswith('attachment'))
@@ -2378,6 +2510,17 @@ class DeepAnalysisTest(unittest.TestCase):
 
     def knowledge(self, result):
         return deep.load_knowledge(self.index, '100091540', result)
+
+    def test_the_qualification_section_is_given_whole(self):
+        from test_pinecone_service import SECTIONED_NIT
+        index = PineconeService(api_key='test-key', client=FakePinecone(dimension=512), dimension=512, chunk_size=300,
+                                chunk_overlap=40, top_k=4, max_chars=4000, freshness_timeout=1, settle_seconds=0)
+        index.rebuild_namespace('100091540', [Document('NIT.pdf', SECTIONED_NIT, 'nit')])
+
+        knowledge = deep.load_knowledge(index, '100091540', self.RESULT)
+
+        self.assertRegex(knowledge['text'], r"- The documents' qualification section, given whole: E\d+, E\d+")
+        self.assertIn('3.1 Financial Criteria', knowledge['text'])
 
     @staticmethod
     def replies():

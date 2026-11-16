@@ -409,7 +409,7 @@ kbd {
   background: var(--hover);
 }
 
-/* aria-disabled while what it started loads (Default filters): looks disabled, but keeps the keyboard focus */
+/* aria-disabled while what it started runs (Search again): looks disabled, but keeps the keyboard focus */
 .button-secondary:disabled,
 .button-secondary[aria-disabled="true"] {
   color: var(--faint);
@@ -835,6 +835,80 @@ select.filter-input {
 
 .filters-count[hidden] {
   display: none;
+}
+
+/* Pressed, the list is the watchlist's: the selected state, in blue */
+#watchlist-btn[aria-pressed="true"] {
+  border-color: color-mix(in oklch, var(--accent) 45%, white);
+  background: var(--accent-wash);
+  color: var(--accent-strong);
+}
+
+/* The watchlist's status, a sunk band under the toolbar like the search filters */
+.watchlist-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--line-2);
+  background: var(--surface-sunk);
+}
+
+.watchlist-bar[hidden] {
+  display: none;
+}
+
+.watchlist-status {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+  text-wrap: pretty;
+}
+
+.watchlist-lead {
+  color: var(--ink-2);
+  font-weight: 500;
+}
+
+.watchlist-bar.is-running .watchlist-lead {
+  color: var(--processing-fg);
+}
+
+.watchlist-bar.is-failed .watchlist-lead {
+  color: var(--not-fg);
+}
+
+/* A row's watchlist department, under its organisation */
+.org-watch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  align-self: flex-start;
+  max-width: 100%;
+  padding: 1px 8px 1px 6px;
+  border-radius: 999px;
+  background: var(--accent-wash);
+  color: var(--accent-strong);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.5;
+}
+
+.org-watch > span:not(.visually-hidden) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.org-watch .bi {
+  font-size: 11px;
+}
+
+.org-watch-inline {
+  display: none;
+  margin-top: 4px;
 }
 
 /* A sunk band under the toolbar, in the page flow, so no shadow */
@@ -1360,10 +1434,6 @@ tbody .cell-drop {
   transition: background-color .12s var(--ease-out), border-color .12s var(--ease-out), color .12s var(--ease-out);
 }
 
-.row-drop .bi-arrow-counterclockwise {
-  font-size: 14px;
-}
-
 .row-drop:hover {
   border-color: var(--control-line);
   background: var(--surface);
@@ -1473,6 +1543,10 @@ tbody .cell-drop {
   gap: 5px;
   font-size: 12px;
   font-weight: 500;
+}
+
+.decision-reviewed {
+  color: var(--ink-2);
 }
 
 .decision-shortlisted {
@@ -1959,6 +2033,13 @@ tbody .cell-drop {
   text-transform: uppercase;
 }
 
+/* The folders not in the database: set apart at the end of the popup */
+.closed-stray {
+  margin-top: 24px;
+  padding-top: 16px;
+  border-top: 1px solid var(--line-2);
+}
+
 .closed-note {
   margin: 0 0 10px;
   color: var(--muted);
@@ -1968,8 +2049,8 @@ tbody .cell-drop {
 }
 
 /*
- * On a phone each tender is a block: its name with Delete beside it, then one line under them, when it closed at
- * the left and its files at the right; without a closing date the files take the left.
+ * On a phone each tender is a block: its name with its action beside it, then one line under them: when it closed
+ * (Closed tenders), or the OCR it needs (the OCR estimate).
  */
 @media (max-width: 575.98px) {
   .closed-table thead {
@@ -2006,7 +2087,7 @@ tbody .cell-drop {
     text-align: left;
   }
 
-  /* Flush right, so a wide "5 files · 12.0 MB" under it never pulls one Delete out of line with the rest */
+  /* Flush right, so a wide figure under it never pulls one action out of line with the rest */
   .closed-table .closed-action {
     grid-row: 1;
     grid-column: 2;
@@ -2019,7 +2100,7 @@ tbody .cell-drop {
     min-width: 0;
   }
 
-  /* A figure and its note on one line: "2 files · 301 KB", "03 Nov 2026 · 8 days ago" */
+  /* A figure and its note on one line: "03 Nov 2026 · 8 days ago" */
   .closed-table td:not(:first-child) > div {
     display: inline;
   }
@@ -2098,20 +2179,14 @@ tbody .cell-drop {
   font-family: var(--font-mono);
 }
 
-.decision-button[aria-pressed="true"] {
-  font-weight: 600;
+/* The tender's decision, before the buttons of what it can become */
+.decision-now {
+  margin-right: 6px;
+  font-size: 13px;
 }
 
-.decision-shortlist[aria-pressed="true"] {
-  border-color: color-mix(in oklch, var(--eligible-dot) 45%, white);
-  background: var(--eligible-bg);
-  color: var(--eligible-fg);
-}
-
-.decision-drop[aria-pressed="true"] {
-  border-color: color-mix(in oklch, var(--not-dot) 45%, white);
-  background: var(--not-bg);
-  color: var(--not-fg);
+.decision-pending {
+  color: var(--muted);
 }
 
 /* The decision first: verdict, then the criteria that decide it */
@@ -3043,6 +3118,81 @@ input.profile-input {
   font-size: 13px;
 }
 
+/* Why an editor's last save was refused, in its footer in place of the note */
+.editor-error {
+  color: var(--not-fg);
+  font-weight: 500;
+}
+
+/* ---------- watchlist editor (on the profile editor's fields and tables) ---------- */
+
+.watchlist-settings {
+  display: grid;
+  grid-template-columns: minmax(180px, 240px) 1fr;
+  gap: 12px 16px;
+}
+
+@media (max-width: 575.98px) {
+  .watchlist-settings {
+    grid-template-columns: 1fr;
+  }
+}
+
+.watchlist-heading {
+  flex-wrap: wrap;
+  gap: 2px 8px;
+}
+
+.watchlist-hint {
+  flex-basis: 100%;
+  margin: 4px 0 0;
+  color: var(--meta);
+  font-size: 12px;
+}
+
+.profile-table th.watchlist-th {
+  padding: 8px 10px;
+}
+
+.watchlist-find {
+  max-width: 320px;
+  margin-bottom: 8px;
+}
+
+input.watchlist-find {
+  height: 34px;
+}
+
+.watchlist-table td {
+  vertical-align: top;
+}
+
+/* Patterns and names, one per line: monospace, so a regular expression reads as written */
+.watchlist-lines {
+  min-width: 260px;
+  height: auto;
+  min-height: 38px;
+  padding: 9px 10px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.watchlist-number {
+  min-width: 80px;
+}
+
+.watchlist-actions-cell {
+  width: 1%;
+  white-space: nowrap;
+}
+
+.watchlist-row-actions {
+  display: flex;
+  padding: 3px 4px;
+}
+
 /* ---------- toasts ---------- */
 
 .app-toast {
@@ -3089,6 +3239,10 @@ input.profile-input {
 
   .org-inline {
     display: block;
+  }
+
+  .org-watch-inline {
+    display: inline-flex;
   }
 }
 

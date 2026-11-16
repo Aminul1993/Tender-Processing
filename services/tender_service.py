@@ -5,8 +5,12 @@ every tender listed in memory.
 import logging
 import re
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
+from decimal import Decimal
+from typing import Annotated, Literal
 from urllib.parse import urlencode
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from ext import TENDER_PAGE_SIZE, TENDERTIGER_URL, tender_list
 
@@ -51,6 +55,68 @@ SORT_ORDERS = ('asc', 'desc')
 # How many tenders a page of the list may hold; TenderTiger sends a page of any of them in one request
 PAGE_SIZES = (TENDER_PAGE_SIZE, 50, 100, 500)
 
+Comparison = Literal['gt', 'gte', 'lt', 'lte', 'eq', 'between']
+Amount = Annotated[Decimal | None, Field(ge=0)]
+
+
+class TenderFilters(BaseModel):
+    """The filters of TenderTiger's search page, by the names the API takes; see search_fields()."""
+    model_config = ConfigDict(extra='forbid')  # a misspelt filter is an error, not silently ignored
+
+    word: str = ''
+    organisation: str = ''
+    location: str = ''
+    tid: str = ''
+    industry: str = ''
+    published_from: date | None = None
+    published_to: date | None = None
+    closing_from: date | None = None
+    closing_to: date | None = None
+    qty_op: Comparison = 'gt'
+    qty: Amount = None
+    qty_to: Amount = None
+    value_op: Comparison = 'gt'
+    value: Amount = None
+    value_to: Amount = None
+    emd_op: Comparison = 'gt'
+    emd: Amount = None
+    emd_to: Amount = None
+    gem: Literal['gem', 'non_gem'] | None = None
+    bidding: Literal['ncb', 'icb'] | None = None
+    funding: Literal['funded', 'non_funded'] | None = None
+    msme: bool = False
+    bid_doc: bool = False
+    startup: bool = False
+
+
+DATE_FIELDS = ('published_from', 'published_to', 'closing_from', 'closing_to')
+RELATIVE_DATE = re.compile(r'today(?:\s*([+-])\s*(\d+))?', re.IGNORECASE)
+
+
+def stored_filters(raw, source):
+    """
+    Filters kept in a JSON file by hand (the watchlist's), as TenderFilters: raw is the file's
+    object, with TenderFilters' names; a date may also be "today", "today+7" or "today-7" (days), read as of today.
+    Raises ValueError saying what is wrong, starting with source (the file's name).
+    """
+    if not isinstance(raw, dict):
+        raise ValueError(f'{source} must hold one JSON object of filters, like {{"bid_doc": true}}.')
+    try:
+        return TenderFilters.model_validate(
+            {name: _relative_date(value) if name in DATE_FIELDS else value for name, value in raw.items()})
+    except ValidationError as exc:
+        first = exc.errors()[0]
+        raise ValueError(f"{source}, {'.'.join(map(str, first['loc']))}: {first['msg']}") from None
+
+
+def _relative_date(value):
+    """A date filter of "today", "today+7" or "today-7" (days) as that date; any other value as it is."""
+    match = RELATIVE_DATE.fullmatch(value.strip()) if isinstance(value, str) else None
+    if not match:
+        return value
+    days = int(match[2] or 0)
+    return date.today() + timedelta(days=-days if match[1] == '-' else days)
+
 
 def load_tenders(filters=None, page=1, sort='closing', order='asc', page_size=TENDER_PAGE_SIZE):
     """
@@ -61,10 +127,7 @@ def load_tenders(filters=None, page=1, sort='closing', order='asc', page_size=TE
     TenderTiger, and TenderServiceError if the API fails.
     """
     fields = search_fields(filters or {})
-    if sort not in SORT_COLUMNS or order not in SORT_ORDERS:
-        raise ValueError(f'Sort by {", ".join(SORT_COLUMNS)}, in order {" or ".join(SORT_ORDERS)}.')
-    if page_size not in PAGE_SIZES:
-        raise ValueError(f'Show {", ".join(map(str, PAGE_SIZES[:-1]))} or {PAGE_SIZES[-1]} tenders a page.')
+    check_page(sort, order, page_size)
     try:
         json_response = tender_list(fields, page=page, sort=(SORT_COLUMNS[sort], order), page_size=page_size)
     except Exception as exc:
@@ -76,16 +139,29 @@ def load_tenders(filters=None, page=1, sort='closing', order='asc', page_size=TE
         log.error('Unexpected tender list response: %.200s', json_response)
         raise TenderServiceError('Unexpected tender list response: it has no TenderList')
 
-    with _lock:
-        _tenders.update({str(t['tcno']): t for t in tenders if t.get('tcno') is not None})
+    remember(tenders)
     log.info('Loaded %d tenders (page %d, %d a page, by %s %s)%s', len(tenders), page, page_size, sort, order,
              f' with filters {fields}' if fields else '')
     return tenders
 
 
+def check_page(sort, order, page_size):
+    """Raises ValueError unless sort is a SORT_COLUMNS name, order asc or desc, and page_size one of PAGE_SIZES."""
+    if sort not in SORT_COLUMNS or order not in SORT_ORDERS:
+        raise ValueError(f'Sort by {", ".join(SORT_COLUMNS)}, in order {" or ".join(SORT_ORDERS)}.')
+    if page_size not in PAGE_SIZES:
+        raise ValueError(f'Show {", ".join(map(str, PAGE_SIZES[:-1]))} or {PAGE_SIZES[-1]} tenders a page.')
+
+
+def remember(tenders):
+    """Keeps raw tenders listed elsewhere (the watchlist) with those of the list, so they can be processed too."""
+    with _lock:
+        _tenders.update({str(t['tcno']): t for t in tenders if t.get('tcno') is not None})
+
+
 def search_fields(filters):
     """
-    The fields TenderTiger's search page posts for filters, a dict with the keys of routes.api.TenderFilters:
+    The fields TenderTiger's search page posts for filters, a dict with the keys of TenderFilters:
       word, organisation, location, tid, industry  text: word search, organisation name, location, TID or tender
                                                    number, company industry
       published_from, published_to,                dates (datetime.date); a range may be open at one end
@@ -164,6 +240,11 @@ def closing_date(tender):
     return _parse_date(tender.get('closingdate'))
 
 
+def tender_value(tender):
+    """The raw tender's value as a float, or None when the list gives none."""
+    return _number(tender.get('tendervalue'))
+
+
 def to_row(tender):
     """
     Picks the fields the tender table shows. The browser only ever sends TCNOs back; the server looks up the
@@ -179,7 +260,7 @@ def to_row(tender):
         'published_date': _date_text(tender.get('publicationdate')),
         'closing_date': _date_text(tender.get('closingdate')),
         'days_left': (closing - date.today()).days if closing else None,
-        'tender_value': _number(tender.get('tendervalue')),
+        'tender_value': tender_value(tender),
         'currency': _text(tender.get('currcode')).upper(),
         'has_document': has_documents(tender),
         # Without documents, a tender is checked on its pre-qualification criteria alone

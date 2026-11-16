@@ -12,18 +12,18 @@ import logging
 import os
 import re
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from markitdown import MarkItDown, __version__ as MARKITDOWN_VERSION
 
-from ext import (ASSESSMENT_MODEL, COMPANY_DETAILS_FILE, OCR_MODEL, TenderTigerBlocked, assess_eligibility,
-                 company_details, make_model, prequalification_criteria)
+from ext import (ASSESSMENT_MODEL, OCR_MODEL, TenderTigerBlocked, assess_eligibility, make_model,
+                 prequalification_criteria)
 from services.cache_service import file_sha256
-from services.company_service import profile_for_tender
 from services.ocr_service import OCR_PAGE_COST, OCR_SETTINGS, ScanTooLong, add_ocr, ocr_parts
-from services.pinecone_service import Document, document_type
+from services.pinecone_service import Document, Retrieval, document_type
 from services.tender_service import to_row
 
 log = logging.getLogger(__name__)
@@ -42,10 +42,10 @@ _VERDICT_LABELS = {'eligible': ELIGIBLE, 'not eligible': NOT_ELIGIBLE, 'ineligib
 # The source names the tender's TenderTiger texts are indexed and checked under, beside the file names
 PREQUALIFICATION_SOURCE = 'TenderTiger Pre-Qualification'
 TENDER_DATA_SOURCE = 'TenderTiger Tender Data'
-# The result of a tender's last check is saved in its folder under this name; see processing_service.save_result()
-RESULT_FILE = 'eligibility_result.json'
-# The last deep analysis of that result is saved beside it under this name; see deep_analysis_service
-DEEP_ANALYSIS_FILE = 'deep_analysis.json'
+# Where versions before the database saved a tender's last result and deep analysis, in its folder: one left there
+# is no document (scripts/import_files_to_db.py imports them)
+LEGACY_RESULT_FILE = 'eligibility_result.json'
+LEGACY_DEEP_ANALYSIS_FILE = 'deep_analysis.json'
 # Tender files that hold no eligibility criteria, so are not read: drawings (one tender's drawings ran to 300k
 # tokens and held none) and GeM item lists (.csv of items, quantities and consignees). A BOQ is still read,
 # because it may give the estimated cost the criteria depend on.
@@ -84,6 +84,23 @@ ASSESSMENT_QUERIES = {
         'Exemptions and relaxations for MSE, MSME, Udyam or startup bidders; blacklisting and debarment conditions',
     ],
 }
+# The section of the documents that states the qualification criteria, taken whole before the searches above fill
+# the rest of the budget (hierarchical retrieval, see PineconeService.retrieve()): its matches vote for the section
+# they are in
+# A check too large for one request on the Groq plan (its 413, "request too large ... tokens per minute") is tried
+# again with its excerpts split in two batches, a batch still too large split in two again, up to MAX_BATCHES. A
+# batch that reaches the plan's per-minute limit (its 429, "rate limit reached ... try again in 12.3s") waits as long
+# as Groq says, up to RATE_LIMIT_WAITS times, and no more than RATE_LIMIT_MAX_SECONDS each
+MAX_BATCHES = 3
+RATE_LIMIT_WAITS = 4
+RATE_LIMIT_MAX_SECONDS = 90
+QUALIFICATION_SECTION = {
+    'qualification section': [
+        'Eligibility criteria and qualification requirements the bidder must meet to qualify',
+        'Qualifying criteria: similar works experience, average annual turnover, solvency or net worth, and '
+        'disqualification',
+    ],
+}
 
 
 class OcrBudgetExceeded(RuntimeError):
@@ -102,7 +119,8 @@ def ocr_estimate(tcno_folder, cache=None, max_file_chars=300_000):
     The OCR the tender's files would need, told without any OCR: {'pages', 'cost', 'files'}, where pages counts the
     pages and images to OCR, cost is the most that can cost (every one sent to OCR_MODEL, at OCR_PAGE_COST, in US
     dollars) and files is [{'name', 'pages'}] for each PDF that needs any. A file read before (in cache) needs none,
-    nor does one that is not read (_NO_CRITERIA) or that is too long to OCR (max_file_chars).
+    nor does a page or image read before, nor a file that is not read (_NO_CRITERIA) or that is too long to OCR
+    (max_file_chars).
     """
     tcno_folder = Path(tcno_folder)
     files = []
@@ -111,7 +129,7 @@ def ocr_estimate(tcno_folder, cache=None, max_file_chars=300_000):
             continue
         if cache and cache.text(file_sha256(path), _READER) is not None:
             continue
-        pages = ocr_parts(path, max_file_chars)
+        pages = ocr_parts(path, max_file_chars, cache)
         if pages:
             files.append({'name': path.relative_to(tcno_folder).as_posix(), 'pages': pages})
     pages = sum(file['pages'] for file in files)
@@ -157,17 +175,18 @@ class TokenUsage:
 
 
 def tender_files(tcno_folder):
-    """The tender's documents: every file under tcno_folder except the saved result and deep analysis."""
+    """The tender's documents: every file under tcno_folder except a result or deep analysis an older version saved
+    there."""
     tcno_folder = Path(tcno_folder)
-    saved = {tcno_folder / RESULT_FILE, tcno_folder / DEEP_ANALYSIS_FILE}
+    saved = {tcno_folder / LEGACY_RESULT_FILE, tcno_folder / LEGACY_DEEP_ANALYSIS_FILE}
     return sorted(path for path in tcno_folder.rglob('*') if path.is_file() and path not in saved)
 
 
-def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, company_file=COMPANY_DETAILS_FILE,
+def process_tender_files(tcno_folder, *, index, company_store, tcno=None, on_progress=None,
                          prequalification_link=None, tender=None, usage=None, max_file_chars=300_000, workers=4,
                          cache=None, ocr_budget=None):
     """
-    Checks the company profile saved in company_file against the eligibility criteria of a tender: every file
+    Checks the company profile in company_store against the eligibility criteria of a tender: every file
     under tcno_folder, the pre-qualification criteria behind prequalification_link (the tender's TenderTiger
     GetPreQualification link) when one is given, and the tender's TenderTiger data (tender, the raw list row) when
     given. Every source is converted to text (files in parallel, workers at a time), and all of them are indexed
@@ -183,8 +202,11 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
       criteria          the rows of the criteria table, see parse_criteria()
       unreadable_files  files that could not be read, so were not indexed or checked; PREQUALIFICATION_SOURCE
                         when the pre-qualification criteria could not be fetched
-      index             {'index', 'namespace', 'sources', 'chunks', 'embedding_tokens', 'retrieved_chunks',
-                        'retrieved_characters'}
+      index             {'index', 'namespace', 'sources', 'chunks', 'upserted', 'kept_sources', 'deleted',
+                        'embedding_tokens', 'retrieved_chunks', 'retrieved_characters', 'whole_sections'}: the
+                        chunks upserted, the sources left as they were (unchanged since the last build) and the
+                        chunks deleted, and the sections retrieved whole (see PineconeService.ingest() and
+                        retrieve())
 
     on_progress, if given, is called with a short status message before each step, plus step and steps
     (1-based position and total: one per file, then indexing, then the final check) when they are known.
@@ -202,7 +224,7 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
     tcno_folder = Path(tcno_folder)
     tcno = str(tcno or tcno_folder.name)
     # Read once, so every file of the tender is checked against the same profile
-    company = _company(company_file, tcno)
+    company = _company(company_store, tcno)
     index.require()
 
     files = tender_files(tcno_folder)
@@ -240,8 +262,9 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
                         estimate['pages'], estimate['cost'], ocr_budget)
             raise OcrBudgetExceeded(estimate, ocr_budget)
     # Before reading: a Pinecone plan with no room for the namespace fails the tender before any OCR is paid for
-    # (TenderProcessor has already made it before downloading; this empties it again, which is quick)
-    index.reset_namespace(tcno, on_progress=report)
+    # (TenderProcessor has already made it before downloading). The chunks of a complete namespace are kept, so
+    # ingest() upserts only the sources that changed since it was built.
+    index.reset_namespace(tcno, on_progress=report, keep=True)
 
     steps = len(files) + 2
     read, unreadable = read_documents(tcno_folder, files, usage, max_file_chars=max_file_chars, workers=workers,
@@ -258,7 +281,7 @@ def process_tender_files(tcno_folder, *, index, tcno=None, on_progress=None, com
     report(f'Checking eligibility against the criteria retrieved from {name}', step=steps, steps=steps)
     analysis = _assess_from_index(index, tcno, usage, company,
                                   f'None of the {len(files)} file(s) contained text that could be read.', manifest,
-                                  tender=tender)
+                                  tender=tender, on_progress=lambda message: report(message, step=steps, steps=steps))
     analysis['index'] = {**built, **analysis['index']}
     return analysis
 
@@ -301,7 +324,7 @@ def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4,
                 # spent on pages that would only be dropped with it.
                 try:
                     text, unread = add_ocr(path, text, usage.track(make_model(OCR_MODEL), 'criteria'),
-                                           max_chars=max_file_chars)
+                                           max_chars=max_file_chars, cache=cache)
                 except ScanTooLong as error:
                     log.warning('Not reading %s: %s is over MAX_FILE_CHARS (%d)', name, error, max_file_chars)
                     return name, None, f'{name} (too long: {error}; the MAX_FILE_CHARS limit is {max_file_chars:,})'
@@ -350,10 +373,10 @@ def tender_data_text(tender):
     return '\n'.join(f'{label}: {text}' for label, text in lines if text)
 
 
-def recheck_saved_criteria(tcno, *, index, on_progress=None, company_file=COMPANY_DETAILS_FILE, usage=None,
+def recheck_saved_criteria(tcno, *, index, company_store, on_progress=None, usage=None,
                            tender=None):
     """
-    Checks the company profile saved in company_file against the criteria retrieved from the tender's Pinecone
+    Checks the company profile in company_store against the criteria retrieved from the tender's Pinecone
     namespace (built by process_tender_files()), without downloading or reading the documents again: the embedding
     of the queries and one LLM call. The sources the namespace lists as unreadable stay unreadable, so the check is
     still marked incomplete. tender, the raw TenderTiger list row, if given, is sent as it is now, in place of the
@@ -366,44 +389,176 @@ def recheck_saved_criteria(tcno, *, index, on_progress=None, company_file=COMPAN
     """
     report = on_progress or (lambda message, **position: None)
     usage = usage or TokenUsage()
-    company = _company(company_file, tcno)
+    company = _company(company_store, tcno)
     index.require()
     name = index.namespace(tcno)
     report(f'Checking eligibility against the criteria retrieved from {name}', step=1, steps=1)
     return _assess_from_index(index, str(tcno), usage, company,
-                              f'The Pinecone namespace {name} holds no document text.', tender=tender)
+                              f'The Pinecone namespace {name} holds no document text.', tender=tender,
+                              on_progress=lambda message: report(message, step=1, steps=1))
 
 
-def _assess_from_index(index, tcno, usage, company, nothing_found, manifest=None, tender=None):
+def _assess_from_index(index, tcno, usage, company, nothing_found, manifest=None, tender=None, on_progress=None):
     """
-    Retrieves the chunks of ASSESSMENT_QUERIES from the tender's namespace and makes the final check on them.
-    manifest is the one the namespace was just built with, if it was. tender, the raw TenderTiger list row, if
-    given, goes to the model as the tender's details (tender value, organisation, closing date, ...), and its copy
-    in the namespace is left out of the excerpts.
+    Retrieves the QUALIFICATION_SECTION and the chunks of ASSESSMENT_QUERIES from the tender's namespace and makes
+    the final check on them: in one request, or in batches when that is too large for the Groq plan (see
+    _assess_in_batches()). manifest is the one the namespace was just built with, if it was. tender, the raw
+    TenderTiger list row, if given, goes to the model as the tender's details (tender value, organisation, closing
+    date, ...), and its copy in the namespace is left out of the excerpts. on_progress(message), if given, is told
+    of the batches and of waits for the plan's per-minute limit.
     """
-    retrieval = index.retrieve(tcno, ASSESSMENT_QUERIES, manifest=manifest)
-    sections = retrieval.sections()
-    details = None
-    if tender:
-        details = tender_data_text(tender)
-        sections = [section for section in sections if not section.startswith(f'## {TENDER_DATA_SOURCE}\n')]
-    analysis = _assess(usage.track(make_model(ASSESSMENT_MODEL), 'assessment'), sections,
-                       retrieval.unreadable, company, nothing_found, details)
+    retrieval = index.retrieve(tcno, ASSESSMENT_QUERIES, manifest=manifest, section_queries=QUALIFICATION_SECTION)
+    details = tender_data_text(tender) if tender else None
+    llm = usage.track(make_model(ASSESSMENT_MODEL), 'assessment')
+    try:
+        analysis = _assess(llm, _excerpts(retrieval, retrieval.chunks, tender), retrieval.unreadable, company,
+                           nothing_found, details)
+    except Exception as exc:
+        if not _too_large(exc):
+            raise
+        log.warning('Tender %s: the check is too large for one request on the Groq plan; checking it in batches',
+                    tcno)
+        analysis = _assess_in_batches(llm, retrieval, tender, company, details, exc,
+                                      on_progress or (lambda message: None))
     analysis['index'] = {'index': index.index_name, 'namespace': retrieval.namespace,
-                         'retrieved_chunks': len(retrieval.chunks), 'retrieved_characters': retrieval.characters}
+                         'retrieved_chunks': len(retrieval.chunks), 'retrieved_characters': retrieval.characters,
+                         'whole_sections': retrieval.whole_sections,
+                         'assessment_batches': analysis.pop('batches', 1)}
     return analysis
 
 
-def _company(company_file, tcno):
+def _excerpts(retrieval, chunks, tender):
+    """The chunks of a retrieval as the model's excerpts, one section per source (Retrieval.sections()); the
+    TenderTiger data indexed with the documents left out when the tender's list row goes with them."""
+    sections = Retrieval(namespace=retrieval.namespace, manifest=retrieval.manifest, chunks=chunks).sections()
+    if tender:
+        sections = [section for section in sections if not section.startswith(f'## {TENDER_DATA_SOURCE}\n')]
+    return sections
+
+
+def _too_large(exc):
+    """Whether exc is Groq's 413: one request over the plan's tokens per minute, which no retry can pass."""
+    text = str(exc).lower()
+    return 'request too large' in text and 'tokens per minute' in text
+
+
+def _rate_limit_wait(exc):
     """
-    The company profile in company_file to check tender tcno against (without its own marks, see
-    profile_for_tender()), after checking the LLM can be called. Raises RuntimeError.
+    The seconds to wait when exc is Groq's 429 (the plan's per-minute limit reached by requests just made), from its
+    "try again in 1m2.5s"; None for any other error.
+    """
+    text = str(exc)
+    if 'rate limit reached' not in text.lower():
+        return None
+    match = re.search(r'try again in ((?:\d+(?:\.\d+)?(?:ms|h|m|s))+)', text)
+    seconds = 60.0
+    if match:
+        units = {'ms': 0.001, 's': 1, 'm': 60, 'h': 3600}
+        seconds = sum(float(number) * units[unit]
+                      for number, unit in re.findall(r'(\d+(?:\.\d+)?)(ms|h|m|s)', match.group(1)))
+    return min(seconds + 1, RATE_LIMIT_MAX_SECONDS)
+
+
+def _paced(call, report):
+    """call(), waiting out the Groq plan's per-minute token limit when a batch reaches it (see _rate_limit_wait())."""
+    for attempt in range(RATE_LIMIT_WAITS + 1):
+        try:
+            return call()
+        except Exception as exc:
+            wait = _rate_limit_wait(exc)
+            if wait is None or attempt == RATE_LIMIT_WAITS:
+                raise
+            report(f"Waiting {wait:.0f} s for the Groq plan's per-minute token limit")
+            time.sleep(wait)
+
+
+def _halves(chunks):
+    """chunks (in document order) as two runs of about the same length of text, so a section stays together."""
+    total, used = sum(len(chunk['text']) for chunk in chunks), 0
+    for at, chunk in enumerate(chunks[:-1], 1):
+        used += len(chunk['text'])
+        if used >= total / 2:
+            return [chunks[:at], chunks[at:]]
+    return [chunks[:-1], chunks[-1:]]
+
+
+def _assess_in_batches(llm, retrieval, tender, company, details, too_large, report):
+    """
+    The final check when one request is too large for the Groq plan (too_large, its 413). The excerpts, in document
+    order, are split in two runs of about the same length, each checked on its own with the same instructions,
+    company profile and tender details; a run still too large is split in two again, up to MAX_BATCHES. Their
+    criteria are joined (a criterion found in more than one batch once, by the most telling status: not met, then met,
+    then cannot determine), the JV terms are taken from the batch that states them, and the verdict, score and JV
+    verdict are worked out from the joined statuses, as statuses_verdict() does. Returns the analysis _assess() does,
+    with 'batches'. Raises the error of a batch still too large at MAX_BATCHES, and any other error of a batch.
+    """
+    pending, batches, replies = _halves(retrieval.chunks), 2, []
+    while pending:
+        chunks = pending.pop(0)
+        excerpts = _excerpts(retrieval, chunks, tender)
+        if not excerpts:
+            continue
+        number = len(replies) + 1
+        report(f'Checking eligibility in {batches} batches: batch {number}')
+        try:
+            replies.append(plain_maths(_paced(
+                lambda: assess_eligibility(llm, excerpts, company, details, part=(number, batches)), report)))
+        except Exception as exc:
+            if not _too_large(exc) or batches >= MAX_BATCHES or len(chunks) < 2:
+                raise
+            pending[:0] = _halves(chunks)
+            batches += 1
+    if not replies:
+        raise too_large
+    return _join_batches(replies, retrieval.unreadable, too_large)
+
+
+# A criterion found in more than one batch keeps its most telling status: not met, then met, then cannot determine
+_STATUS_WEIGHT = {'not_met': 2, 'met': 1, 'unknown': 0}
+
+
+def _join_batches(replies, skipped, too_large):
+    """The analysis of the batches' replies, joined (see _assess_in_batches())."""
+    criteria = {}
+    for reply in replies:
+        for criterion in parse_criteria(reply):
+            key = criterion_key(criterion['criterion'])
+            kept = criteria.get(key)
+            if kept is None or _STATUS_WEIGHT[criterion['status']] > _STATUS_WEIGHT[kept['status']]:
+                criteria[key] = criterion
+    criteria = list(criteria.values())
+    jvs = [parse_jv(reply) for reply in replies]
+    jv = next((parsed for parsed in jvs if parsed['allowed'] == 'yes'), None) \
+        or next((parsed for parsed in jvs if parsed['allowed'] == 'no'), jvs[0])
+    jv = {**jv, 'conditions': list(dict.fromkeys(condition for parsed in jvs for condition in parsed['conditions']))}
+    comparison = compare_routes(criteria, jv)
+    statuses = [criterion['status'] for criterion in criteria]
+    met = sum(1 for status in statuses if status == 'met')
+    limit = re.search(r'Limit \d+, Requested \d+', str(too_large))
+    note = (f"**Checked in {len(replies)} batches.** The documents' excerpts were too many tokens for one request on "
+            f"the Groq plan{f' ({limit.group(0)} tokens per minute)' if limit else ''}, so they were checked in "
+            f'{len(replies)} parts, one after another. The verdict, score and JV verdict are worked out from the '
+            'statuses of all of them together; each part ends with its own verdict, for that part alone.')
+    details = '\n\n'.join([note] + [f'## Batch {number} of {len(replies)}\n\n{reply}'
+                                     for number, reply in enumerate(replies, 1)])
+    return {'verdict': statuses_verdict(statuses, skipped), 'details': _note_skipped(details, skipped),
+            'score': round(100 * met / len(criteria)) if criteria else None, 'criteria': criteria,
+            'unreadable_files': skipped, 'comparison': comparison,
+            'jv': {'allowed': jv['allowed'], 'max_members': jv['max_members'],
+                   'verdict': jv_verdict(comparison, jv, skipped), 'conditions': jv['conditions']},
+            'batches': len(replies)}
+
+
+def _company(company_store, tcno):
+    """
+    The company profile in company_store (a CompanyStore) to check tender tcno against, with the other tenders'
+    marks (CompanyStore.for_tender()), after checking the LLM can be called. Raises RuntimeError.
     """
     if not os.getenv('GROQ_API_KEY'):
         raise RuntimeError('GROQ_API_KEY is not set. Add it to .env and restart the app.')
-    company = profile_for_tender(company_details(company_file), tcno)
+    company = company_store.for_tender(tcno)
     if not company:
-        raise RuntimeError(f'The company profile in {company_file} is empty.')
+        raise RuntimeError('The company profile is empty. Add it with Edit profile on the page.')
     return company
 
 

@@ -22,6 +22,22 @@ Chunk IDs are derived from the source name and the chunk's position, so the mani
 (knowledge() fetches them all without listing the namespace) and an upsert repeated after a failure overwrites
 rather than duplicates.
 
+Regenerating keeps what has not changed: reset_namespace(keep=True) leaves the chunks of a complete namespace in
+place and marks its manifest 'building' and kept, and ingest() then compares each source's SHA-256 (of its text and
+everything that shapes its records) with the one the manifest lists, upserts only the sources that changed or are
+new, and deletes the chunks of the sources gone or grown shorter. Before its first change it marks the manifest
+'building' without kept, so a build that fails half-way leaves a namespace that is never kept, only rebuilt.
+
+Retrieval (retrieve()) is hybrid, hierarchical and adaptive:
+  hybrid        on an index with the dotproduct metric, each chunk also holds a sparse vector of its words and
+                figures (sparse_encoder.py), and a search scores dense and sparse together, so clause numbers and
+                rupee figures match exactly; dense alone on a cosine index
+  hierarchical  each chunk knows the chunks of the document sections it is in (document_sections.py): the searches
+                for the qualification section vote for the section their best matches are in, and that section is
+                taken whole, before the other searches fill what budget is left
+  adaptive      a search keeps its matches only down to a score floor, a share of its best match's score, instead
+                of always its top_k
+
 Pinecone serverless applies writes a few seconds after accepting them. A build therefore waits, before it writes
 the complete manifest and again after, until searches of the namespace have caught up with its last write. Pinecone
 reports each write's log position (lsn_committed) and how far each search has caught up (lsn_reconciled), which
@@ -33,6 +49,7 @@ errors; embedding and upserting run in parallel batches, so tenders with thousan
 """
 import hashlib
 import json
+import math
 import logging
 import random
 import re
@@ -42,16 +59,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from services import sparse_encoder
+from services.document_sections import VERSION as SECTIONS_VERSION, chunk_sections
+
 log = logging.getLogger(__name__)
 
 # The ID of the record that marks a namespace as complete and describes what it holds
 MANIFEST_ID = '__manifest__'
-# Bumped when the records change shape; a namespace of another version is rebuilt by the migration script
-SCHEMA_VERSION = 2
+# Bumped when the records change shape; a namespace of another version is rebuilt by the migration script, and its
+# sources are all upserted again by a regenerate. 3: chunks hold their sections, and sparse values on a dotproduct
+# index; sources their SHA-256.
+SCHEMA_VERSION = 3
 # The most inputs Pinecone's hosted embedding models take in one request
 EMBED_BATCH = 96
-# IDs fetched per request when reading chunks back by ID
+# IDs fetched per request when reading chunks back by ID, and deleted per request
 FETCH_BATCH = 100
+DELETE_BATCH = 1000
+# A search keeps at least this many matches, whatever their score, so a score floor never leaves a kind of
+# requirement with nothing
+MIN_MATCHES = 2
+# The most sections one retrieval takes whole
+MAX_SECTIONS = 2
 # Pinecone's limits on index and namespace names
 INDEX_NAME_LIMIT = 45
 NAMESPACE_NAME_LIMIT = 512
@@ -104,13 +132,16 @@ class Document:
 class Retrieval:
     """
     What retrieve() found in a tender's namespace. chunks are in document order (by source as indexed, then
-    position), each {'id', 'source_file', 'document_type', 'chunk_index', 'overlap', 'text', 'score', 'queries'},
-    where queries are the labels of the queries that found it and score the best of their scores (1.0 for a pinned
-    chunk).
+    position), each {'id', 'source_file', 'document_type', 'chunk_index', 'overlap', 'text', 'score', 'queries',
+    'section', 'sections', 'section_titles'}, where queries are the labels of the queries that found it and score
+    the best of their scores (1.0 for a pinned chunk), section the title of the document section it is in, and
+    sections and section_titles the chunk ranges and titles of the sections it is in (see document_sections.py).
+    whole_sections are the sections taken whole, each {'source_file', 'title', 'chunks' ('first-last'), 'label'}.
     """
     namespace: str
     manifest: dict
     chunks: list = field(default_factory=list)
+    whole_sections: list = field(default_factory=list)
 
     @property
     def unreadable(self):
@@ -151,7 +182,13 @@ def split_pieces(text, max_chars):
     found in the second half of the piece, so a piece is never cut short by a break near its start nor ends mid-word
     (unless a single word is longer than max_chars).
     """
-    pieces, start, text = [], 0, text.strip()
+    text = text.strip()
+    return [text[start:end] for start, end in _piece_spans(text, max_chars)]
+
+
+def _piece_spans(text, max_chars):
+    """split_pieces() of text, already stripped, as the (start, end) of each piece in it."""
+    spans, start = [], 0
     while start < len(text):
         end = min(start + max_chars, len(text))
         if end < len(text):
@@ -160,11 +197,12 @@ def split_pieces(text, max_chars):
                 if cut > start:
                     end = cut
                     break
-        piece = text[start:end].strip()
-        if piece:
-            pieces.append(piece)
+        piece = text[start:end]
+        if piece.strip():
+            lead = len(piece) - len(piece.lstrip())
+            spans.append((start + lead, start + lead + len(piece.strip())))
         start = end
-    return pieces
+    return spans
 
 
 def chunk_text(text, size=1600, overlap=200):
@@ -174,18 +212,23 @@ def chunk_text(text, size=1600, overlap=200):
     whole in one of them. Returns [(chunk, overlap)], where overlap is the number of leading characters the chunk
     repeats from the previous one.
     """
+    return [(chunk, repeated) for chunk, repeated, _ in _chunks((text or '').strip(), size, overlap)]
+
+
+def _chunks(text, size, overlap):
+    """chunk_text() of text, already stripped, with the (start, end) in text of each chunk's own piece."""
     overlap = max(0, min(overlap, size // 2))
-    pieces = split_pieces(text or '', max(1, size - overlap))
+    spans = _piece_spans(text, max(1, size - overlap))
     chunks = []
-    for number, piece in enumerate(pieces):
+    for number, (start, end) in enumerate(spans):
         tail = ''
         if number and overlap:
-            tail = pieces[number - 1][-overlap:]
+            tail = text[spans[number - 1][0]:spans[number - 1][1]][-overlap:]
             space = tail.find(' ')
             if 0 <= space < len(tail) - 1:
                 tail = tail[space + 1:]
             tail += '\n'
-        chunks.append((tail + piece, len(tail)))
+        chunks.append((tail + text[start:end], len(tail), (start, end)))
     return chunks
 
 
@@ -228,10 +271,10 @@ class PineconeService:
     """
 
     def __init__(self, api_key=None, index_name='tender-processing', namespace_prefix='tcno-', cloud='aws',
-                 region='us-east-1', embed_model='llama-text-embed-v2', dimension=1024, metric='cosine',
-                 chunk_size=1600, chunk_overlap=200, top_k=8, max_chars=60_000, upsert_batch=50, workers=4,
-                 attempts=4, ready_timeout=300, freshness_timeout=120, cache_seconds=30, settle_seconds=5,
-                 client=None, cache=None):
+                 region='us-east-1', embed_model='llama-text-embed-v2', dimension=1024, metric='dotproduct',
+                 chunk_size=1600, chunk_overlap=200, top_k=8, max_chars=60_000, hybrid_alpha=0.75, score_floor=0.85,
+                 min_score=0.2, section_share=0.5, upsert_batch=50, workers=4, attempts=4, ready_timeout=300,
+                 freshness_timeout=120, cache_seconds=30, settle_seconds=5, client=None, cache=None):
         self._api_key = api_key
         # A cache_service.Cache of chunk vectors, so a chunk embedded once is never embedded again; None embeds all
         self.cache = cache
@@ -241,11 +284,23 @@ class PineconeService:
         self.region = region
         self.embed_model = embed_model
         self.dimension = dimension
+        # The metric of an index made here. dotproduct scores the (unit length) dense vectors as cosine does, and
+        # also takes sparse values, for hybrid retrieval; an existing index keeps the metric it was made with.
         self.metric = metric
         self.chunk_size = chunk_size
         self.chunk_overlap = chunk_overlap
         self.top_k = top_k
         self.max_chars = max_chars
+        # The weight of the dense score in a hybrid search, the sparse one weighing the rest; 1 is dense alone
+        self.hybrid_alpha = min(1.0, max(0.0, hybrid_alpha))
+        # A search keeps its matches down to score_floor times its best match's score, and none under min_score (on
+        # the dense scale: times hybrid_alpha in a hybrid search), MIN_MATCHES whatever their score; 0 turns either off
+        self.score_floor = max(0.0, score_floor)
+        self.min_score = max(0.0, min_score)
+        # The most of max_chars the sections taken whole may fill; 0 takes none
+        self.section_share = min(1.0, max(0.0, section_share))
+        self._sparse = False  # the shared index takes sparse values (its metric is dotproduct); see ensure_index()
+        self._metric_warned = False
         self.upsert_batch = upsert_batch
         self.workers = max(1, workers)
         self.attempts = max(1, attempts)
@@ -259,6 +314,8 @@ class PineconeService:
         self._names = None  # the namespaces last listed
         self._names_at = 0.0  # time.monotonic() of that listing, or of the last failed one
         self._names_error = None
+        self._names_version = 0  # counts the namespaces created or deleted here, so a listing begun before one is not kept
+        self._names_refreshing = False  # a listing runs in the background (see namespaces())
         self._names_lock = threading.Lock()
         self._handle = None  # the pinecone Index of index_name
         self._handle_lock = threading.Lock()
@@ -271,9 +328,11 @@ class PineconeService:
         return cls(api_key=config.PINECONE_API_KEY, index_name=config.PINECONE_INDEX_NAME,
                    namespace_prefix=config.PINECONE_NAMESPACE_PREFIX, cloud=config.PINECONE_CLOUD,
                    region=config.PINECONE_REGION, embed_model=config.PINECONE_EMBED_MODEL,
-                   dimension=config.PINECONE_EMBED_DIMENSION, chunk_size=config.CHUNK_SIZE,
-                   chunk_overlap=config.CHUNK_OVERLAP, top_k=config.RETRIEVAL_TOP_K,
-                   max_chars=config.RETRIEVAL_MAX_CHARS, upsert_batch=config.PINECONE_UPSERT_BATCH,
+                   dimension=config.PINECONE_EMBED_DIMENSION, metric=config.PINECONE_METRIC,
+                   chunk_size=config.CHUNK_SIZE, chunk_overlap=config.CHUNK_OVERLAP, top_k=config.RETRIEVAL_TOP_K,
+                   max_chars=config.RETRIEVAL_MAX_CHARS, hybrid_alpha=config.RETRIEVAL_HYBRID_ALPHA,
+                   score_floor=config.RETRIEVAL_SCORE_FLOOR, min_score=config.RETRIEVAL_MIN_SCORE,
+                   section_share=config.RETRIEVAL_SECTION_SHARE, upsert_batch=config.PINECONE_UPSERT_BATCH,
                    workers=config.INGEST_WORKERS, client=client, cache=cache)
 
     # ---------- configuration and names ----------
@@ -310,35 +369,60 @@ class PineconeService:
 
     def namespaces(self, refresh=False):
         """
-        The tender namespaces (those starting with the prefix) in the index, listed at most every cache_seconds
-        (refresh lists them now). A failed listing is not retried until cache_seconds have passed, so a page of 500
-        tenders makes one call, not 500. Raises VectorStoreError when Pinecone cannot be reached.
+        The tender namespaces (those starting with the prefix) in the index, listed at most every cache_seconds. Once
+        the last list is older, it is still given at once while a fresh one is listed in the background (a listing
+        takes a second or more), so the tender lists never wait on Pinecone after the first; refresh lists them now
+        and waits. A failed listing is not retried until cache_seconds have passed, so a page of 500 tenders makes one
+        call, not 500. Raises VectorStoreError when Pinecone cannot be reached and there is no list to give.
         """
         # The lock guards the cache only, never a call to Pinecone, so a slow listing with retries cannot hold up the
         # request threads; two threads refreshing at once just both list
         with self._names_lock:
-            fresh = time.monotonic() - self._names_at < self.cache_seconds
-            if not refresh and fresh:
-                if self._names_error is not None:
-                    raise _CachedFailure(f'{self._names_error} (not asked again for {self.cache_seconds}s)')
-                if self._names is not None:
-                    return set(self._names)
+            stale = time.monotonic() - self._names_at >= self.cache_seconds
+            if not refresh and self._names is not None:
+                if stale and not self._names_refreshing:
+                    self._names_refreshing = True
+                    threading.Thread(target=self._list_in_background, name='pinecone-namespaces', daemon=True).start()
+                return set(self._names)
+            if not refresh and not stale and self._names_error is not None:
+                raise _CachedFailure(f'{self._names_error} (not asked again for {self.cache_seconds}s)')
+        try:
+            return self._list_names(attempts=None if refresh else 1)
+        except VectorStoreError as exc:
+            with self._names_lock:
+                self._names, self._names_at, self._names_error = None, time.monotonic(), str(exc)
+            raise
+
+    def _list_names(self, attempts):
+        """Lists the namespaces from Pinecone and keeps them, unless one was created or deleted here meanwhile."""
+        with self._names_lock:
+            version = self._names_version
 
         def listing():
             return {description.name for page in self._index().list_namespaces(prefix=self.namespace_prefix)
                     for description in page.namespaces}
 
         try:
-            names = self._call(f'list the namespaces of {self.index_name}', listing, attempts=None if refresh else 1)
+            names = self._call(f'list the namespaces of {self.index_name}', listing, attempts=attempts)
         except _NotFound:
             names = set()  # no index yet, so no namespace
-        except VectorStoreError as exc:
-            with self._names_lock:
-                self._names, self._names_at, self._names_error = None, time.monotonic(), str(exc)
-            raise
         with self._names_lock:
-            self._names, self._names_at, self._names_error = set(names), time.monotonic(), None
+            # A namespace created or deleted here during the listing may be missing from it: the next call lists again
+            if self._names_version == version:
+                self._names, self._names_at, self._names_error = set(names), time.monotonic(), None
         return set(names)
+
+    def _list_in_background(self):
+        """namespaces()'s background listing. A failure keeps the last list for another cache_seconds."""
+        try:
+            self._list_names(attempts=1)
+        except VectorStoreError as exc:
+            log.warning('Could not list the Pinecone namespaces again, so the last list stands a while: %s', exc)
+            with self._names_lock:
+                self._names_at = time.monotonic()
+        finally:
+            with self._names_lock:
+                self._names_refreshing = False
 
     def has_namespace(self, tcno, strict=False):
         """
@@ -396,38 +480,59 @@ class PineconeService:
                 raise VectorStoreError(f'The Pinecone index {name} has {dimension} dimensions, but '
                                        f'PINECONE_EMBED_DIMENSION is {self.dimension}. Set PINECONE_INDEX_NAME to a '
                                        'new index, or the dimension to match.')
+            metric = getattr(description, 'metric', None)
+            metric = str(getattr(metric, 'value', metric) or '').lower()
+            self._sparse = metric == 'dotproduct'
+            if not self._sparse and self.hybrid_alpha < 1 and not self._metric_warned:
+                self._metric_warned = True
+                log.warning('The Pinecone index %s uses the %s metric, so retrieval is dense only: hybrid retrieval '
+                            '(clause numbers and rupee figures matched exactly) needs the dotproduct metric. Set '
+                            'PINECONE_INDEX_NAME to a new index: each tender is indexed into it when next checked, '
+                            'its files and chunks in the cache not read or embedded again.', name,
+                            metric or 'unknown')
             self._ready = True
             return name
 
     # ---------- building and deleting a tender's namespace ----------
 
-    def reset_namespace(self, tcno, on_progress=None):
+    def reset_namespace(self, tcno, on_progress=None, keep=False):
         """
-        Makes the tender's namespace empty and marked as being built, ready for ingest(): the shared index is made if
-        need be, a namespace holding anything is emptied (and waited on until Pinecone counts it empty), and a
-        manifest with status 'building' is written, which creates the namespace. Called before a tender's documents
-        are downloaded and read, so a Pinecone plan with no room for another namespace fails the tender before any
-        download or OCR is spent. Returns the namespace. Raises QuotaExceeded, or VectorStoreError when Pinecone
-        fails.
+        Makes the tender's namespace ready for ingest(), marked as being built: the shared index is made if need be,
+        a namespace holding anything is emptied, and a manifest with status 'building' is written, which creates the
+        namespace. Called before a tender's documents are downloaded and read, so a Pinecone plan with no room for
+        another namespace fails the tender before any download or OCR is spent.
+
+        keep leaves a namespace that ingest() can add to in place instead of emptying it (one with a complete
+        manifest, built with this embedding model and schema, or one this kept already and nothing has changed
+        since): its manifest is rewritten as building and kept, so ingest() upserts only the sources that changed.
+
+        The manifest is waited on until searches see it, so ingest() reads this one back, never the one before.
+        Returns the namespace. Raises QuotaExceeded, or VectorStoreError when Pinecone fails.
         """
         report = on_progress or (lambda message: None)
         self.ensure_index()
         namespace = self.namespace(tcno)
         index = self._index()
+        manifest = {'record_type': 'manifest', 'tcno': str(tcno), 'status': 'building', 'created_at': _now()}
         if namespace in self.namespaces(refresh=True):
-            report(f'Emptying the Pinecone namespace {namespace}')
-            # Applied in order before every write that follows, so no old record survives the rebuild; ingest()
-            # waits until searches see its last write, so they no longer see these either
-            try:
-                self._call(f'empty the namespace {namespace}',
-                           lambda: index.delete(delete_all=True, namespace=namespace))
-            except _NotFound:
-                pass
+            kept = self._reusable(namespace) if keep else None
+            if kept:
+                report(f'Keeping the unchanged sources of the Pinecone namespace {namespace}')
+                manifest = {**kept[0], 'status': 'building', 'kept': True, 'created_at': manifest['created_at']}
+            else:
+                report(f'Emptying the Pinecone namespace {namespace}')
+                # Applied in order before every write that follows, so no old record survives the rebuild; ingest()
+                # waits until searches see its last write, so they no longer see these either
+                try:
+                    self._call(f'empty the namespace {namespace}',
+                               lambda: index.delete(delete_all=True, namespace=namespace))
+                except _NotFound:
+                    pass
         report(f'Preparing the Pinecone namespace {namespace}')
-        self._upsert(namespace, [{'id': MANIFEST_ID, 'values': self._unit(), 'metadata': {
-            'record_type': 'manifest', 'tcno': str(tcno), 'status': 'building', 'created_at': _now()}}],
-            f'create the namespace {namespace}')
+        written = self._upsert(namespace, [{'id': MANIFEST_ID, 'values': self._unit(), 'metadata': manifest}],
+                               f'create the namespace {namespace}')
         self._remember(namespace, exists=True)
+        self._wait_until_searchable(namespace, written)
         return namespace
 
     def ingest(self, tcno, documents, unreadable=(), on_progress=None):
@@ -438,31 +543,62 @@ class PineconeService:
         unreadable are the sources that could not be read, kept in the manifest so a re-check still knows the check
         is incomplete.
 
-        Returns {'index', 'namespace', 'sources', 'chunks', 'embedding_tokens', 'manifest'}, manifest as manifest()
-        reads it (to retrieve from at once, without reading it back). on_progress, if given, is called with a short
-        status message as the work goes on. Raises VectorStoreError; the namespace is then left without a complete
-        manifest, so it is never trusted and is rebuilt next time.
+        In a namespace reset_namespace(keep=True) kept, a source with the same name and SHA-256 as before is left as
+        it is (its chunks are not upserted again), and the chunks no source has any more are deleted. The manifest is
+        first marked building and no longer kept, so a failure part-way leaves a namespace that is rebuilt from
+        scratch next time.
+
+        Returns {'index', 'namespace', 'sources', 'chunks', 'upserted', 'kept_sources', 'deleted',
+        'embedding_tokens', 'manifest'}: the chunks upserted now, the sources left as they were and the chunks
+        deleted, and the manifest as manifest() reads it (to retrieve from at once, without reading it back).
+        on_progress, if given, is called with a short status message as the work goes on. Raises VectorStoreError;
+        the namespace is then left without a complete manifest, so it is never trusted and is rebuilt next time.
         """
         report = on_progress or (lambda message: None)
         tcno = str(tcno)
         namespace = self.namespace(tcno)
         started = time.monotonic()
+        self.ensure_index()  # knows whether the index takes sparse values
         records, sources = self.chunk_documents(tcno, documents)
-        tokens, written = self.upsert_chunks(tcno, records, on_progress=report)
-        if records:
-            report(f'Waiting until Pinecone can search all {len(records):,} chunks')
+        kept, content = self._reusable(namespace, kept_only=True) or ({}, {})
+        before = {source['name']: source for source in content.get('sources') or []}
+        unchanged = {source['name'] for source in sources
+                     if (before.get(source['name']) or {}).get('sha256') == source['sha256']
+                     and before[source['name']].get('chunks') == source['chunks']}
+        counts = {source['name']: source['chunks'] for source in sources}
+        stale = [chunk_id(name, position) for name, source in before.items()
+                 for position in range(counts.get(name, 0), int(source.get('chunks') or 0))]
+        fresh = [record for record in records if record['metadata']['source_file'] not in unchanged]
+        if kept and (fresh or stale):
+            # The kept chunks no longer match the old manifest from here: a failure now must not keep them
+            self._upsert(namespace, [{'id': MANIFEST_ID, 'values': self._unit(), 'metadata': {
+                'record_type': 'manifest', 'tcno': tcno, 'status': 'building', 'created_at': _now()}}],
+                f'mark the namespace {namespace} as being rebuilt')
+        if unchanged:
+            report(f'Keeping {len(unchanged)} unchanged source(s) in {namespace}')
+        if stale:
+            report(f'Deleting {len(stale):,} chunk(s) of sources gone or shorter from {namespace}')
+            self._delete_ids(namespace, stale)
+        tokens, written = self.upsert_chunks(tcno, fresh, on_progress=report)
+        if fresh:
+            report(f'Waiting until Pinecone can search all {len(fresh):,} chunks')
             if not self._wait_until_searchable(namespace, written):
                 # No log position to wait for: wait for the count instead (the 'building' manifest counts too)
                 self._wait_for_count(namespace, lambda count: count >= len(records) + 1, 'to count every chunk')
-        manifest = self._write_manifest(tcno, len(records), sources, unreadable)
-        log.info('Indexed tender %s in %s/%s: %d source(s), %d chunk(s), %d embedding tokens, %.1fs', tcno,
-                 self.index_name, namespace, len(sources), len(records), tokens, time.monotonic() - started)
+        manifest = self._write_manifest(tcno, len(records), sources, unreadable, int(kept.get('parts') or 0))
+        log.info('Indexed tender %s in %s/%s: %d source(s), %d chunk(s); %d upserted, %d source(s) kept unchanged, '
+                 '%d deleted; %d embedding tokens, %.1fs', tcno, self.index_name, namespace, len(sources),
+                 len(records), len(fresh), len(unchanged), len(stale), tokens, time.monotonic() - started)
         return {'index': self.index_name, 'namespace': namespace, 'sources': len(sources), 'chunks': len(records),
+                'upserted': len(fresh), 'kept_sources': len(unchanged), 'deleted': len(stale),
                 'embedding_tokens': tokens, 'manifest': manifest}
 
-    def rebuild_namespace(self, tcno, documents, unreadable=(), on_progress=None):
-        """Builds the tender's namespace from scratch: reset_namespace() then ingest(). Returns what ingest() does."""
-        self.reset_namespace(tcno, on_progress=on_progress)
+    def rebuild_namespace(self, tcno, documents, unreadable=(), on_progress=None, keep=False):
+        """
+        Builds the tender's namespace: reset_namespace() then ingest(). Returns what ingest() does. keep upserts only
+        the sources that changed (see reset_namespace()); otherwise it is built from scratch.
+        """
+        self.reset_namespace(tcno, on_progress=on_progress, keep=keep)
         return self.ingest(tcno, documents, unreadable, on_progress=on_progress)
 
     def delete_namespace(self, tcno):
@@ -510,10 +646,11 @@ class PineconeService:
         log.info('Deleted the Pinecone namespace %s of tender %s', namespace, tcno)
         return True
 
-    def _write_manifest(self, tcno, chunks, sources, unreadable):
+    def _write_manifest(self, tcno, chunks, sources, unreadable, old_parts=0):
         """
         Upserts the complete manifest (and, when its source list is too long for one record's metadata, the parts
-        holding it, first), waits until it can be read back, and returns it as manifest() reads it.
+        holding it, first), waits until it can be read back, and returns it as manifest() reads it. old_parts is how
+        many parts the namespace's last manifest had: those past the new ones are deleted.
         """
         namespace = self.namespace(tcno)
         # ASCII, so characters are bytes and each part stays under Pinecone's 40 KB of metadata per record
@@ -521,6 +658,8 @@ class PineconeService:
         parts = [payload[start:start + MANIFEST_PART_CHARS] for start in range(0, len(payload), MANIFEST_PART_CHARS)]
         if len(parts) == 1:
             parts = []
+        if old_parts > len(parts):
+            self._delete_ids(namespace, [_part_id(number) for number in range(len(parts), old_parts)])
         unit = [1.0] + [0.0] * (self.dimension - 1)  # Pinecone refuses all-zero vectors; nothing queries these
         created_at = _now()
         records = [{'id': _part_id(number), 'values': unit, 'metadata': {
@@ -528,7 +667,8 @@ class PineconeService:
             for number, part in enumerate(parts)]
         metadata = {'record_type': 'manifest', 'tcno': str(tcno), 'schema_version': SCHEMA_VERSION,
                     'status': 'complete', 'created_at': created_at, 'embed_model': self.embed_model,
-                    'dimension': self.dimension, 'chunks': chunks, 'parts': len(parts)}
+                    'dimension': self.dimension, 'chunks': chunks, 'parts': len(parts),
+                    'chunk_size': self.chunk_size, 'chunk_overlap': self.chunk_overlap, 'hybrid': self._sparse}
         if not parts:
             metadata['payload'] = payload
         # The parts first, the manifest alone after them: a complete manifest is never visible without its parts
@@ -540,15 +680,19 @@ class PineconeService:
             self._wait_until_written(namespace, [record['id'] for record in records], created_at)
         return {'index': self.index_name, 'namespace': namespace, 'tcno': str(tcno), 'created_at': created_at,
                 'embed_model': self.embed_model, 'schema_version': SCHEMA_VERSION, 'chunks': chunks,
-                'sources': sources, 'unreadable': list(unreadable)}
+                'chunk_size': self.chunk_size, 'hybrid': self._sparse, 'sources': sources,
+                'unreadable': list(unreadable)}
 
     # ---------- chunking, embedding and upserting ----------
 
     def chunk_documents(self, tcno, documents):
         """
-        The records to store for the tender's documents, and the manifest's list of sources. Each record is {'id',
-        'text', 'metadata'}, the metadata {'record_type', 'tcno', 'source_file', 'document_type', 'chunk_id',
-        'chunk_index', 'overlap', 'created_at'}. Sources with the same name are kept once (the first).
+        The records to store for the tender's documents, and the manifest's list of sources ({'name', 'type',
+        'chunks', 'sha256'}, sha256 of the source's text and of everything else its records depend on, so a source
+        with the same name and SHA-256 has the same records). Each record is {'id', 'text', 'metadata'}, the
+        metadata {'record_type', 'tcno', 'source_file', 'document_type', 'chunk_id', 'chunk_index', 'overlap',
+        'created_at'}, with 'section', 'sections' and 'section_titles' when the chunk is in a section of the
+        document (see document_sections.chunk_sections()). Sources with the same name are kept once (the first).
         """
         created_at = _now()
         records, sources, seen = [], [], set()
@@ -557,16 +701,25 @@ class PineconeService:
                 log.warning('Tender %s: source %s is listed twice; indexing it once', tcno, document.name)
                 continue
             seen.add(document.name)
-            pieces = chunk_text(document.text, self.chunk_size, self.chunk_overlap)
-            sources.append({'name': document.name, 'type': document.document_type, 'chunks': len(pieces)})
-            for position, (text, overlap) in enumerate(pieces):
+            text = (document.text or '').strip()
+            pieces = _chunks(text, self.chunk_size, self.chunk_overlap)
+            places = chunk_sections(text, [span for _, _, span in pieces])
+            sources.append({'name': document.name, 'type': document.document_type, 'chunks': len(pieces),
+                            'sha256': self._source_digest(document)})
+            for position, ((chunk, overlap, _), place) in enumerate(zip(pieces, places)):
                 identifier = chunk_id(document.name, position)
-                records.append({'id': identifier, 'text': text, 'metadata': {
+                records.append({'id': identifier, 'text': chunk, 'metadata': {
                     'record_type': 'chunk', 'tcno': str(tcno), 'source_file': document.name,
                     'document_type': document.document_type, 'chunk_id': identifier, 'chunk_index': position,
-                    'overlap': overlap, 'created_at': created_at,
+                    'overlap': overlap, 'created_at': created_at, **place,
                 }})
         return records, sources
+
+    def _source_digest(self, document):
+        """The SHA-256 of a source's text and type and of the settings that shape its records."""
+        shape = [SCHEMA_VERSION, SECTIONS_VERSION, sparse_encoder.VERSION if self._sparse else None, self.embed_model,
+                 self.dimension, self.chunk_size, self.chunk_overlap, document.document_type]
+        return hashlib.sha256(json.dumps([shape, document.text or '']).encode('utf-8')).hexdigest()
 
     def embed(self, texts, input_type='passage'):
         """
@@ -585,8 +738,9 @@ class PineconeService:
         """
         Embeds and upserts records (from chunk_documents()) into the tender's namespace: EMBED_BATCH records per
         embedding request, upsert_batch vectors per upsert, workers groups at a time. A chunk whose vector is in the
-        cache is not embedded again. Returns (the embedding tokens, the highest log position Pinecone committed them
-        at, or None when it gave none).
+        cache is not embedded again. Each vector is scaled to unit length, and on an index that takes them each
+        record also gets the sparse values of its text (sparse_encoder.py). Returns (the embedding tokens, the
+        highest log position Pinecone committed them at, or None when it gave none).
         """
         report = on_progress or (lambda message: None)
         if not records:
@@ -596,8 +750,16 @@ class PineconeService:
 
         def store(group):
             vectors, tokens = self._embed_passages([record['text'] for record in group])
-            payload = [{'id': record['id'], 'values': vector, 'metadata': {**record['metadata'], 'text': record['text']}}
-                       for record, vector in zip(group, vectors)]
+            payload = []
+            for record, vector in zip(group, vectors):
+                item = {'id': record['id'], 'values': _unit_length(vector),
+                        'metadata': {**record['metadata'], 'text': record['text']}}
+                # With the title of its section, so a clause number or term in the heading matches every chunk under it
+                sparse = sparse_encoder.sparse_vector(
+                    f"{record['metadata'].get('section', '')}\n{record['text']}") if self._sparse else None
+                if sparse:
+                    item['sparse_values'] = sparse
+                payload.append(item)
             positions = [self._upsert(namespace, payload[start:start + self.upsert_batch],
                                       f'upsert {len(payload[start:start + self.upsert_batch])} chunk(s) into {namespace}')
                          for start in range(0, len(payload), self.upsert_batch)]
@@ -633,15 +795,29 @@ class PineconeService:
         if namespace not in self.namespaces():
             return None
         try:
-            found = self._fetch_records(namespace, [MANIFEST_ID])
+            found = self._read_manifest(namespace, ('complete',))
         except _NotFound:
             self._remember(namespace, exists=False)
             return None
-        record = found.get(MANIFEST_ID)
+        if found is None:
+            return None
+        metadata, content = found
+        return {'index': self.index_name, 'namespace': namespace, 'tcno': metadata.get('tcno', str(tcno)),
+                'created_at': metadata.get('created_at'), 'embed_model': metadata.get('embed_model'),
+                'schema_version': metadata.get('schema_version'), 'chunks': int(metadata.get('chunks') or 0),
+                'chunk_size': int(metadata.get('chunk_size') or 0) or None, 'hybrid': bool(metadata.get('hybrid')),
+                'sources': content.get('sources') or [], 'unreadable': content.get('unreadable') or []}
+
+    def _read_manifest(self, namespace, statuses):
+        """
+        (metadata, content) of the namespace's manifest when its status is one of statuses, content {'sources',
+        'unreadable'} read from its payload or parts; None when there is none, or a part is missing.
+        """
+        record = self._fetch_records(namespace, [MANIFEST_ID]).get(MANIFEST_ID)
         if record is None:
             return None
         metadata = dict(record.metadata or {})
-        if metadata.get('status') != 'complete':
+        if metadata.get('status') not in statuses:
             return None
         payload = metadata.get('payload')
         parts = int(metadata.get('parts') or 0)
@@ -653,11 +829,49 @@ class PineconeService:
                             namespace, parts)
                 return None
             payload = ''.join((found[identifier].metadata or {}).get('payload', '') for identifier in ids)
-        content = json.loads(payload or '{}')
-        return {'index': self.index_name, 'namespace': namespace, 'tcno': metadata.get('tcno', str(tcno)),
-                'created_at': metadata.get('created_at'), 'embed_model': metadata.get('embed_model'),
-                'schema_version': metadata.get('schema_version'), 'chunks': int(metadata.get('chunks') or 0),
-                'sources': content.get('sources') or [], 'unreadable': content.get('unreadable') or []}
+        try:
+            return metadata, json.loads(payload or '{}')
+        except ValueError:
+            # Parts rewritten by a build that stopped before its manifest: not to be trusted, nor kept
+            log.warning('The manifest of %s does not match its parts; treating it as incomplete', namespace)
+            return None
+
+    def restore_kept(self, tcno):
+        """
+        After a regenerate that stopped before ingest() changed anything (its download failed, say): writes the
+        manifest reset_namespace(keep=True) marked as being built back as complete, so the namespace serves re-checks
+        as before. Returns True when there was such a manifest. Raises VectorStoreError when Pinecone fails.
+        """
+        namespace = self.namespace(tcno)
+        kept = self._reusable(namespace, kept_only=True)
+        if not kept:
+            return False
+        metadata = {key: value for key, value in kept[0].items() if key != 'kept'}
+        metadata['status'] = 'complete'
+        written = self._upsert(namespace, [{'id': MANIFEST_ID, 'values': self._unit(), 'metadata': metadata}],
+                               f'restore the manifest of {namespace}')
+        self._wait_until_searchable(namespace, written)
+        return True
+
+    def _reusable(self, namespace, kept_only=False):
+        """
+        (metadata, content) of the namespace's manifest (see _read_manifest()) when ingest() may keep the chunks it
+        lists: one built with this embedding model, dimension and schema, complete or kept by reset_namespace(keep=
+        True) (only kept, with kept_only); else None.
+        """
+        try:
+            found = self._read_manifest(namespace, ('building',) if kept_only else ('complete', 'building'))
+        except _NotFound:
+            return None
+        if found is None:
+            return None
+        metadata = found[0]
+        if (metadata.get('status') == 'building' and not metadata.get('kept')) \
+                or int(metadata.get('schema_version') or 0) != SCHEMA_VERSION \
+                or metadata.get('embed_model') != self.embed_model \
+                or int(metadata.get('dimension') or 0) != self.dimension:
+            return None
+        return found
 
     def status(self, tcno):
         """
@@ -667,7 +881,7 @@ class PineconeService:
         namespace = self.namespace(tcno)
         state = {'tcno': str(tcno), 'index': self.index_name, 'namespace': namespace,
                  'exists': self.has_namespace(tcno, strict=True), 'complete': False, 'chunks': None, 'sources': [],
-                 'unreadable': [], 'created_at': None, 'embed_model': None, 'vector_count': None}
+                 'unreadable': [], 'created_at': None, 'embed_model': None, 'hybrid': None, 'vector_count': None}
         if not state['exists']:
             return state
         manifest = self.manifest(tcno)
@@ -675,26 +889,39 @@ class PineconeService:
         if manifest:
             state.update(complete=True, chunks=manifest['chunks'], sources=manifest['sources'],
                          unreadable=manifest['unreadable'], created_at=manifest['created_at'],
-                         embed_model=manifest['embed_model'])
+                         embed_model=manifest['embed_model'], hybrid=manifest['hybrid'])
         return state
 
-    def query(self, tcno, vector, top_k=None, filter=None):
+    def query(self, tcno, vector, top_k=None, filter=None, sparse=None):
         """
         The chunks of the tender's namespace nearest to vector (from embed(..., 'query')), best first, as chunk dicts
-        (see Retrieval) with their score. filter narrows them further by metadata.
+        (see Retrieval) with their score. filter narrows them further by metadata. sparse, the sparse values of the
+        query, makes it a hybrid search (an index with the dotproduct metric only): its score is the sum of the dense
+        and the sparse dot products.
         """
         namespace = self.namespace(tcno)
-        conditions = {**_CHUNK_FILTER, **(filter or {})}
-        response = self._call(f'query {namespace}', lambda: self._index().query(
-            vector=vector, top_k=top_k or self.top_k, namespace=namespace, filter=conditions, include_metadata=True))
+        request = {'vector': vector, 'top_k': top_k or self.top_k, 'namespace': namespace,
+                   'filter': {**_CHUNK_FILTER, **(filter or {})}, 'include_metadata': True}
+        if sparse:
+            request['sparse_vector'] = sparse
+        response = self._call(f'query {namespace}', lambda: self._index().query(**request))
         return [_chunk(match.metadata or {}, match.id, match.score) for match in response.matches or []]
 
-    def retrieve(self, tcno, queries, top_k=None, max_chars=None, manifest=None):
+    def retrieve(self, tcno, queries, top_k=None, max_chars=None, manifest=None, section_queries=None):
         """
         The chunks of the tender's namespace that answer queries, {label: [query text, ...]}, within max_chars of
-        text. Every chunk of the short TenderTiger sources (PINNED_TYPES) comes first; then each query's top_k matches
-        are taken in turn, best first, one query after another, so every query gets its share before the budget runs
-        out. A chunk found by several queries is taken once, with each label in its 'queries'.
+        text, in three steps:
+          1. every chunk of the short TenderTiger sources (PINNED_TYPES), budget or not
+          2. the sections section_queries ({label: [query text, ...]}, if given) are about, whole: their matches vote
+             (with their scores) for each section they are in that fits section_share of the budget, and the best
+             MAX_SECTIONS sections that do not overlap, within the score floor of the best one, are taken (see
+             _pick_sections())
+          3. each query's matches, in turn, best first, one query after another, so every query gets its share
+             before the budget runs out
+        A search keeps its top_k matches only down to its score floor (score_floor times its best score, and not
+        under min_score), and at least MIN_MATCHES. On a namespace built with sparse values, each search is hybrid,
+        the dense score weighing hybrid_alpha and the sparse one the rest. A chunk found by several queries is taken
+        once, with each label in its 'queries'.
 
         manifest, if given, is the one ingest() just wrote, so it is not read back (Pinecone serverless makes new
         records visible a few seconds after they are written).
@@ -711,38 +938,128 @@ class PineconeService:
         retrieval = Retrieval(namespace=manifest['namespace'], manifest=manifest)
         if not manifest['chunks']:
             return retrieval
+        hybrid = bool(manifest.get('hybrid')) and self.hybrid_alpha < 1
 
         pinned_ids = [chunk_id(source['name'], position) for source in manifest['sources']
                       if source['type'] in PINNED_TYPES for position in range(source['chunks'])]
         pinned = [{**chunk, 'score': 1.0, 'queries': ['pinned']} for chunk in self._fetch(tcno, pinned_ids)]
 
-        labelled = [(label, text) for label, texts in queries.items() for text in texts if text and text.strip()]
-        vectors, _ = self.embed([text for _, text in labelled], 'query') if labelled else ([], 0)
-        with ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(vectors)))) as pool:
-            matches = list(pool.map(lambda vector: self.query(tcno, vector, top_k=top_k), vectors))
+        def flatten(searches):
+            return [(label, text) for label, texts in (searches or {}).items()
+                    for text in texts if text and text.strip()]
+
+        sectioned = flatten(section_queries) if self.section_share else []
+        labelled = flatten(queries)
+        found = self._search(tcno, [text for _, text in sectioned + labelled], top_k, hybrid)
+        section_matches = [self._above_floor(matches, hybrid) for matches in found[:len(sectioned)]]
+        matches = [self._above_floor(matches, hybrid) for matches in found[len(sectioned):]]
 
         chosen, used = {}, 0
-        for chunk in pinned:
-            chosen[chunk['id']] = chunk
-            used += len(chunk['text'])
-        for label, match in _round_robin(labelled, matches):
+
+        def take(match, label):
+            """Adds match under label, or label to it when taken already; False when it is over the budget."""
+            nonlocal used
             if match['id'] in chosen:
                 taken = chosen[match['id']]
                 taken['score'] = max(taken['score'], match['score'])
                 if label not in taken['queries']:
                     taken['queries'].append(label)
-                continue
+                return True
             if used + len(match['text']) > budget:
-                continue
+                return False
             chosen[match['id']] = {**match, 'queries': [label]}
             used += len(match['text'])
+            return True
+
+        for chunk in pinned:
+            chosen[chunk['id']] = chunk
+            used += len(chunk['text'])
+        if sectioned:
+            limit = min(budget, used + int(budget * self.section_share))
+            chunk_size = manifest.get('chunk_size') or self.chunk_size
+            for label, source, first, last, title, score in self._pick_sections(sectioned, section_matches,
+                                                                                 limit - used, chunk_size):
+                ids = [chunk_id(source, position) for position in range(first, last + 1)]
+                section = self._fetch(tcno, ids)
+                if used + sum(len(chunk['text']) for chunk in section if chunk['id'] not in chosen) > limit:
+                    continue
+                for chunk in section:
+                    take({**chunk, 'score': score}, label)
+                retrieval.whole_sections.append({'source_file': source, 'title': title, 'chunks': f'{first}-{last}',
+                                                 'label': label})
+        for label, match in _round_robin(labelled, matches):
+            take(match, label)
 
         order = {source['name']: position for position, source in enumerate(manifest['sources'])}
         retrieval.chunks = sorted(chosen.values(),
                                   key=lambda chunk: (order.get(chunk['source_file'], len(order)), chunk['chunk_index']))
-        log.info('Retrieved %d chunk(s), %d characters, from %s for %d quer(ies)', len(retrieval.chunks),
-                 retrieval.characters, manifest['namespace'], len(labelled))
+        log.info('Retrieved %d chunk(s), %d characters, from %s for %d quer(ies)%s%s', len(retrieval.chunks),
+                 retrieval.characters, manifest['namespace'], len(labelled) + len(sectioned),
+                 ', hybrid' if hybrid else '',
+                 ''.join(f"; section {section['title'] or '(untitled)'!r} of {section['source_file']} whole "
+                         f"(chunks {section['chunks']})" for section in retrieval.whole_sections))
         return retrieval
+
+    def _search(self, tcno, texts, top_k, hybrid):
+        """[the matches of each of texts] in the tender's namespace, hybrid searches when hybrid, in parallel."""
+        if not texts:
+            return []
+        vectors, _ = self.embed(texts, 'query')
+        searches = []
+        for text, vector in zip(texts, vectors):
+            dense, sparse = _unit_length(vector), None
+            if hybrid:
+                dense = [value * self.hybrid_alpha for value in dense]
+                sparse = sparse_encoder.sparse_vector(text)
+                sparse = sparse_encoder.scaled(sparse, 1 - self.hybrid_alpha) if sparse else None
+            searches.append((dense, sparse))
+        with ThreadPoolExecutor(max_workers=max(1, min(self.workers, len(searches)))) as pool:
+            return list(pool.map(lambda search: self.query(tcno, search[0], top_k=top_k, sparse=search[1]), searches))
+
+    def _above_floor(self, matches, hybrid):
+        """The matches of one search (best first) down to its score floor, and at least MIN_MATCHES of them."""
+        if not matches:
+            return matches
+        floor = max(self.min_score * (self.hybrid_alpha if hybrid else 1.0), self.score_floor * matches[0]['score'])
+        return [match for rank, match in enumerate(matches) if rank < MIN_MATCHES or match['score'] >= floor]
+
+    def _pick_sections(self, sectioned, section_matches, room, chunk_size):
+        """
+        The sections to take whole: [(label, source, first chunk, last chunk, title, best score)], best first. Each
+        match votes, with its score, for every section it is in that can fit room characters (at chunk_size a
+        chunk), so a section gathers the votes of the sections within it; the sections with most votes (the larger
+        on a tie) are picked, up to MAX_SECTIONS that do not overlap, while their votes stay within the score floor
+        of the best one's.
+        """
+        votes, best, about = {}, {}, {}
+        for (label, _), matches in zip(sectioned, section_matches):
+            for match in matches:
+                if match.get('document_type') in PINNED_TYPES:
+                    continue  # sent whole already, at no cost to room: it would take a section's place
+                titles = match['section_titles'] + [''] * len(match['sections'])
+                seen = set()
+                for span, title in zip(match['sections'], titles):
+                    # A minor heading over the same chunks as its major one lists the range twice
+                    if span in seen:
+                        continue
+                    seen.add(span)
+                    first, last = (int(part) for part in span.split('-'))
+                    if (last - first + 1) * chunk_size <= room:
+                        key = (match['source_file'], first, last)
+                        votes[key] = votes.get(key, 0.0) + match['score']
+                        best[key] = max(best.get(key, 0.0), match['score'])
+                        about.setdefault(key, (label, title))
+        picked = []
+        top = max(votes.values(), default=0.0)
+        for key, vote in sorted(votes.items(), key=lambda item: (-round(item[1], 9), item[0][1] - item[0][2],
+                                                                  item[0])):
+            if len(picked) == MAX_SECTIONS or vote < self.score_floor * top:
+                break
+            if any(key[0] == other[1] and key[1] <= other[3] and other[2] <= key[2] for other in picked):
+                continue  # overlaps a section picked already
+            label, title = about[key]
+            picked.append((label, *key, title, best[key]))
+        return picked
 
     def knowledge(self, tcno):
         """
@@ -761,14 +1078,6 @@ class PineconeService:
         order = {source['name']: position for position, source in enumerate(manifest['sources'])}
         chunks.sort(key=lambda chunk: (order.get(chunk['source_file'], len(order)), chunk['chunk_index']))
         return Retrieval(namespace=manifest['namespace'], manifest=manifest, chunks=chunks)
-
-    def first_chunk(self, tcno, name):
-        """
-        The text of the first chunk of the source called name in the tender's namespace, or None when it holds no
-        such chunk. One fetch by ID: no search, no embedding. Raises VectorStoreError when Pinecone fails.
-        """
-        chunks = self._fetch(tcno, [chunk_id(name, 0)])
-        return chunks[0]['text'] if chunks else None
 
     # ---------- internals ----------
 
@@ -791,6 +1100,14 @@ class PineconeService:
     def _unit(self):
         """A vector for records nothing searches for (Pinecone refuses all-zero vectors)."""
         return [1.0] + [0.0] * (self.dimension - 1)
+
+    def _delete_ids(self, namespace, ids):
+        """Deletes the records with these IDs from namespace, DELETE_BATCH per request."""
+        index = self._index()
+        for start in range(0, len(ids), DELETE_BATCH):
+            part = ids[start:start + DELETE_BATCH]
+            self._call(f'delete {len(part)} record(s) from {namespace}',
+                       lambda part=part: index.delete(ids=part, namespace=namespace))
 
     def _upsert(self, namespace, vectors, what):
         """Upserts vectors into namespace. Returns the log position Pinecone committed them at, or None."""
@@ -915,6 +1232,7 @@ class PineconeService:
     def _remember(self, namespace, exists):
         """Keeps the cached namespace names in step with a namespace created or deleted here."""
         with self._names_lock:
+            self._names_version += 1
             if self._names is not None:
                 (self._names.add if exists else self._names.discard)(namespace)
 
@@ -1017,7 +1335,14 @@ def _chunk(metadata, identifier, score):
     return {'id': identifier, 'source_file': metadata.get('source_file', ''),
             'document_type': metadata.get('document_type', 'other'), 'chunk_index': int(metadata.get('chunk_index') or 0),
             'overlap': int(metadata.get('overlap') or 0), 'text': metadata.get('text', ''), 'score': float(score or 0.0),
-            'queries': []}
+            'queries': [], 'section': metadata.get('section', ''), 'sections': list(metadata.get('sections') or []),
+            'section_titles': list(metadata.get('section_titles') or [])}
+
+
+def _unit_length(vector):
+    """vector scaled to length 1, so a dotproduct index scores it as cosine does."""
+    norm = math.sqrt(sum(value * value for value in vector))
+    return [value / norm for value in vector] if norm else list(vector)
 
 
 def _now():

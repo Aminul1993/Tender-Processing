@@ -390,10 +390,10 @@ Soft, consistent rounding that steps with size: 2px for search-match highlights,
 Quiet and solid; one primary per area.
 - **Shape:** 38px tall, 8px radius; 32px small variant; 36px inside the selection bar.
 - **Primary:** `accent` with white 600 text, 16px side padding, may carry a mono count chip (white at 20%). Hover `accent-strong`. Disabled `disabled-bg` with `faint` text.
-- **Secondary:** white with a `control-line` border, `ink` text; hover deepens the border and fills `hover`. Pressed decision buttons (Shortlist, Drop) take the eligible or not tone fill and a tone-mixed border. While what it started loads (Default filters), its text turns `faint` and it stays focusable (`aria-disabled`), so the keyboard focus stays on it.
+- **Secondary:** white with a `control-line` border, `ink` text; hover deepens the border and fills `hover`. Pressed decision buttons (Shortlist, Drop) take the eligible or not tone fill and a tone-mixed border. While what it started runs (the watchlist's Search again), its text turns `faint` and it stays focusable (`aria-disabled`), so the keyboard focus stays on it.
 - **Danger:** the secondary shape in red, for deleting only (Delete in Closed tenders): `not-fg` text and icon, a border of `not-dot` mixed 45% into white; hover fills `not-bg` with a full `not-dot` border.
 - **Icon button:** 32px, transparent, `muted` glyph; hover gains a border and white fill. Bordered 38px variant sits in the toolbar.
-- **Link button:** `accent` underlined text at 12px (Retry, inline actions, Clear filters). In the filters' footer, Clear filters sits before the small secondary Default filters and the small primary Apply filters.
+- **Link button:** `accent` underlined text at 12px (Retry, inline actions, Clear filters). In the filters' footer, Clear filters sits before the small primary Apply filters.
 - **Focus:** every interactive element shows a 2px `accent` outline at 2px offset on `:focus-visible`.
 - **Transitions:** background, border and colour at 0.15s on `cubic-bezier(.16, 1, .3, 1)`.
 

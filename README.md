@@ -10,18 +10,20 @@ unpacks every zip (nested zips too), reads each file, indexes all of them in the
 (`tcno-<tcno>`), retrieves the passages on each kind of requirement from it, and checks the company's eligibility
 with the LLM pipeline in [ext.py](ext.py). Tenders are processed one at a time in the background while the page shows
 live progress. Each row names the criteria a tender fails or could not determine, and the team can mark a
-tender shortlisted or dropped. The company profile the tenders are checked against is kept as markdown in
-[company_details.md](company_details.md) and is edited on the page as a form (**Edit profile** in the app bar).
+tender reviewed (looked at, undecided), shortlisted or dropped; every tender starts pending, and moves forward only
+(see [Decisions](#decisions)). The company profile the tenders are checked against is kept in the database and
+is edited on the page as a form (**Edit profile** in the app bar).
+**Watchlist** shows the live tenders of the departments the team tracks, kept in the database (see
+[Watchlist](#watchlist)).
 
 ## Project structure
 
 ```
 app.py                       Application factory (create_app) and uvicorn entry point
-worker.py                    A worker process: processes queued tenders from the job in Redis (REDIS_URL)
+worker.py                    A worker process: processes queued tenders from the job in the database
 config.py                    Settings, each overridable by an environment variable
 ext.py                       Existing helpers: the TenderTiger login session, tender_list(), prequalification_criteria(),
-                             extract_zip_recursive(), LLM summarising, company_details() / save_company_details()
-company_details.md           The company profile (markdown) every tender is checked against
+                             extract_zip_recursive(), LLM summarising, assess_eligibility()
 routes/
   pages.py                   Router "pages": GET /
   api.py                     Router "api": the JSON endpoints and the {"error": ...} handlers
@@ -29,28 +31,37 @@ services/
   tender_service.py          Loads json_response["TenderList"], caches it, maps rows for the table
   download_service.py        Downloads a tender's documents into TARGET_DIRECTORY/<tcno>/ and extracts zips
   pinecone_service.py        One Pinecone namespace per tender (tcno-<tcno>) in one shared index: create, check,
-                             chunk, embed, batch upsert, query, retrieve, read back everything, delete, rebuild
+                             chunk, embed, batch upsert (only changed sources on a regenerate), hybrid / hierarchical
+                             / adaptive retrieve, read back everything, delete, rebuild
+  sparse_encoder.py          Sparse vectors of a text's words, rupee figures, clause numbers, percentages and
+                             financial years, for hybrid retrieval
+  document_sections.py       The sections of a document, from its headings, for hierarchical retrieval
   analysis_service.py        process_tender_files(tcno_folder, index=...) reads every source, indexes them in the
                              tender's namespace, retrieves the criteria and returns {"verdict", "details", "score",
                              "criteria", ...}; recheck_saved_criteria(tcno, index=...) retrieves and checks again
   ocr_service.py             OCR of scans, PDF pages with no text layer and large images: PaddleOCR locally first;
                              unsure and table pages go to OCR_MODEL
-  cache_service.py           SQLite cache of file texts (by SHA-256) and chunk vectors, so nothing is read or
-                             embedded twice
+  database.py                The PostgreSQL database (DATABASE_URL): the connection pool, and the tables, made on
+                             first use
+  cache_service.py           The cache of file texts (by SHA-256), the OCR of each page (by the SHA-256 of its
+                             image) and chunk vectors, so nothing is read, OCR'd or embedded twice
   company_service.py         Company profile markdown <-> the editor's form blocks; company name; the table of
-                             criteria statuses marked by hand (record_mark(), profile_for_tender())
+                             criteria statuses marked by hand, kept apart (CompanyStore.mark(), for_tender())
   processing_service.py      The job: queues tenders, runs them on the workers (threads of the app, worker.py
-                             processes), tracks progress and results; saves each result to
-                             eligibility_result.json and loads those at startup
-  job_state.py               The job, its items and the results in Redis (an in-process one without REDIS_URL)
-  decision_service.py        Shortlisted / dropped decisions, saved to decisions.json
+                             processes), tracks progress and results
+  job_state.py               The job, its items and every tender's last result, in the database
+  decision_service.py        Reviewed / shortlisted / dropped decisions, in the database
   deep_analysis_service.py   Deep analysis: five agents review a completed result, the criteria retrieved from
-                             its Pinecone namespace, the company profile and the statuses marked by user; saved to
-                             deep_analysis.json
+                             its Pinecone namespace, the company profile and the statuses marked by user; saved in
+                             the database
   profile_gap_service.py     The monthly profile-gap report: the month's Cannot determine criteria grouped by the
                              fact they lacked, with whether the profile states it (no LLM call)
+  watchlist_service.py       The watchlist: which department claims a tender, and the background search of
+                             TenderTiger for every live tender of the departments, saved in the database
 scripts/
   migrate_to_pinecone.py     One-off: indexes the tenders already downloaded and removes eligibility_criteria.md
+  import_files_to_db.py      One-off: moves the results, decisions, watchlist and cache an older version kept in
+                             files into the database
 docs/
   pinecone-architecture.md   The Pinecone design (a namespace per tender): diagram, flows, migration plan, risks
 utils/
@@ -69,6 +80,7 @@ test_app.py                  Tests for the API, download/extract, indexing, verd
 test_ext.py                  Existing tests for ext.py
 test_pinecone_service.py     Tests for the Pinecone service
 test_profile_gap_service.py  Tests for the profile-gap report
+test_watchlist_service.py    Tests for the watchlist: its rules, the background search and its API
 pinecone_fake.py             In-memory stand-in for the Pinecone client, used by the tests
 ```
 
@@ -101,7 +113,28 @@ GROQ_API_KEY=your-key
 PINECONE_API_KEY=your-pinecone-key
 PINECONE_INDEX_NAME=tender-processing
 PINECONE_NAMESPACE_PREFIX=tcno-
+DATABASE_URL=postgresql://postgres:your-password@localhost:5432/tender_processing
 ```
+
+The app keeps its data in PostgreSQL (13 or newer): the processing job, every tender's last result and deep
+analysis, the company profile, the shortlisted / dropped decisions, the watchlist and its tenders and the cache of file
+texts, page OCR and chunk vectors.
+Make the database once; the app makes its tables when it starts:
+
+```powershell
+psql -h localhost -U postgres -c "CREATE DATABASE tender_processing"
+```
+
+If an older version kept those in files (`eligibility_result.json` and `deep_analysis.json` in each tender folder,
+`company_details.md` and `watchlist.json` in the project folder, `decisions.json`, `watchlist_tenders.json`,
+`watchlist_search.json` and `cache.sqlite3` in `downloads/`), move them into the database once, with the app stopped:
+
+```powershell
+python scripts/import_files_to_db.py
+```
+
+It keeps whatever the database already holds, so it can be run again. The files are left in place, and no longer
+read; delete them once the app shows what they held.
 
 If the tenders were checked by a version before Pinecone, run the migration once (see
 [Migrating from eligibility_criteria.md](#migrating-from-eligibility_criteriamd)).
@@ -118,11 +151,27 @@ dates, GeM, NCB / ICB, funding, MSME, bid documents, startups): TenderTiger appl
 remembers the last ones applied. Without the Groq key or the Pinecone key the tender list still loads, but every
 tender fails at the analysis step with a clear message.
 
-Beside the organisation filter, two filters narrow the page shown: the decision (**Not dropped**,
-**Shortlisted**, **No decision**, **Dropped**) and the closing date (**Open**,
+Beside the organisation filter, two filters narrow the page shown: the decision (**All decisions**, **Pending**,
+**Reviewed**, **Shortlisted**, **Dropped**) and the closing date (**Open**,
 **Closes in 7 days**, today included, and **Closed**; a tender without a closing date counts as open). The verdict
-tabs count only the tenders these two filters leave, so with **Not dropped** the dropped tenders are left out of the
-counts as well as the table. **Show all tenders**, when nothing matches, clears every filter of the page.
+tabs count only the tenders these two filters leave, so with **Pending** they count only the tenders nobody has
+marked yet. **Show all tenders**, when nothing matches, clears every filter of the page.
+
+### Decisions
+
+Every tender starts **Pending**, and the team's decision only moves forward:
+
+| A tender that is | can be marked |
+|---|---|
+| Pending | Reviewed (looked at, undecided), Shortlisted or Dropped |
+| Reviewed | Shortlisted or Dropped |
+| Shortlisted | Dropped |
+| Dropped | nothing: it is final |
+
+The tender's window shows its decision, with the date, and only the buttons of what it can be marked next (**Mark
+reviewed**, **Shortlist**, **Drop**). The × at the end of a row drops the tender straight away; a dropped row is
+greyed and has none. A decision cannot be taken back: the server refuses any move backwards, so two people marking
+the same tender cannot undo each other's work. Deleting a closed tender (**Closed tenders**) forgets its decision.
 
 ## Run
 
@@ -143,30 +192,28 @@ uvicorn app:create_app --factory --host 0.0.0.0 --port 5000
 Behind a reverse proxy on another host, add `--proxy-headers --forwarded-allow-ips <proxy-ip>` so the page's
 links use the proxy's address and scheme.
 
-**Run one web process.** The tender list, the deep analyses and (without `REDIS_URL`) the job live in its memory,
-so do not use uvicorn's `--workers`, `gunicorn -w 4` or `--reload`. The endpoints run in uvicorn's thread pool, so
-requests are still served while a job runs. Each tender's last result is saved as `eligibility_result.json` in its
-folder and loaded again at startup, and its Pinecone namespace is kept, so it can be re-checked quickly; the
-downloaded files stay in `downloads/`, and shortlisted / dropped decisions stay in `decisions.json`.
+**Run one web process.** The tender list and the deep analyses live in its memory, so do not use uvicorn's
+`--workers`, `gunicorn -w 4` or `--reload`. The endpoints run in uvicorn's thread pool, so requests are still served
+while a job runs. Each tender's last result is kept in the database, and its Pinecone namespace is kept, so it can
+be re-checked quickly; the downloaded files stay in `downloads/`.
 
-**Several workers.** The processing job (the queue, each tender's status and stage) and the results are kept in
-Redis ([job_state.py](services/job_state.py)), so tenders can be processed by several workers at once. Without
-`REDIS_URL` an in-process Redis stands in: the web app processes `JOB_WORKERS` tenders at a time (default 1) and
-the job is lost on restart, as before. With `REDIS_URL` (a Redis database: `redis://default:<password>@<host>:<port>`,
-or `rediss://` for TLS; not a Redis Cloud account API key), the job survives a restart of the web app, and worker
-processes can take part:
+**Several workers.** The processing job (the queue, each tender's status and stage) and the results are kept in the
+database ([job_state.py](services/job_state.py)), so the job survives a restart of the web app and tenders can be
+processed by several workers at once. The web app processes `JOB_WORKERS` tenders at a time itself (default 1), and
+worker processes can take part:
 
 ```powershell
 python worker.py --threads 2     # in another terminal, or on another machine sharing TARGET_DIRECTORY
 ```
 
-Each worker takes the oldest queued tender, processes it and records the result in Redis and in its folder.
-Workers need the same `.env` as the web app and the same `TARGET_DIRECTORY` (the same machine, or a shared folder):
-the documents, results and OCR cache are there. Set `JOB_WORKERS=0` to leave all the processing to workers; the
+Each worker takes the oldest queued tender, processes it and records the result in the database. Workers need the
+same `.env` as the web app (the same `DATABASE_URL`) and the same `TARGET_DIRECTORY` (the same machine, or a shared
+folder): the documents are there. Set `JOB_WORKERS=0` to leave all the processing to workers; the
 run panel then says "Waiting for a worker…" until one starts. A worker keeps a lease on the tender it processes,
 renewed every 22 seconds; a worker that dies leaves its tender failed ("Processing stopped unexpectedly") once the
 lease runs out after 90 seconds. Ctrl+C stops a worker after the tenders it is on. Each worker logs to
-`LOG_DIRECTORY/worker-<pid>.log`. Every change is made under one Redis lock, held for milliseconds.
+`LOG_DIRECTORY/worker-<pid>.log`. Every change is made in one transaction under one lock (a PostgreSQL advisory
+lock), held for milliseconds; an idle worker looks for a queued tender twice a second.
 
 Several workers on one machine share its CPU: PaddleOCR already uses every core for one page, so OCR is no faster
 with more of them (see `OCR_CONCURRENCY`), and each worker that OCRs loads its own models (about 1 GB). Workers
@@ -186,14 +233,18 @@ pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on ma
 | `PINECONE_CLOUD`, `PINECONE_REGION` | `aws`, `us-east-1` | Where the index is created (serverless); the Starter plan allows only `aws` / `us-east-1` |
 | `PINECONE_EMBED_MODEL` | `llama-text-embed-v2` | Pinecone-hosted embedding model; no other key is needed |
 | `PINECONE_EMBED_DIMENSION` | `1024` | Its dimension (384, 512, 768, 1024 or 2048). Changing the model or dimension needs a new `PINECONE_INDEX_NAME` and every namespace rebuilt |
+| `PINECONE_METRIC` | `dotproduct` | The metric of an index the app makes. `dotproduct` scores the (unit-length) dense vectors as cosine does and also takes sparse values, for hybrid retrieval; an index made with `cosine` is searched dense only (logged once). An index keeps its metric: to switch, set a new `PINECONE_INDEX_NAME`, and each tender is indexed into it when next checked, its files and chunks taken from the cache |
 | `PINECONE_UPSERT_BATCH` | `50` | Vectors per upsert request (Pinecone caps a request at 2 MB) |
 | `CHUNK_SIZE`, `CHUNK_OVERLAP` | `1600`, `200` | Characters per chunk, and how many repeat the end of the chunk before |
-| `RETRIEVAL_TOP_K` | `8` | Chunks each retrieval query returns |
-| `RETRIEVAL_MAX_CHARS` | `60000` | The most document text sent to the LLM for one check or deep analysis (about 13k tokens). Groq's free tier refuses a request over 8,000 tokens per minute (error 413), and it counts the expected answer too, which for an eligibility check can be 7k tokens on its own: lowering this does not make the free tier enough |
+| `RETRIEVAL_TOP_K` | `8` | The most chunks each retrieval query returns |
+| `RETRIEVAL_SCORE_FLOOR`, `RETRIEVAL_MIN_SCORE` | `0.85`, `0.2` | Adaptive retrieval: a query keeps its matches only down to this share of its best match's score, and none under the minimum (a cosine score; times `RETRIEVAL_HYBRID_ALPHA` in a hybrid search), two at least whatever they score; `0` turns either off. Calibrated on the 35 tenders indexed on 13 Nov 2026: 24% less text at the defaults (`RETRIEVAL_TOP_K` 8, `RETRIEVAL_MAX_CHARS` 60000), 9% at 5 and 30000 |
+| `RETRIEVAL_HYBRID_ALPHA` | `0.75` | Hybrid retrieval: the weight of the dense score; the sparse score (exact words, rupee figures however written, clause numbers, percentages, financial years) weighs the rest. `1` is dense only. Needs a `dotproduct` index |
+| `RETRIEVAL_SECTION_SHARE` | `0.5` | Hierarchical retrieval: the most of `RETRIEVAL_MAX_CHARS` the qualification section, taken whole, may fill; `0` takes no section whole |
+| `RETRIEVAL_MAX_CHARS` | `60000` | The most document text sent to the LLM for one check or deep analysis (about 13k tokens). Groq's free tier refuses a request over 8,000 tokens per minute (error 413), and it counts the expected answer too; a check refused so is made again in batches (see **Checks too large for one request** under [How a tender is processed](#how-a-tender-is-processed)) |
 | `INGEST_WORKERS` | `4` | Files read, and chunk batches embedded and upserted, at the same time |
-| `REDIS_URL` | (none) | The Redis database the job and results are kept in, shared with worker processes (see [Several workers](#run)); unset, an in-process Redis is used |
-| `REDIS_PREFIX` | `tender-processing:` | Put before every Redis key, so one Redis can serve several installs |
-| `JOB_WORKERS` | `1` | Tenders the web app processes at the same time itself; `0` leaves them to `worker.py` processes (needs `REDIS_URL`) |
+| `DATABASE_URL` | (none, required) | The PostgreSQL database the job, results, decisions, watchlist and cache are kept in, shared with worker processes: `postgresql://<user>:<password>@<host>:<port>/<database>`. The database must exist; the tables are made on first use |
+| `DATABASE_SCHEMA` | `public` | The schema the tables are made in (made too), so one database can serve several installs |
+| `JOB_WORKERS` | `1` | Tenders the web app processes at the same time itself; `0` leaves them to `worker.py` processes |
 | `OCR_CONCURRENCY` | `8` | Scanned pages and images sent to `OCR_MODEL` at the same time in a process, while PaddleOCR reads on, one page at a time |
 | `SUMMARY_MODEL` | `openai/gpt-oss-20b` | No longer used by the pipeline: the documents are indexed instead of summarised |
 | `ASSESSMENT_MODEL` | `openai/gpt-oss-120b` | Groq model that checks the company against the criteria, also on a re-check |
@@ -212,24 +263,20 @@ pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on ma
 | `OCR_BUDGET_USD` | `0.5` | The most that OCR could cost a tender, in US dollars, every page at `OCR_PAGE_COST`, before the team is asked; 0 is no limit |
 | `OCR_PAGE_COST` | `0.0056` | The most one page sent to `OCR_MODEL` costs, in US dollars (2,644 input and 882 output tokens at qwen3.8-27b's $0.80 / $4.00 per million); update it when the model or its price changes |
 | `MAX_FILE_CHARS` | `300000` | A tender file with more text is not indexed and is listed as not checked. A scanned PDF is judged from its page count before OCR, at about 2,000 characters a page (150 pages at the default), and its OCR stops at the page where the text passes the limit |
-| `DECISIONS_FILE` | `TARGET_DIRECTORY/decisions.json` | Where shortlisted / dropped decisions are saved |
-| `CACHE_FILE` | `TARGET_DIRECTORY/cache.sqlite3` | The texts read from tender files (by SHA-256) and their chunks' vectors, so regenerating reads and embeds only changed files; delete it to start afresh |
-| `COMPANY_DETAILS_FILE` | `./company_details.md` | The company profile; edited on the page or by hand |
-| `DEFAULT_FILTERS_FILE` | `./default_filters.json` | The TenderTiger filters that **Default filters** applies; edited by hand (see `GET /api/default-filters`) |
+| `WATCHLIST_REFRESH_HOURS` | `24` | Hours before the watchlist's tenders are searched for again in the background (checked every 15 minutes, and a minute after the app starts); `0` searches only when **Search again** is pressed |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 | `LOG_DIRECTORY` | `./logs` | `app.log` is written here, rotated at 5 MB |
 | `PORT` | `5000` | Port for `python app.py` |
 
 ## Company profile
 
-Every tender is checked against the markdown in `COMPANY_DETAILS_FILE` (`company_details.md`), and only
-against that: a criterion whose company figure is missing becomes Cannot determine. Whether a project counts as
+Every tender is checked against the company profile, and only against that: a criterion whose company figure is missing becomes Cannot determine. Whether a project counts as
 similar work is judged per tender, from what the project was against the tender's definition, so a "Similar Work:
 Yes" label in the profile is ignored. Click **Edit profile** in
-the app bar to change it. The editor is a form built from the file: the `#` heading is the profile title, every
+the app bar to change it. The editor is a form built from the markdown: the `#` heading is the profile title, every
 `##` heading and `###` sub-heading is a field you can rename, and every markdown table becomes rows of fields.
-Any other text appears in a text box. Save (or Ctrl+S) writes the form back to the file as markdown; rows left
-completely empty are dropped.
+Any other text appears in a text box. Save (or Ctrl+S) writes the form back as markdown; rows left completely
+empty are dropped.
 
 Tables can be restructured in the form too: column names are fields you can rename, **Add row** and **Add
 column** sit under each table, a column's × (shown when you point at or tab to its name) removes it, and
@@ -241,20 +288,22 @@ there.
 sub-heading** (at the end of each section) adds a `###` sub-heading to it; each comes with an empty Item / Value
 table. The trash button next to a heading removes it with everything under it, after asking if any of that has
 values. Every heading, sub-heading and column needs a name: a blank one, or a heading that is only its number,
-stops the save. The file can still be edited by hand; the form picks up the new structure the next time it
-opens. The file is read when each tender's analysis starts, so a change
+stops the save, and the footer says why (in place of its note, where a message cannot cover **Save**). The profile
+is read when each tender's analysis starts, so a change
 applies to the tenders checked after it, with no restart. Verdicts already given are not re-checked; select
 those tenders and run **Check eligibility** again to update them.
 
 An empty or missing profile fails every analysis straight away, before any LLM call; the editor then starts from a title and a
 Company Name row.
 
-A criterion status changed by hand in the analysis view is also recorded in the profile, in a **Criteria marked
-by the bid team** table (Criterion | Requirement | Status | TCNO | Marked on) at its end, one row per tender and
-criterion: marking it again replaces the row, and setting it back to the AI's status removes it (and the section
-with its last row). The model takes a row's status for a criterion of another tender with the same requirement,
-and says so. A tender is always checked, and deep-analysed, without its own rows: its marks are carried over to
-its new result by the app, so the model never returns them as its own finding.
+A criterion status changed by hand in the analysis view is also recorded with the bid team's marks, in the
+database apart from the profile (the `criterion_marks` table), one per tender and criterion: marking it again
+replaces it, and setting it back to the AI's status removes it. They are not in the profile and not in its editor.
+When a tender is checked (or deep-analysed), the marks of the other tenders are given after the profile, as a
+**Criteria marked by the bid team** table (Criterion | Requirement | Status | TCNO | Marked on); the model takes a
+row's status for a criterion with the same requirement, and says so. A tender is never given its own marks: they
+are carried over to its new result by the app, so the model never returns them as its own finding. Marks an
+older version kept in the profile's own table move to `criterion_marks` with `scripts/import_files_to_db.py`.
 
 **Standing declarations and certificates** is the section for what holds on every tender: the land border
 declaration (GFR 144(xi)), the Make in India supplier class and local content, labour-code compliance, GST, PAN,
@@ -274,6 +323,95 @@ states that fact now: **Stated** (re-check the tenders checked before it was add
 profile**, or n/a. It counts each tender's latest completed check processed in the month (UTC), uses the status the
 model gave even where the bid team has marked it since, and finds the reasons by keywords (`TOPICS` in
 [profile_gap_service.py](services/profile_gap_service.py)), with no LLM call.
+
+## Watchlist
+
+**Watchlist** in the toolbar swaps TenderTiger's list for the watchlist's: the tenders its last search of TenderTiger
+kept for the departments the team tracks, drawn from the sheet *Sources / Departments for Tender Tracking & Bidding*
+(27-05-2026, 97 rows). The rules apply only when TenderTiger is searched: each tender a department claims is saved,
+with that department, in the `watchlist_tenders` table, and the list shows that table as it is, from the database
+alone. A tender that closes after the search stays on it until the next. The bar under the toolbar says how many
+there are and when TenderTiger was last searched for them; **Search again** searches now. The organisation filter then
+lists the departments. On TenderTiger's list too, a tender the last search kept carries its department's name under
+its organisation, and the organisation filter offers **Watchlist departments**: only the page's tenders of those
+departments. **Filters** always searches TenderTiger: applied while the watchlist is shown, it switches to
+TenderTiger's list.
+
+**Edit watchlist**, in the same bar, opens the watchlist as a form, like **Edit profile**: the least tender value
+and a note, the search filters and the state groups as rows of fields, and a row per department (Sl, sector, name,
+full name, states, organisation patterns and names searched for one per line, the description pattern, its least
+value). **Find a department** narrows the rows shown; the arrows move a department up or down, since the first that
+claims a tender names it; **Add department** and × add and remove them. Save (or Ctrl+S) checks the whole watchlist
+first: one that is not valid is not saved, and the footer says why, naming the department, whose row is focused.
+Cancel, the close button and Esc ask before throwing away unsaved edits. Saved rules apply from the next **Search
+again**.
+
+Why the watchlist is searched for in the background, not filtered from TenderTiger's list: one TenderTiger search
+serves at most 10,000 tenders (asking past that gets another search's tenders), and more than 10,000 tenders with
+bid documents close on a single day, so the whole list can never be read. The organisation filter takes one exact
+name, not a list, and finds nothing at all when a location is added. So a search ("refresh") asks TenderTiger for
+each organisation name of the departments, one at a time, closing from today, and keeps the tenders a department
+claims.
+Paced by `TENDERTIGER_REQUEST_GAP`, its 126 searches take 10 to 15 minutes; it runs in a thread of the web app,
+once the list is older than `WATCHLIST_REFRESH_HOURS` or when asked, and the list is saved in the database (the
+`watchlist_tenders` table), so a restart keeps it. A restart never starts another search within an hour of the last
+one starting (`app_state` says when). The tenders on it can be checked like any other.
+
+What it misses: on the 10,000 tenders that closed on 13 Nov 2026, the departments claimed 813, and exact names find
+93% of them. The rest are offices TenderTiger lists under names of their own, almost all West Bengal PWD
+(`public works department||p.w. directorate||pwd (west zone)||...`); no exact search names them, and a location search
+with the bid-documents filter finds nothing at all. Since the department names come from what the search kept, they
+carry no department's name on TenderTiger's list either.
+
+### The watchlist's tables
+
+The watchlist is kept in five tables of the database, edited with **Edit watchlist** or with SQL (psql, pgAdmin):
+
+| Table | One row per | Columns |
+|---|---|---|
+| `watchlist_settings` | (one row) | `about` (a note), `filters`, `min_value_cr` |
+| `watchlist_state_groups` | state group | `name`, `states` (text[]) |
+| `watchlist_departments` | department (parent) | `id`, `position`, `sl`, `sector`, `name`, `full_name`, `states` (text[]), `brief`, `min_value_cr` |
+| `watchlist_organisations` | organisation pattern (child) | `department_id`, `position`, `pattern` |
+| `watchlist_searches` | exact name searched for (child) | `department_id`, `position`, `name` |
+
+- `filters` (JSON): what every search is narrowed by, with the names of `GET /api/tenders`; a date may be
+  `"today"`. The sheet's: `{"closing_from": "today", "bid_doc": true}`.
+- Departments are taken in `position` order: the first that claims a tender names it.
+  - `watchlist_organisations.pattern`: regular expressions (any case), matched against TenderTiger's organisation
+    name with runs of spaces made one. A department claims a tender when one of its patterns matches.
+  - `states`: the states (and state group names) the department is tracked in, matched against the tender's state;
+    `NULL` for any state. TenderTiger's own spellings are understood ("Orissa (Odisha)", "Uttaranchal"). A tender
+    whose state is "Multi State" or "Not classified" is claimed only by a department of any state.
+  - `brief` (optional): a regular expression the tender's description must match too.
+  - `min_value_cr` (optional): the least tender value, in crore of rupees, the department claims; `NULL` for the
+    settings' `min_value_cr` (25). A tender with no value (TenderTiger sends 0; 43% of a page of 500 on 16 Nov
+    2026), or one in another currency, is dropped by a department with a minimum. Like every rule, a changed
+    minimum applies from the next search.
+  - `watchlist_searches.name`: the exact organisation names, as TenderTiger writes them, that a refresh searches
+    for. Each must match one of the department's own patterns. A name TenderTiger lists in several ways needs each
+    way it has live tenders under: an exact search finds only its own name.
+
+```sql
+-- West Bengal PWD from 2 Cr
+UPDATE watchlist_departments SET min_value_cr = 2 WHERE name = 'PWD West Bengal';
+-- Another exact name for Kolkata Port Trust
+INSERT INTO watchlist_searches (department_id, position, name)
+SELECT id, 3, 'kolkata port <name as TenderTiger writes it>' FROM watchlist_departments WHERE name = 'KOPT';
+```
+
+An edit of the rules applies from the next search: until then the list stays as the last search saved it, and the
+bar says the watchlist changed since. A watchlist that is not valid (a bad pattern, an unknown state, a search name its
+patterns do not match) cannot be saved, and stops a search, naming the department; the lists still load. An older version's `watchlist.json` is imported by `scripts/import_files_to_db.py`.
+
+How the sheet was read: "AP" is Arunachal Pradesh (the 12-state list is the 14 PWD states without Delhi and West
+Bengal, and NF Railway's AP sits among the north-eastern states), "UT" Uttarakhand, "All PWD States" and "PWD
+States" the 14 states of the PWD rows. Tender values: West Bengal state PWD from ₹2 Cr, Kolkata Port Trust from
+₹1 Cr, every other row from ₹25 Cr; a tender with no value given is not tracked. The head-office rows are tracked in that office's state: Delhi (HQ) Delhi,
+Noida (HQ) Uttar Pradesh, Gurugram (HQ) and Faridabad (HQ) Haryana, and RITES (Gurugram (HQ), Patna) Haryana and
+Bihar. The O&M rows of NHAI, NHIDCL and MoRTH claim only tenders whose description says O&M or maintenance; their
+"(ALL)" rows claim any work in their own states. NF Railway Construction comes before NF Railway, so it names its
+own tenders.
 
 ## How a tender is processed
 
@@ -328,18 +466,26 @@ model gave even where the bid team has marked it since, and finds the reasons by
    criteria to read it.
 
    **Indexing.** All the sources of the tender go into one Pinecone namespace of its own, `tcno-<tcno>`, in the
-   shared index `PINECONE_INDEX_NAME` (serverless, cosine, `PINECONE_EMBED_DIMENSION`; created on first use). The
-   namespace is made before the documents are downloaded (an earlier one of the tender is emptied), so a Pinecone
-   plan with no room for another namespace fails the tender before TenderTiger is asked or any OCR is paid for.
+   shared index `PINECONE_INDEX_NAME` (serverless, `PINECONE_METRIC`, `PINECONE_EMBED_DIMENSION`; created on first
+   use). The namespace is made before the documents are downloaded, so a Pinecone plan with no room for another
+   namespace fails the tender before TenderTiger is asked or any OCR is paid for. An earlier complete namespace of
+   the tender is kept, marked as being built, and only the sources that changed are upserted again (see
+   **Re-checking against the namespace** below); any other is emptied.
    Each source is split into chunks of about
    `CHUNK_SIZE` characters that overlap by `CHUNK_OVERLAP`, the chunks are embedded with Pinecone's hosted
    `PINECONE_EMBED_MODEL` (96 per request) and upserted (`PINECONE_UPSERT_BATCH` per request), `INGEST_WORKERS`
    batches at a time, with retries on rate limits and server errors. Every chunk carries `tcno`, `source_file`,
    `document_type` (nit, boq, corrigendum, technical, form, prequalification, tender_data or other, from the file
-   name), `chunk_id`, `chunk_index`, `created_at` and its `text`. Once searches see every chunk (Pinecone reports
+   name), `chunk_id`, `chunk_index`, `created_at` and its `text`, and the document sections it is in (`section`,
+   `sections`, `section_titles`: see [document_sections.py](services/document_sections.py)). On a `dotproduct`
+   index it also holds sparse values: the hashed terms of its text and section title, where `Rs. 25 lakh`,
+   `₹ 25,00,000` and `0.25 crore` are one amount, `clause 4.2.1`, `Annexure-III` and a bare `4.2.1` heading are
+   clause terms, and `51 %` and `FY 2023-2024` are terms of their own (see
+   [sparse_encoder.py](services/sparse_encoder.py)). Once searches see every chunk (Pinecone reports
    each write's log position and how far each search has caught up), a complete `__manifest__` record is written
    last (a long source list is split over `__manifest__-000`, ... parts written just before it): the sources with
-   their chunk counts and the sources that could not be read. A namespace without it was left half-built; a failed
+   their chunk counts and SHA-256s, the sources that could not be read, and whether the chunks hold sparse values.
+   A namespace without it was left half-built; a failed
    run deletes it, and one left by a crash is rebuilt the next time the tender is checked. Files are read
    `INGEST_WORKERS` at a time. PaddleOCR reads one page at a time in a process (one engine already uses every
    core: 8 pages took 77 s in turn, 71 s on 8 threads and 77 s in 4 processes, and 8 processes ran out of memory),
@@ -348,14 +494,29 @@ model gave even where the bid team has marked it since, and finds the reasons by
    tender's namespace, so tenders never see each other's records.
 
    **Retrieval.** Before the LLM is called, the chunks on each kind of requirement are retrieved from the
-   namespace:
-   eligibility, financial, technical, experience, JV and compliance, two or three searches each
-   (`ASSESSMENT_QUERIES` in [analysis_service.py](services/analysis_service.py)), `RETRIEVAL_TOP_K` chunks per
-   search. The TenderTiger sources are always sent in full; the searches then take turns, best match first, until
-   `RETRIEVAL_MAX_CHARS` of text is taken. The chunks go to the LLM in document order, as a `## <source>` section
-   per source, and it checks the company against the criteria in them, listing a criterion stated in several
-   sources once. A failed final call leaves the namespace in place, so a re-check can follow without reading the
-   documents again.
+   namespace, within `RETRIEVAL_MAX_CHARS` of text, in three steps:
+   1. The TenderTiger sources, always in full.
+   2. *Hierarchical:* the qualification section, whole. Two searches for the qualification criteria
+      (`QUALIFICATION_SECTION` in [analysis_service.py](services/analysis_service.py)) vote, with their matches'
+      scores, for the sections those matches are in, so a section holding several matches (its sub-sections' votes
+      add up in it) wins. The best section that fits `RETRIEVAL_SECTION_SHARE` of the budget is fetched by its chunk
+      IDs and sent whole, and a second one that does not overlap it, if its votes are within the score floor of the
+      first's. A section is told from the document's headings: a part, section, annexure or line in capitals
+      (`NOTICE INVITING E-TENDER (NIT)`) holds the numbered or lettered clause headings after it
+      (`B. AVERAGE ANNUAL TURNOVER:`), while running headers, table rows and contents lines are ignored. The result's
+      `index.whole_sections` names the sections taken.
+   3. The searches for each kind of requirement: eligibility, financial, technical, experience, JV and compliance,
+      two or three searches each (`ASSESSMENT_QUERIES`), take turns, best match first, until the budget is spent.
+
+   Every search is *adaptive*: it keeps its `RETRIEVAL_TOP_K` matches only down to `RETRIEVAL_SCORE_FLOOR` times its
+   best score, and none under `RETRIEVAL_MIN_SCORE` (two at least), so a kind of requirement the tender barely
+   mentions sends one or two chunks instead of eight. On a namespace with sparse values every search is *hybrid*:
+   its score is `RETRIEVAL_HYBRID_ALPHA` times the dense cosine plus the rest times the cosine of the sparse terms,
+   so the deep analysis's search for a criterion's evidence ("Turnover: ₹ 2.5 crore, clause 4.2") finds the chunk
+   that states the same figure or clause, however it is written. The chunks go to the LLM in document order, as a
+   `## <source>` section per source, and it checks the company against the criteria in them, listing a criterion
+   stated in several sources once. A failed final call leaves the namespace in place, so a re-check can follow
+   without reading the documents again.
 
    **Tender details.** The tender's row in the TenderTiger list (tender value, organisation, closing date, name,
    location) goes with the task as "Tender details", ahead of the company profile, taken from the list as it was
@@ -398,14 +559,21 @@ model gave even where the bid team has marked it since, and finds the reasons by
 and compared with the current company profile in one LLM call. The sources the namespace's manifest lists as
 unreadable still make the check incomplete, so an Eligible verdict there still becomes Requires Review. A
 namespace left half-built (no complete manifest) is not trusted: the tender's documents are downloaded and indexed
-again. To read the documents again and rebuild the namespace, queue the tender with `"regenerate": true`. On the
-page, that is the **Regenerate criteria** switch in the selection bar, or the button of that name in the analysis
-view, next to **Re-check**. Regenerating deletes the namespace first, then empties the folder (step 2), downloads,
-reads and indexes the documents again; if the download fails, the tender is left with no namespace, and the next
-check reads the documents again.
+again. To read the documents again and bring the namespace up to date, queue the tender with
+`"regenerate": true`. On the page, that is the **Regenerate criteria** switch in the selection bar, or the button of
+that name in the analysis view, next to **Re-check**. Regenerating marks the namespace as being built (its chunks
+kept), empties the folder (step 2), downloads and reads the documents again, then compares each source's SHA-256
+with the one the manifest lists: an unchanged source is left as it is, neither embedded nor upserted again; a
+changed or new one is upserted, and the chunks of a source gone, or grown shorter, are deleted. The result's
+`index` counts them (`upserted`, `kept_sources`, `deleted`). Before its first change the build marks the manifest
+as no longer kept, so a failure part-way leaves a namespace that is rebuilt from scratch next time. A namespace of
+another schema, embedding model or dimension, or another `CHUNK_SIZE` / `CHUNK_OVERLAP`, keeps nothing. If the
+download fails, the tender is left with no namespace (it is deleted as incomplete), and the next check reads the
+documents again.
 
 **OCR budget.** Before any OCR, a tender's downloaded files are counted for the pages and images OCR would read
-(files in the cache need none; see `ocr_estimate()` in [analysis_service.py](services/analysis_service.py)), and
+(files in the cache need none, nor do pages and images in the page cache, which takes a fraction of a second a
+page to tell; see `ocr_estimate()` in [analysis_service.py](services/analysis_service.py)), and
 what that could cost at most, every one sent to `OCR_MODEL` at `OCR_PAGE_COST`. Over `OCR_BUDGET_PAGES` or
 `OCR_BUDGET_USD`, the tender stops there, before reading anything, and is saved with the status
 `awaiting_approval` (not a failure: nothing went wrong), "Waiting for approval of the OCR" and its `ocr_estimate`
@@ -416,23 +584,26 @@ Before a bulk regenerate (the **Regenerate criteria** switch), the page asks `/a
 tender's pages and worst-case cost, counted from the documents already on disk, with **Regenerate** (tenders over
 the budget stop and ask) or **Regenerate and approve OCR**.
 
-**Cache.** Reading and embedding are cached in `CACHE_FILE` (SQLite, [cache_service.py](services/cache_service.py)),
+**Cache.** Reading and embedding are cached in the database (the `texts`, `pages` and `vectors` tables,
+[cache_service.py](services/cache_service.py)),
 so regenerating reads and embeds only the files that changed. A file's text, after MarkItDown and OCR, is kept by
 the file's SHA-256 and the reading settings (the MarkItDown version, `PADDLEOCR_MODEL`, `OCR_MIN_CONFIDENCE`,
 `OCR_MODEL`): a file downloaded again unchanged, or the same file in another tender, is not read or OCR'd again,
-and spends no OCR tokens. Each chunk's vector is kept by the SHA-256 of the chunk's text and the embedding model
-and dimension, so an unchanged file's chunks are never embedded twice, and changing `CHUNK_SIZE`,
-`CHUNK_OVERLAP` or the model cannot serve a stale vector. The namespace is still rebuilt and every chunk upserted
-again; only the embedding is skipped, and `index.embedding_tokens` counts only the chunks embedded. A reading
-with pages or images OCR could not read is not kept, so the next run tries them again; nor is a PDF too long to
-OCR. A cache that cannot be read or written is logged and passed over. Delete the file to read and embed
-everything again.
+and spends no OCR tokens. Each page and image OCR reads is also kept on its own, by the SHA-256 of its rendered
+image and the same settings, so a file only some of whose pages could be read has only the rest read again, and a
+file that changed in a few pages (or a corrigendum reissuing a page of the NIT) has only the new pages read. Each
+chunk's vector is kept by the SHA-256 of the chunk's text and the embedding model and dimension, so an unchanged
+file's chunks are never embedded twice, and changing `CHUNK_SIZE`, `CHUNK_OVERLAP` or the model cannot serve a
+stale vector; `index.embedding_tokens` counts only the chunks embedded. A regenerate does not upsert an unchanged
+source again either (see above). A file reading with pages or images OCR could not read is not kept, so the next
+run tries them again (the pages read are in the page cache); nor is a PDF too long to OCR. A cache that cannot be
+read or written is logged and passed over. Empty the three tables to read and embed everything again.
 
 **Namespace limits.** All tenders share one index, each in its own namespace, because Pinecone allows far more
 namespaces per index (100 on Starter, 100,000 on Standard) than indexes per project (5 on Starter, 20 on
 Standard). Once an index's namespaces run out, a new tender fails with "The Pinecone namespace limit is reached":
-delete the namespaces of tenders no longer needed with `DELETE /api/namespace/<tcno>` (their results are kept;
-checking them again rebuilds the namespace), or move to a larger plan. See
+delete the closed tenders no longer needed (**Delete** in **Closed tenders** deletes a tender's namespace with the
+rest of it), or move to a larger plan. See
 [docs/pinecone-architecture.md](docs/pinecone-architecture.md).
 
 Expect a minute or two per tender whose documents are read: the documents are no longer summarised by the LLM, so
@@ -444,18 +615,30 @@ then the queued tenders that need TenderTiger are cancelled, and only re-checks 
 Stopping a run cancels the queued tenders; the one in progress
 finishes.
 
+**Checks too large for one request.** When Groq refuses the final check as too large for the plan's tokens per
+minute (its 413, "Request too large ... Limit 8000, Requested 9431"), the check is made again in batches: the
+retrieved excerpts, in document order, are split in two runs of about the same length, each checked on its own with
+the same instructions, company profile and tender details (and told it is one part of several); a run still too large
+is split in two again, up to 3 batches. A batch that reaches the plan's per-minute limit (its 429, "try again in
+12.3s") waits as long as Groq says and is sent again. The criteria of the batches are joined, a criterion found in
+two batches once with its most telling status (Not met, then Met, then Cannot determine); the JV terms come from the
+batch that states them; and the verdict, score and JV verdict are worked out from the joined statuses, by the same
+rules as when the team marks statuses by hand. The analysis says it was checked in batches and shows each batch's
+reply, and the result's `index.assessment_batches` says how many (1 for one request). Batches cost more tokens than
+one request (the instructions and company profile go with each), take a minute or more on the free tier, and a
+criterion that needs a figure stated in another batch can come out Cannot determine; the tender's value from
+TenderTiger goes with every batch. Tender 101225209, refused at 9,431 tokens, was checked in 2 batches in 73 seconds,
+18,436 tokens in all. Still too large in 3 batches, the tender fails as before.
+
 **Token usage.** Every LLM call a tender makes is counted, as the input and output tokens the model reports, in
 two steps: `criteria`, reading the documents (now only the scanned pages sent to `OCR_MODEL`), and `assessment`, the final check
 that gives the result. The counts are saved with the result as `tokens`, and logged. A failed tender keeps the
 tokens it spent before failing; a re-check spends none on `criteria`. Embedding tokens are billed by Pinecone, not
 counted here; the result's `index.embedding_tokens` gives them for the run that built the index.
 
-**Saved results.** Every finished check, failed ones included, is saved as `eligibility_result.json` in the TCNO
-folder, replacing the previous one; it holds the same fields as `GET /api/result/<tcno>`. On startup the app
-loads every such file, so the table, the analysis view and the time estimates come back after a restart; a file
-it cannot read is skipped with a warning in the log. A result saved by an earlier version loses its old
-`criteria_file` (or `index_name`) field on loading and gets `namespace`. Regenerating empties the folder, so the old result is gone
-until the new one is saved.
+**Saved results.** Every finished check, failed ones included, is saved in the database (the `results` table),
+replacing the previous one; it holds the same fields as `GET /api/result/<tcno>`, so the table, the analysis view
+and the time estimates come back after a restart. Regenerating keeps the old result until the new one is saved.
 
 ## Deep analysis
 
@@ -483,11 +666,10 @@ are met and every source was read or checked, otherwise Requires Review). Where 
 determination, the agents have not settled it, so it is Requires Review. An agent's answer that is not valid JSON
 is sent back once to be rewritten; a second bad answer fails the run.
 
-The report is saved as `deep_analysis.json` in the TCNO folder, beside `eligibility_result.json`, and survives a
-restart. It is never served or read as a tender document. It records what it was based on: once the result's
-statuses, the unread files checked, or the company profile change, it is shown as out of date until it is run
-again. Re-checking keeps the old report (marked out of date); regenerating empties the folder and removes it. A
-failed run leaves the last report as it was. One deep analysis runs at a time; others wait their turn. A typical
+The report is saved in the database (the `deep_analyses` table), and survives a restart. It records what it was
+based on: once the result's statuses, the unread files checked, or the company profile change, it is shown as out
+of date until it is run again, so re-checking or regenerating the tender keeps the old report, marked out of date.
+Deleting the tender (Closed tenders) deletes it. A failed run leaves the last report as it was. One deep analysis runs at a time; others wait their turn. A typical
 run makes 4 to 8 LLM calls, counted by agent under `tokens`.
 
 Each LLM agent runs on its own model, set in `.env` (`DEEP_PROFILER_MODEL`, `DEEP_AUDIT_MODEL`,
@@ -574,29 +756,67 @@ before TenderTiger is asked. Every tender listed stays known to the server, so o
 The dates come from TenderTiger as `DD-MM-YYYY` and are shown as `18-Nov-2026`; `days_left` counts from
 today to the closing date. `has_document` is false when the tender's `isdocument` is not `1`; such a tender
 can still be checked, on its pre-qualification criteria alone, while `has_prequalification` (it has the IDs
-for a `GetPreQualification` link) is true. `has_indexed_criteria` is true when the tender's Pinecone namespace
-(`tcno-<tcno>`) exists, so a check re-uses it; it replaces `has_saved_criteria`. It is false
-when Pinecone is not configured or cannot be reached, so the list still loads. `502` if the tender API or the
+for a `GetPreQualification` link) is true. `has_indexed_criteria` is true when the tender's last result names its
+Pinecone namespace (`tcno-<tcno>`), so a check re-uses it; it replaces `has_saved_criteria`. It comes from the
+database alone, so a list never waits on Pinecone; a tender with no result yet is false, whatever Pinecone holds, and
+the check itself asks Pinecone whether to re-check or read the documents again. `502` if the tender API or the
 TenderTiger login fails.
 
-### GET /api/default-filters
+Each row also has `watchlist`: the [watchlist](#watchlist) department that claims the tender,
+`{"sl": 1, "name": "ER", "full_name": "Eastern Railway", "sector": "Railway Zonal", "min_value_cr": 25}`, or
+`null`. A tender under its department's minimum value has `null`.
 
-The filters in `DEFAULT_FILTERS_FILE` (`default_filters.json`), which **Default filters** under the page's Filters
-puts into the form and loads the list with. The file holds one JSON object with the parameter names of
-`GET /api/tenders`; a date may also be `"today"`, `"today+7"` or `"today-7"` (days), so the file does not go stale.
-The one shipped lists the open tenders that have bid documents:
+### GET /api/watchlist
+
+One page of the [watchlist](#watchlist): the tenders its last search saved (the `watchlist_tenders` table), as they
+are, as table rows of the same shape as `GET /api/tenders`. Takes `sort`, `order`, `page` and `page_size` as it does;
+the server sorts, on the closing dates and values alone, tenders without one last, and reads only the page's tenders
+whole. Unlike TenderTiger's list it has a `total`, so `has_more` is exact, and `watchlist` is the search's status, as
+`GET /api/watchlist/status` gives it. `500` when the database cannot be read, `400` for a bad parameter.
+
+### GET /api/watchlist/status
 
 ```json
 {
-  "closing_from": "today",
-  "bid_doc": true
+  "status": "running", "refreshed_at": "2026-11-13T06:10:42+00:00", "tenders": 1212, "departments": 61,
+  "searched": 45, "searches": 126, "current": "military engineer services", "found": 503,
+  "started_at": "2026-11-14T06:11:00+00:00", "finished_at": null, "error": null, "capped": [],
+  "refresh_hours": 24.0, "changed": false
 }
 ```
 
-They are returned as the query parameters the form sends: strings, only the filters set (a `false` flag and a
-comparison without its amount are left out), dates resolved, an amount always with its comparison:
-`{"closing_from": "2026-11-11", "bid_doc": "true"}`. `404` without the file; `500` when it is not valid JSON or
-holds an unknown filter or a bad value, naming it.
+`status` is `idle` (no search since the app started), `running`, `completed` or `failed` (`error` says why; the list
+stays as the last search left it). `tenders` and `departments` count the tenders the last search saved and the
+departments with any.
+`searched` of `searches` (organisation names) are done; `found` is what the search in progress
+has kept so far. `capped` lists searches that found more than TenderTiger serves even closing day by day. `changed`
+is true when the watchlist's rules changed since the list was searched for: they apply from the next search.
+
+### POST /api/watchlist/refresh
+
+Searches TenderTiger again for the watchlist, in the background; one search at a time (asked while one runs,
+nothing changes). Returns `202` with the status. `404` / `500` as `GET /api/watchlist`.
+
+### GET /api/watchlist/rules
+
+The watchlist's rules, for **Edit watchlist**, from its tables; a value is left out when there is none, and a
+department of any state has `"states": "any"`. Before any, the usual filters and no department.
+
+```json
+{"about": "The departments the team tracks, ...", "filters": {"closing_from": "today", "bid_doc": true},
+ "min_value_cr": 25.0, "state_groups": {"North East": ["Arunachal Pradesh", "Assam", "..."]},
+ "departments": [{"sl": 81, "sector": "Port", "name": "KOPT", "full_name": "Kolkata Port Trust",
+                  "organisations": ["^kolkata port\b", "^kolkata dock"], "search": ["kolkata port trust"],
+                  "states": ["West Bengal"], "min_value_cr": 1.0}]}
+```
+
+### PUT /api/watchlist/rules
+
+Saves the rules, sent in the shape `GET` gives, in place of the last, in one transaction, and returns them as saved.
+The rules apply from the next search; the list stays as the last search saved it until then.
+`400` when they are not a valid watchlist, naming the department (`the watchlist, department 81 (KOPT): 'Bengal' is
+neither a state nor a state group.`), or when the body has an unknown field or a value of the wrong type: then
+nothing changes.
 
 ### POST /api/process-tenders
 
@@ -608,8 +828,8 @@ Request:
 
 Response `202`: the job's progress (same shape as `/api/progress`). Starts a job, or adds the tenders to
 the running one; tenders already queued or processing are skipped. A tender with a Pinecone namespace is
-re-checked against it; `regenerate` (optional, default `false`) deletes the namespace of every posted tender,
-downloads and reads its documents again and rebuilds the namespace. `approve_ocr` (optional, default `false`)
+re-checked against it; `regenerate` (optional, default `false`) downloads and reads every posted tender's
+documents again and brings its namespace up to date, upserting again only the sources that changed. `approve_ocr` (optional, default `false`)
 reads every scanned page even when the OCR is over the tender's budget (see [OCR budget](#ocr-budget)). `400` for
 an empty list or an unknown TCNO.
 
@@ -725,7 +945,10 @@ in the saved results, an earlier one), and `average_recheck_seconds` that of the
   "rechecked": false,
   "namespace": "tcno-100091540",
   "index": {"index": "tender-processing", "namespace": "tcno-100091540", "sources": 4, "chunks": 312,
-            "embedding_tokens": 118230, "retrieved_chunks": 31, "retrieved_characters": 47210},
+            "upserted": 41, "kept_sources": 3, "deleted": 2, "embedding_tokens": 15230, "retrieved_chunks": 24,
+            "retrieved_characters": 35880,
+            "whole_sections": [{"source_file": "NIT.pdf", "title": "SECTION 3: QUALIFICATION CRITERIA",
+                                "chunks": "14-19", "label": "qualification section"}]},
   "tokens": {
     "criteria": {"input": 312480, "output": 18342, "total": 330822},
     "assessment": {"input": 9120, "output": 2654, "total": 11774},
@@ -740,15 +963,16 @@ A failed tender has `"status": "failed"`, `verdict` and `details` set to `null`,
 and what failed and what to do next in `error_title` and `error_action`. `rechecked` is true when the result
 came from the tender's Pinecone namespace without reading the documents; `namespace` is that namespace after the
 run, or `null` when it has none (it replaces `criteria_file`). `index` says what the run indexed (`sources`, `chunks`,
-`embedding_tokens`; absent on a re-check) and retrieved (`retrieved_chunks`, `retrieved_characters`); `null` for a
-failed run.
+`embedding_tokens`, and of the chunks, how many were `upserted` and `deleted`, and the `kept_sources` left as they
+were since the last build; absent on a re-check) and retrieved (`retrieved_chunks`, `retrieved_characters`, and the
+`whole_sections` taken whole); `null` for a failed run. Results saved before a field was added lack it.
 `tokens` holds the LLM tokens of the run (see Token usage above); results saved before it was added have none.
 `jv.allowed` is `yes`, `no` or `unknown` (not stated); `max_members` is `null` when not stated or no JV is
 allowed; `jv.verdict` is the outcome as JV lead member (see step 8), `null` without a JV. In `comparison`,
 `alone_requirement` and `alone_status` are `null` for a requirement only a JV has, and the `lead_*`,
 `other_members` and `combined` fields are `null` when no JV may bid. Statuses are `met`, `not_met` or `unknown`.
 A failed tender has `"jv": null` and an empty `comparison`.
-`404` if the tender has no result: not processed since the server started, and no saved result in its folder.
+`404` if the tender has no result: never processed, or deleted.
 
 ### GET /api/files/&lt;tcno&gt;/&lt;file&gt;
 
@@ -775,8 +999,8 @@ not met, Eligible if all are met and no unreadable file is left unchecked, other
 verdict is kept as `ai_verdict`; the score, `checks` (with `user_marked`, the number marked) and each comparison
 row's `alone_status` follow too. `details` stays the AI's text. The result is saved, so the marks survive a
 restart, and a re-check or regenerate marks the same statuses again on the criteria of the new result with the
-same name. The mark is also recorded in the company profile, or removed from it with the mark (see [Company
-profile](#company-profile)); a profile that cannot be saved is logged, and the mark stands. Response `200` with
+same name. The mark is also recorded with the bid team's marks, or removed from them with the mark (see [Company
+profile](#company-profile)); one that cannot be recorded is logged, and the mark stands. Response `200` with
 the updated result. `400` for an unknown status, `404` without a completed
 result or such a criterion, `409` while the tender is queued or being checked.
 
@@ -878,38 +1102,51 @@ Reports of version 2 named `eligibility_criteria.md` there.
 
 ### GET /api/deep-analysis/&lt;tcno&gt;/file
 
-Downloads the saved report, `deep_analysis.json`, as `deep_analysis_<tcno>.json`. `404` without one.
+Downloads the saved report as `deep_analysis_<tcno>.json`. `404` without one.
 
 ### GET /api/closed-downloads
 
-What **Closed tenders** in the app bar shows: the tenders whose closing date has passed but whose documents are
-still in `TARGET_DIRECTORY`, longest closed first, and under `unknown` those with documents but no closing date on
-record. A tender folder holding only its result is left out.
+What **Closed tenders** in the app bar shows: the checked tenders on record (their results in the database) whose
+closing date has passed, longest closed first, and under `unknown` those with no closing date on record. It is read
+from the database alone, in two reads: the download folder is not looked at, so a tender is listed whether or not
+its documents are still on disk. A tender queued or being checked is left out.
 
 ```json
-{"directory": "C:\\Tender-Processing\\downloads",
- "closed": [{"tcno": "102048481", "name": "Supply of packaged drinking water", "closing_date": "02-Oct-2026",
-             "days_closed": 40, "files": 3, "bytes": 2400000}],
- "unknown": [{"tcno": "91289333", "name": "Hiring of vehicles", "closing_date": null, "days_closed": null,
-              "files": 8, "bytes": 31000000}]}
+{"closed": [{"tcno": "102048481", "name": "Supply of packaged drinking water", "closing_date": "02-Oct-2026",
+             "days_closed": 40}],
+ "unknown": [{"tcno": "91289333", "name": "Hiring of vehicles", "closing_date": null, "days_closed": null}]}
 ```
 
 A result keeps the tender's closing date (`closing_date`, `YYYY-MM-DD`), refreshed each time the tender is listed,
-since TenderTiger can move it. A result saved before closing dates were kept gets its date the first time it is
-needed, from the TenderTiger data indexed in its Pinecone namespace; one whose namespace predates that is `unknown`
-until the tender is listed again.
+since TenderTiger can move it. A result saved before closing dates were kept is `unknown` until the tender is listed
+again.
+
+### GET /api/stray-downloads
+
+What **Find folders not in the database**, at the end of the **Closed tenders** popup, lists: the tender folders in
+`TARGET_DIRECTORY` the database holds no result for, left by a check that never finished or by an older version, so
+the database-only list above never shows them. Only this looks through the download folder, when the button is
+pressed. A folder counts when it is named as a TCNO (digits: not a download's staging folder) and its tender is not
+queued or being checked (its folder is being filled). Largest first; `name` is the tender's description when the
+tender list has it, `files` and `bytes` count every file in the folder. Each has **Delete**, as above.
+
+```json
+{"directory": "C:\Tender-Processing\downloads",
+ "tenders": [{"tcno": "102309372", "name": "Construction of ROB", "files": 4, "bytes": 2400000}]}
+```
 
 ### DELETE /api/downloads/&lt;tcno&gt;
 
-**Delete** in that popup: deletes everything kept for the tender, so it reads as never checked: its Pinecone
-namespace, its folder (the downloaded documents, the saved result and the deep analysis), all Redis holds of it
-(its result, and its place in the last run, which is forgotten too when it checked no other tender) and the team's
-decision.
-Only the statuses marked by hand stay, as they are recorded in the company profile. Checking the tender again
+**Delete** in that popup (in its list of folders not in the database too): deletes everything kept for the tender, so
+it reads as never checked: its Pinecone
+namespace, its folder of downloaded documents (if there is one), and all the database holds of it: its result, its
+deep analysis, the team's decision, and its place in the last run (forgotten too when it checked no other tender).
+Only the statuses marked by hand stay, recorded with the bid team's marks. Checking the tender again
 starts from scratch.
 
 Response `200`: `{"tcno": "102048481", "files": 3, "bytes": 2400000, "namespace_deleted": true}`, counting the
-documents. The namespace goes first, so when Pinecone fails (`502`) nothing else has been deleted yet. `404` when
+documents. The namespace goes first, so when Pinecone fails (`502`) nothing else has been deleted yet; without a
+Pinecone key (`503`) nothing is deleted at all, so no delete leaves a tender's records behind in Pinecone. `404` when
 nothing is kept for the tender, `409` while the tender is queued or being checked, while a deep analysis of it runs,
 or when a file cannot be deleted (open in another program, say).
 
@@ -927,26 +1164,20 @@ The tender's Pinecone namespace: whether it exists and is complete (has its comp
 
 `vector_count` counts the manifest too. `503` when `PINECONE_API_KEY` is not set, `502` when Pinecone fails.
 
-### DELETE /api/namespace/&lt;tcno&gt;
-
-Deletes the tender's Pinecone namespace, to free a place under the plan's namespace limit; other tenders'
-namespaces are untouched. The result is kept, with `namespace` `null`; the next check downloads and indexes the
-documents again. Response `200`: `{"tcno": "100091540", "namespace": "tcno-100091540", "deleted": true}` (`false`
-when there was none). It takes a few seconds: the namespace is emptied first, and checked again after it is
-deleted, as Pinecone can bring back a namespace written to just before. `409` while
-the tender is queued or being checked, `503` / `502` as above.
-
 ### PUT /api/decision/&lt;tcno&gt;
 
-Records the team's decision on a tender. It is saved to `DECISIONS_FILE`, so it survives a restart.
+Marks the team's decision on a tender, one that follows its own (see [Decisions](#decisions)). It is saved in
+the database, so it survives a restart.
 
 ```json
-{"decision": "dropped"}
+{"decision": "shortlisted"}
 ```
 
-`decision` is `"shortlisted"`, `"dropped"` or `null` (clears it). Response `200`:
-`{"tcno": "100091540", "decision": {"decision": "dropped", "decided_at": "..."}}`, with `decision` `null`
-after clearing. `400` for a missing or unknown decision, `404` for an unknown TCNO.
+`decision` is `"reviewed"`, `"shortlisted"` or `"dropped"`. Response `200`:
+`{"tcno": "100091540", "decision": {"decision": "shortlisted", "decided_at": "..."}}`. `409` for a decision that
+does not follow the tender's (`Tender 100091540 is shortlisted, so it cannot be marked reviewed: it can only be
+marked dropped.`), `400` for a missing or unknown decision (`null` included: a decision cannot be cleared), `404` for
+an unknown TCNO.
 
 ### GET /api/company
 
@@ -979,8 +1210,11 @@ Saves the profile edited in the form. Send every block, in the shape `GET /api/c
             {"type": "table", "columns": ["Item", "Value"], "rows": [["Company Name", "ABC Infrastructure Ltd."]]}]}
 ```
 
-The blocks are written to `COMPANY_DETAILS_FILE` as markdown. Rows with every cell empty are dropped, and a
-cell is kept on one line with any `|` escaped, and a `rule` with nothing to separate is dropped. Response `200`:
+The profile is rendered as markdown, and that markdown's blocks are saved in the database: one row per block in
+`company_profile_blocks` (its `position`, `type`, and a heading's `level` and `text`, a text block's `text` or a
+table's `columns`), and one row per table row in `company_profile_rows` (`block_id`, `position`, `cells`), each the
+child of its table's block. A save replaces them all, in one transaction. Rows with every cell empty are dropped, a
+cell is kept on one line, and a `rule` with nothing to separate is dropped. Response `200`:
 the saved profile, in the same shape as `GET /api/company`. `400` for a body without valid blocks, a heading
 below the title with no name (blank, or only a number such as `"9."`), a table column with no name, or blocks
 that leave the profile empty.
@@ -1024,8 +1258,11 @@ is checked (its documents are downloaded again).
 ## Tests
 
 ```powershell
-python -m unittest test_app test_ext test_pinecone_service
+python -m pytest
 ```
 
 The tests replace the tender API, the download, the LLM and Pinecone (with the in-memory
-[pinecone_fake.py](pinecone_fake.py)) with fakes, so they run offline in a few seconds.
+[pinecone_fake.py](pinecone_fake.py)) with fakes, so they run offline in about a minute. They need PostgreSQL:
+`TEST_DATABASE_URL`, or else the server of `DATABASE_URL` with a database named after it plus `_test` (made if
+missing). Each test works in a schema of its own there, dropped when it is done; the app's own database is never
+touched.

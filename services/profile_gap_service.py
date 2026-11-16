@@ -8,7 +8,7 @@ import re
 from collections import Counter
 from datetime import date, datetime, timezone
 
-from services.company_service import MARKED_HEADING, parse_profile
+from services.company_service import parse_profile
 
 # The reasons, tried in order: a criterion's reason is the first whose pattern matches its name, or failing that its
 # requirement (whose boilerplate, such as an MSE exemption, says less about it). in_profile is True for a fact a
@@ -88,8 +88,7 @@ def profile_statuses(markdown):
     """
     {topic key: 'stated', 'empty' or 'missing'} for the profile topics of TOPICS: 'stated' when a row of the
     profile's tables is about it (by the row's first cell and the headings above it) and has a value, 'empty' when
-    such rows have none, 'missing' when there is no such row. The table of criteria marked by the bid team does not
-    count: it records findings on tenders, not facts about the company.
+    such rows have none, 'missing' when there is no such row.
     """
     rows = []  # (text to match, has a value)
     headings = {}  # level -> heading text
@@ -98,8 +97,6 @@ def profile_statuses(markdown):
             headings = {level: text for level, text in headings.items() if level < block['level']}
             headings[block['level']] = re.sub(r'^\s*\d+(\.\d+)*\.?\s+', '', block['text'])
         elif block['type'] == 'table':
-            if any(' '.join(text.split()).lower() == MARKED_HEADING.lower() for text in headings.values()):
-                continue
             above = ' '.join(text for level, text in sorted(headings.items()) if level > 1)
             for row in block['rows']:
                 if row and row[0].strip():

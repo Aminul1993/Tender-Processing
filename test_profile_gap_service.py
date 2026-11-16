@@ -26,11 +26,6 @@ PROFILE = """# ACME
 | GST | 19AAAAA1234A1Z1 |  |
 | GST Registration | Yes |  |
 
-## Criteria marked by the bid team
-
-| Criterion | Requirement | Status | TCNO | Marked on |
-| --- | --- | --- | --- | --- |
-| Not blacklisted | No debarment | Met | 1 | 2026-11-11 |
 """
 
 

@@ -8,9 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from ext import (TENDERTIGER_REQUEST_GAP, TenderTigerBlocked, _PacedAdapter, assess_eligibility, company_details,
-                 extract_zip_recursive, prequalification_criteria, save_company_details, split_text,
-                 summarize_for_goal, tender_list, tendertiger_session)
+from ext import (TENDERTIGER_REQUEST_GAP, TenderTigerBlocked, _PacedAdapter, assess_eligibility, extract_zip_recursive,
+                 prequalification_criteria, split_text, summarize_for_goal, tender_list, tendertiger_session)
 
 
 def zip_bytes(entries):
@@ -71,24 +70,11 @@ class SummarizeForGoalTest(unittest.TestCase):
         self.assertEqual(summary, 'Minimum turnover ₹10 Cr.\nRest: NOT_RELEVANT')
 
 
-class CompanyDetailsTest(unittest.TestCase):
-    def test_saved_profile_is_loaded_and_sent_to_the_model(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'company_details.md'
-            self.assertEqual(company_details(path), '')
-
-            save_company_details('\n# ACME {Ltd}\n| Turnover | ₹10 Cr |\n\n', path)
-            llm = FakeLLM(['assessment'])
-            assess_eligibility(llm, ['## NIT.pdf\nTurnover at least ₹5 Cr'], company_details(path))
-
-            self.assertEqual(company_details(path), '# ACME {Ltd}\n| Turnover | ₹10 Cr |')
-            self.assertTrue(llm.invoked[0][1]['content'].endswith('Company details:\n# ACME {Ltd}\n| Turnover | ₹10 Cr |'))
-
-    def test_profile_saved_with_a_bom_reads_cleanly(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / 'company_details.md'
-            path.write_text('# ACME\n', encoding='utf-8-sig')
-            self.assertEqual(company_details(path), '# ACME')
+class AssessEligibilityTest(unittest.TestCase):
+    def test_the_company_profile_is_sent_to_the_model_as_written(self):
+        llm = FakeLLM(['assessment'])
+        assess_eligibility(llm, ['## NIT.pdf\nTurnover at least ₹5 Cr'], '# ACME {Ltd}\n| Turnover | ₹10 Cr |')
+        self.assertTrue(llm.invoked[0][1]['content'].endswith('Company details:\n# ACME {Ltd}\n| Turnover | ₹10 Cr |'))
 
 
 def fake_response(text='', body=None, status=200):

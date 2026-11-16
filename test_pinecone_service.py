@@ -1,17 +1,41 @@
 """Tests for services/pinecone_service.py, against the in-memory FakePinecone (no network)."""
+import time
 import unittest
 from unittest import mock
 
 from pinecone import ForbiddenError, RateLimitError, ServiceError, UnauthorizedError
 
 from pinecone_fake import FakePinecone
+from services import sparse_encoder
+from services.document_sections import chunk_sections, headings
 from services.pinecone_service import (MANIFEST_ID, Document, NamespaceIncomplete, PineconeService, QuotaExceeded,
-                                       VectorStoreError, VectorStoreNotConfigured, chunk_id, chunk_text, document_type)
+                                       VectorStoreError, VectorStoreNotConfigured, _chunk, _chunks, chunk_id,
+                                       chunk_text, document_type)
 
 NIT = ('Eligibility criteria. The bidder must have a minimum average annual turnover of Rs 10 crore in the last three '
        'financial years.\n\nSimilar work: one completed work of 40 crore in the last seven years.\n\n'
        'Joint venture: a JV of up to 3 members is allowed; the lead member holds at least 51%.')
 BOQ = 'Item 1: Earthwork 500 cum.\n\nItem 2: Concrete 200 cum.\n\nEstimated cost: Rs 98 crore.'
+
+
+def paragraphs(topic, count):
+    return '\n\n'.join(f'{topic} paragraph {number}: the contractor shall arrange {topic.lower()} works and keep '
+                       f'records of materials and labour for item {number}.' for number in range(count))
+
+
+# A notice whose qualification criteria are a section of their own, between a long preamble and long other sections
+SECTIONED_NIT = '\n\n'.join([
+    'NOTICE INVITING TENDER\n\nTender for road works in the district. ' + paragraphs('General', 4),
+    'SECTION 3: QUALIFICATION CRITERIA\n\nThe bidder must meet every qualifying criterion below.',
+    '3.1 Financial Criteria\n\nAverage annual turnover of Rs. 25 lakh in the last three financial years. Net worth '
+    'must be positive. Solvency certificate of Rs 10 lakh.',
+    '3.2 Experience Criteria\n\nSimilar works: one completed work of value 2.5 crore in the last seven years, or two '
+    'of 1.5 crore each.',
+    'SECTION 4: SCOPE OF WORK\n\n' + paragraphs('Drainage', 8),
+    'SECTION 5: SPECIAL CONDITIONS OF CONTRACT\n\n' + paragraphs('Paving', 8),
+])
+QUALIFICATION = {'qualification section': ['qualification criteria the bidder must meet',
+                                           'qualifying criteria: turnover, similar works']}
 
 
 def service(client=None, **options):
@@ -255,6 +279,264 @@ class NamespaceTest(unittest.TestCase):
         self.assertEqual(self.index.namespaces(refresh=True), {f'tcno-{n}' for n in '12345'})
 
 
+class IncrementalBuildTest(unittest.TestCase):
+    """Regenerating a namespace kept by reset_namespace(keep=True) upserts only the sources that changed."""
+
+    def setUp(self):
+        self.client = FakePinecone()
+        self.index = service(self.client)
+        self.first = [Document('TenderTiger Pre-Qualification', 'Net worth must be positive.', 'prequalification'),
+                      Document('NIT.pdf', NIT, 'nit'), Document('BOQ.xlsx', BOQ, 'boq')]
+        self.index.rebuild_namespace('1', self.first, ['scan.pdf'])
+
+    def chunks(self, source):
+        return {identifier: meta for identifier, meta in self.client.chunks('tcno-1').items()
+                if meta['source_file'] == source}
+
+    def test_only_changed_and_new_sources_are_upserted_and_those_gone_are_deleted(self):
+        nit_before = {identifier: meta['created_at'] for identifier, meta in self.chunks('NIT.pdf').items()}
+        shorter_boq = 'Item 1: Earthwork 500 cum.'
+        self.client.calls.clear()
+
+        built = self.index.rebuild_namespace('1', [
+            Document('NIT.pdf', NIT, 'nit'), Document('BOQ.xlsx', shorter_boq, 'boq'),
+            Document('Corrigendum-1.pdf', 'The closing date is extended by a week.', 'corrigendum')], [], keep=True)
+
+        self.assertNotIn(('delete_all', 'tcno-1'), self.client.calls)
+        # NIT.pdf is untouched: neither embedded nor written again
+        self.assertEqual({identifier: meta['created_at'] for identifier, meta in self.chunks('NIT.pdf').items()},
+                         nit_before)
+        new_chunks = len(chunk_text(shorter_boq, 120, 30)) + len(chunk_text('The closing date is extended by a week.',
+                                                                            120, 30))
+        embedded = sum(call[2] for call in self.client.calls if call[:2] == ('embed', 'passage'))
+        self.assertEqual((built['upserted'], embedded, built['kept_sources']), (new_chunks, new_chunks, 1))
+        # The pre-qualification text is gone, and so are the BOQ's chunks past its new end
+        self.assertEqual(self.chunks('TenderTiger Pre-Qualification'), {})
+        self.assertEqual([meta['text'] for meta in self.chunks('BOQ.xlsx').values()], [shorter_boq])
+        self.assertEqual(built['deleted'], len(chunk_text('Net worth must be positive.', 120, 30))
+                         + len(chunk_text(BOQ, 120, 30)) - 1)
+        manifest = self.index.manifest('1')
+        self.assertEqual([source['name'] for source in manifest['sources']],
+                         ['NIT.pdf', 'BOQ.xlsx', 'Corrigendum-1.pdf'])
+        self.assertEqual(manifest['unreadable'], [])
+        self.assertEqual(len(self.index.knowledge('1').chunks), built['chunks'])
+        self.assertEqual(len(self.client.chunks('tcno-1')), built['chunks'])
+
+    def test_nothing_is_upserted_again_when_nothing_changed(self):
+        self.client.calls.clear()
+        built = self.index.rebuild_namespace('1', self.first, ['scan.pdf'], keep=True)
+
+        self.assertEqual((built['upserted'], built['deleted'], built['kept_sources']), (0, 0, 3))
+        self.assertFalse([call for call in self.client.calls if call[0] == 'embed'])
+        # Only the manifest is written: kept, then complete again
+        self.assertEqual([call for call in self.client.calls if call[0] == 'upsert'],
+                         [('upsert', 'tcno-1', 1), ('upsert', 'tcno-1', 1)])
+        self.assertEqual(self.index.manifest('1')['unreadable'], ['scan.pdf'])
+
+    def test_a_build_that_fails_after_changing_the_namespace_is_rebuilt_from_scratch_next_time(self):
+        self.index.reset_namespace('1', keep=True)
+        self.assertIsNone(self.index.manifest('1'))  # kept, but not complete while being built
+        with mock.patch.object(self.index, 'upsert_chunks', side_effect=VectorStoreError('upsert failed')), \
+                self.assertRaises(VectorStoreError):
+            self.index.ingest('1', [Document('NIT.pdf', 'Turnover of Rs 2 crore.', 'nit')])
+
+        self.client.calls.clear()
+        self.index.reset_namespace('1', keep=True)
+        self.assertIn(('delete_all', 'tcno-1'), self.client.calls)  # not kept: its chunks no longer match
+
+    def test_a_namespace_reset_twice_with_keep_is_still_kept(self):
+        # As a regenerate does: the processor before the download, process_tender_files() before reading
+        self.index.reset_namespace('1', keep=True)
+        self.index.reset_namespace('1', keep=True)
+        built = self.index.ingest('1', self.first, ['scan.pdf'])
+        self.assertEqual((built['kept_sources'], built['upserted']), (3, 0))
+
+    def test_without_keep_or_with_other_settings_nothing_is_kept(self):
+        self.client.calls.clear()
+        built = self.index.rebuild_namespace('1', self.first, ['scan.pdf'])
+        self.assertIn(('delete_all', 'tcno-1'), self.client.calls)
+        self.assertEqual(built['kept_sources'], 0)
+
+        other = service(self.client, chunk_size=200)  # chunks of another size: every source is upserted again
+        built = other.rebuild_namespace('1', self.first, ['scan.pdf'], keep=True)
+        self.assertEqual((built['kept_sources'], built['upserted']), (0, built['chunks']))
+        self.assertEqual(len(self.client.chunks('tcno-1')), built['chunks'])
+
+    def test_manifest_parts_no_longer_needed_are_deleted(self):
+        forms = [Document(f'Annexures/{"long-folder-name/" * 3}Form-{number:04d}.pdf', f'Form {number}.', 'form')
+                 for number in range(600)]
+        self.index.rebuild_namespace('1', forms)
+        self.index.rebuild_namespace('1', forms[:1], keep=True)
+
+        records = self.client.namespaces()['tcno-1']
+        self.assertEqual([identifier for identifier, record in records.items()
+                          if record['metadata']['record_type'] == 'manifest_part'], [])
+        self.assertEqual(len(self.client.chunks('tcno-1')), 1)
+        self.assertEqual(len(self.index.manifest('1')['sources']), 1)
+
+
+class AdaptiveRetrievalTest(unittest.TestCase):
+    """A search keeps its matches down to a score floor, not always its top_k."""
+
+    def matches(self, *scores):
+        return [_chunk({'source_file': 'NIT.pdf', 'chunk_index': number, 'text': f'chunk {number}'},
+                       chunk_id('NIT.pdf', number), score) for number, score in enumerate(scores)]
+
+    def retrieved(self, matches, **options):
+        index = service(top_k=8, **options)
+        index.rebuild_namespace('1', [Document('NIT.pdf', NIT, 'nit')])
+        with mock.patch.object(index, 'query', return_value=matches):
+            return [chunk['chunk_index'] for chunk in index.retrieve('1', {'x': ['turnover']}).chunks]
+
+    def test_matches_under_a_share_of_the_best_score_are_left_out(self):
+        matches = self.matches(0.60, 0.55, 0.52, 0.40, 0.30)
+        self.assertEqual(self.retrieved(matches, hybrid_alpha=1), [0, 1, 2])  # 0.85 x 0.60 = 0.51
+        self.assertEqual(self.retrieved(matches, hybrid_alpha=1, score_floor=0, min_score=0), [0, 1, 2, 3, 4])
+
+    def test_matches_under_the_minimum_score_are_left_out_but_never_the_best_two(self):
+        self.assertEqual(self.retrieved(self.matches(0.30, 0.25, 0.19, 0.18), hybrid_alpha=1), [0, 1])
+        self.assertEqual(self.retrieved(self.matches(0.15, 0.14, 0.14), hybrid_alpha=1), [0, 1])
+        # In a hybrid search the minimum is on the dense part's scale: 0.2 x 0.75
+        self.assertEqual(self.retrieved(self.matches(0.18, 0.17, 0.16, 0.14)), [0, 1, 2])
+        self.assertEqual(self.retrieved(self.matches(0.18, 0.17, 0.16, 0.14), hybrid_alpha=1), [0, 1])
+
+
+class HybridRetrievalTest(unittest.TestCase):
+    """On a dotproduct index each chunk also holds sparse values, so figures and clauses match exactly."""
+
+    DOCUMENTS = [Document('A.pdf', 'Similar work: one completed work of value 2.5 crore in the last seven years.', 'nit'),
+                 Document('B.pdf', 'Similar work: one completed work of value 4 crore in the last seven years.', 'nit')]
+
+    def test_an_amount_written_another_way_finds_its_chunk(self):
+        client = FakePinecone()
+        index = service(client, chunk_size=400, score_floor=0, min_score=0)
+        built = index.rebuild_namespace('1', self.DOCUMENTS)
+
+        self.assertTrue(built['manifest']['hybrid'])
+        self.assertTrue(client.sparse('tcno-1', chunk_id('A.pdf', 0)))
+        retrieval = index.retrieve('1', {'x': ['similar completed work of value Rs 250 lakh']})
+        scores = {chunk['source_file']: chunk['score'] for chunk in retrieval.chunks}
+        self.assertGreater(scores['A.pdf'], scores['B.pdf'])
+        dense = service(client, chunk_size=400, score_floor=0, min_score=0, hybrid_alpha=1)
+        scores = {chunk['source_file']: chunk['score']
+                  for chunk in dense.retrieve('1', {'x': ['similar completed work of value Rs 250 lakh']}).chunks}
+        self.assertLessEqual(scores['A.pdf'], scores['B.pdf'])  # the dense fake cannot tell 2.5 crore from 4
+
+    def test_a_cosine_index_is_searched_dense_only(self):
+        client = FakePinecone()
+        index = service(client, metric='cosine')
+        with self.assertLogs('services.pinecone_service', 'WARNING') as logs:
+            built = index.rebuild_namespace('1', self.DOCUMENTS)
+        self.assertIn('retrieval is dense only', logs.output[0])
+        self.assertFalse(built['manifest']['hybrid'])
+        self.assertEqual(client.sparse('tcno-1', chunk_id('A.pdf', 0)), {})
+        # The fake refuses a sparse query on a cosine index, as Pinecone does
+        self.assertEqual(len(index.retrieve('1', {'x': ['similar work 2.5 crore']}).chunks), 2)
+
+
+class HierarchicalRetrievalTest(unittest.TestCase):
+    """The section the qualification searches point to is taken whole."""
+
+    def setUp(self):
+        self.client = FakePinecone(dimension=512)  # wide enough that the fake's hashed words rarely collide
+        self.index = service(self.client, dimension=512, chunk_size=300, chunk_overlap=40, top_k=4, max_chars=4000)
+        self.index.rebuild_namespace('1', [Document('NIT.pdf', SECTIONED_NIT, 'nit')])
+
+    def test_the_qualification_section_is_taken_whole_before_the_other_searches(self):
+        retrieval = self.index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION)
+
+        section = [chunk['chunk_index'] for chunk in self.client.chunks('tcno-1').values()
+                   if any(words in chunk['text'] for words in ('QUALIFICATION CRITERIA', '3.1 Financial',
+                                                               'Average annual turnover', 'Similar works'))]
+        self.assertEqual(retrieval.whole_sections, [{
+            'source_file': 'NIT.pdf', 'title': 'SECTION 3: QUALIFICATION CRITERIA',
+            'chunks': f'{min(section)}-{max(section)}', 'label': 'qualification section'}])
+        taken = {chunk['chunk_index'] for chunk in retrieval.chunks if 'qualification section' in chunk['queries']}
+        self.assertEqual(taken, set(range(min(section), max(section) + 1)))
+        self.assertIn('scope', {label for chunk in retrieval.chunks for label in chunk['queries']})
+
+    def test_a_match_votes_once_for_a_range_and_pinned_texts_do_not_vote(self):
+        def match(source, spans, score, document_type='nit'):
+            return {'source_file': source, 'sections': spans, 'section_titles': ['Title'] * len(spans),
+                    'score': score, 'document_type': document_type}
+
+        matches = [
+            # Section III: a minor heading over the same chunks as its major one lists the range twice
+            match('NIT.pdf', ['0-1', '0-1'], 0.50), match('NIT.pdf', ['0-1', '0-1'], 0.48),
+            match('NIT.pdf', ['3-5'], 0.60), match('NIT.pdf', ['3-5'], 0.59), match('NIT.pdf', ['3-5'], 0.58),
+            # TenderTiger's pre-qualification text: sent whole anyway, so it must not take a section's place
+            match('TenderTiger Pre-Qualification', ['0-2'], 0.90, 'prequalification'),
+            match('TenderTiger Pre-Qualification', ['0-2'], 0.89, 'prequalification'),
+        ]
+        picked = self.index._pick_sections([('qualification section', 'query')], [matches], room=10_000,
+                                           chunk_size=300)
+        self.assertEqual([(source, first, last) for _, source, first, last, *_ in picked], [('NIT.pdf', 3, 5)])
+
+    def test_a_section_larger_than_its_share_of_the_budget_is_not_taken(self):
+        index = service(self.client, dimension=512, chunk_size=300, chunk_overlap=40, top_k=4, max_chars=4000,
+                        section_share=0.1)  # 400 characters: no section of two chunks fits
+        retrieval = index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION)
+        self.assertEqual(retrieval.whole_sections, [])
+        self.assertTrue(retrieval.chunks)
+
+
+class SectionTest(unittest.TestCase):
+    def test_headings_leave_out_running_headers_page_markers_contents_and_sentences(self):
+        text = '\n'.join([
+            'LIFE INSURANCE CORPORATION OF INDIA', '1 Notice inviting tender 3', '2 Eligibility criteria 5',
+            'LIFE INSURANCE CORPORATION OF INDIA', '## Page 2', 'NOTICE INVITING TENDER', 'Sealed bids are invited.',
+            'LIFE INSURANCE CORPORATION OF INDIA', 'SECTION 3: QUALIFICATION CRITERIA', 'A. WORKS EXPERIENCE:',
+            'Three similar works.', '1. The bidder shall submit the documents listed below.', '### Turnover',
+            '**Net worth**', '| ITEM | VALUE |', '4.2 Bid Capacity Formula', 'Downloading ....... 24.06.2026'])
+        self.assertEqual([(tier, title) for _, tier, title, _ in headings(text)], [
+            (1, 'NOTICE INVITING TENDER'), (1, 'SECTION 3: QUALIFICATION CRITERIA'), (2, 'A. WORKS EXPERIENCE'),
+            (2, 'Turnover'), (2, 'Net worth'), (2, '4.2 Bid Capacity Formula')])
+
+    def test_each_chunk_lists_every_section_it_overlaps_smallest_first(self):
+        text = SECTIONED_NIT.strip()
+        pieces = _chunks(text, 300, 40)
+        places = chunk_sections(text, [span for _, _, span in pieces])
+
+        financial = next(number for number, (chunk, _, _) in enumerate(pieces) if 'Average annual turnover' in chunk)
+        place = places[financial]
+        self.assertEqual(place['section'], '3.1 Financial Criteria')
+        self.assertIn('SECTION 3: QUALIFICATION CRITERIA', place['section_titles'])
+        self.assertEqual(len(place['sections']), len(place['section_titles']))
+        sizes = [int(last) - int(first) for first, last in (span.split('-') for span in place['sections'])]
+        self.assertEqual(sizes, sorted(sizes))
+
+    def test_a_document_without_headings_is_one_section(self):
+        text = paragraphs('General', 6)
+        pieces = _chunks(text, 300, 40)
+        places = chunk_sections(text, [span for _, _, span in pieces])
+        self.assertEqual({tuple(place['sections']) for place in places}, {(f'0-{len(pieces) - 1}',)})
+        self.assertNotIn('section', places[0])
+
+
+class SparseEncoderTest(unittest.TestCase):
+    def test_an_amount_is_one_term_however_it_is_written(self):
+        for text in ('Rs. 25 lakh', '₹ 25,00,000/-', 'INR 2500000', '25 Lakhs', 'Rs.0.25 crore', '2,500,000 rupees'):
+            self.assertIn('amt:2500000', sparse_encoder.terms(text), text)
+        for text in ('2.5 crore', 'Rs 250 lakh', '₹2.5 Cr.'):
+            self.assertIn('amt:25000000', sparse_encoder.terms(text), text)
+        # A year or a count is not an amount
+        self.assertFalse([term for term in sparse_encoder.terms('in the last 3 years since 2019') if ':' in term])
+
+    def test_clauses_percentages_and_financial_years_are_terms(self):
+        terms = sparse_encoder.terms('As per clause 4.2.1 and Annexure-III, the lead member holds 51 % in FY 2023-2024')
+        self.assertLessEqual({'ref:clause:4.2.1', 'ref:4.2.1', 'ref:annexure:3', 'pct:51', 'fy:2023-24'}, set(terms))
+        self.assertIn('ref:4.2.1', sparse_encoder.terms('4.2.1 Bid capacity'))
+        self.assertIn('ref:form:a', sparse_encoder.terms('Form-A'))
+
+    def test_common_words_are_left_out_and_a_vector_has_unit_length(self):
+        self.assertEqual(set(sparse_encoder.terms('The bidder shall submit the tender documents')), {'submit'})
+        self.assertIsNone(sparse_encoder.sparse_vector('the shall'))
+        vector = sparse_encoder.sparse_vector('Turnover turnover, net worth of Rs 5 crore as per clause 3.1')
+        self.assertEqual(len(vector['indices']), len(set(vector['indices'])))
+        self.assertAlmostEqual(sum(value * value for value in vector['values']), 1.0)
+        self.assertTrue(all(0 <= index < 2 ** 32 for index in vector['indices']))
+
+
 class FailureTest(unittest.TestCase):
     def setUp(self):
         self.client = FakePinecone(max_namespaces=1)
@@ -319,6 +601,18 @@ class FailureTest(unittest.TestCase):
         with self.assertRaises(VectorStoreNotConfigured):
             index.rebuild_namespace('1', [])
 
+    def test_an_old_namespace_list_is_given_at_once_while_a_fresh_one_is_listed(self):
+        self.index.reset_namespace('1')
+        self.assertEqual(self.index.namespaces(), {'tcno-1'})
+        self.client.namespaces()['tcno-2'] = {}  # made by another process, so not known here yet
+        self.index._names_at -= self.index.cache_seconds  # the list is old
+
+        self.assertEqual(self.index.namespaces(), {'tcno-1'})  # at once, the old list
+        deadline = time.monotonic() + 5
+        while self.index._names_refreshing and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.index.namespaces(), {'tcno-1', 'tcno-2'})  # listed in the background meanwhile
+
     def test_an_unreachable_pinecone_lists_no_namespace_without_failing_the_list(self):
         self.index.reset_namespace('1')
         self.index._names = None
@@ -337,3 +631,38 @@ class FailureTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class MigrateScriptTest(unittest.TestCase):
+    """scripts/migrate_to_pinecone.py never rebuilds a namespace holding the TenderTiger texts only the app has."""
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from scripts.migrate_to_pinecone import migrate
+        self.migrate = migrate
+        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name) / '1'
+        self.folder.mkdir()
+        (self.folder / 'NIT.txt').write_text(NIT, encoding='utf-8')
+        self.client = FakePinecone()
+        self.index = service(self.client)
+        self.index.rebuild_namespace('1', [Document('TenderTiger Tender Data', 'Value: Rs 98 crore', 'tender_data'),
+                                           Document('NIT.txt', NIT, 'nit')])
+
+    def sources(self):
+        return {meta['source_file'] for meta in self.client.chunks('tcno-1').values()}
+
+    def test_a_complete_namespace_of_an_older_version_is_left_as_it_is(self):
+        self.client.namespaces()['tcno-1'][MANIFEST_ID]['metadata']['schema_version'] = 2  # before sections, sparse
+        self.assertEqual(self.migrate(self.folder, self.index), 'up to date')
+        self.assertEqual(self.sources(), {'TenderTiger Tender Data', 'NIT.txt'})
+
+    def test_a_namespace_a_regenerate_left_unfinished_is_given_back(self):
+        self.index.reset_namespace('1', keep=True)  # a regenerate that stopped before reading anything
+        self.assertIsNone(self.index.manifest('1'))
+        self.assertEqual(self.migrate(self.folder, self.index), 'up to date')
+        self.assertIsNotNone(self.index.manifest('1'))
+        self.assertEqual(self.sources(), {'TenderTiger Tender Data', 'NIT.txt'})

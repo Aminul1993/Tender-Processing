@@ -9,7 +9,7 @@
 {% block appbar_actions %}
 <div class="appbar-actions">
   <button type="button" class="appbar-button appbar-button-collapsible" id="closed-open"
-          title="Tenders that have closed but whose documents are still in the download folder">
+          title="Checked tenders that have closed: delete what is kept for them">
     <i class="bi bi-folder-x" aria-hidden="true"></i> <span class="appbar-button-text">Closed tenders</span>
   </button>
   <button type="button" class="appbar-button appbar-help" data-bs-toggle="modal" data-bs-target="#help-modal"
@@ -90,9 +90,9 @@
     </select>
     <select class="select" id="filter-decision" aria-label="Filter by decision">
       <option value="">All decisions</option>
-      <option value="not_dropped">Not dropped</option>
+      <option value="none">Pending</option>
+      <option value="reviewed">Reviewed</option>
       <option value="shortlisted">Shortlisted</option>
-      <option value="none">No decision</option>
       <option value="dropped">Dropped</option>
     </select>
     <select class="select" id="filter-closing" aria-label="Filter by closing date">
@@ -101,6 +101,11 @@
       <option value="soon">Closes in 7 days</option>
       <option value="closed">Closed</option>
     </select>
+    <!-- Pressed, the list is the watchlist's: its departments' live tenders, searched in the background -->
+    <button type="button" class="button button-secondary" id="watchlist-btn" aria-pressed="false"
+            title="Show the live tenders of the departments the team tracks">
+      <i class="bi bi-bookmark-star" aria-hidden="true"></i> Watchlist
+    </button>
     <button type="button" class="button button-secondary" id="filters-btn" aria-expanded="false"
             aria-controls="search-filters">
       <i class="bi bi-funnel" aria-hidden="true"></i> Filters
@@ -114,6 +119,21 @@
       <span id="process-label">Check eligibility</span>
       <span class="button-count" id="selected-count">0</span>
     </button>
+  </div>
+
+  <!-- Shown with the watchlist: how many tenders it holds, when it was searched, and the search in progress -->
+  <div class="watchlist-bar" id="watchlist-bar" hidden>
+    <p class="watchlist-status" id="watchlist-status" aria-live="polite"></p>
+    <div class="footer-group">
+      <button type="button" class="button button-secondary button-sm" id="watchlist-edit"
+              title="Edit the departments the team tracks">
+        <i class="bi bi-pencil-square" aria-hidden="true"></i> Edit watchlist
+      </button>
+      <button type="button" class="button button-secondary button-sm" id="watchlist-refresh"
+              title="Search TenderTiger again for every organisation of the watchlist">
+        <i class="bi bi-arrow-repeat" aria-hidden="true"></i> Search again
+      </button>
+    </div>
   </div>
 
   <!-- The filters of TenderTiger's search page: applying them loads the tenders TenderTiger finds with them -->
@@ -210,9 +230,6 @@
     <div class="filters-foot">
       <button type="button" class="link-button" id="filters-clear">Clear filters</button>
       <div class="footer-group">
-        <!-- Applies the filters kept in default_filters.json -->
-        <button type="button" class="button button-secondary button-sm" id="filters-default"
-                title="Search with the team's default filters, kept in default_filters.json">Default filters</button>
         <button type="submit" class="button button-primary button-sm" id="filters-apply">Apply filters</button>
       </div>
     </div>
@@ -299,8 +316,8 @@
         <div class="help-item">
           <h3>02 · Runs in background</h3>
           <p>You can close this page while checks run on the server. <strong>Notify me when done</strong> sends a
-            browser notification (localhost and https only). Verdicts and shortlist and drop decisions are kept when
-            the server restarts.</p>
+            browser notification (localhost and https only). Verdicts and the team's decisions (reviewed, shortlisted,
+            dropped) are kept when the server restarts.</p>
         </div>
         <div class="help-item">
           <h3>03 · Verdicts</h3>
@@ -335,13 +352,13 @@
   </div>
 </div>
 
-<!-- Closed tenders whose documents are still downloaded; opened by Closed tenders in the app bar -->
+<!-- Checked tenders that have closed, from the database; opened by Closed tenders in the app bar -->
 <div class="modal fade" id="closed-modal" tabindex="-1" aria-labelledby="closed-title" aria-hidden="true">
   <div class="modal-dialog modal-lg modal-dialog-scrollable modal-fullscreen-sm-down">
     <div class="modal-content">
       <div class="modal-header align-items-start">
         <div class="details-heading">
-          <h2 class="details-title" id="closed-title">Closed tenders with downloaded files</h2>
+          <h2 class="details-title" id="closed-title">Closed tenders</h2>
           <p class="details-facts" id="closed-facts"></p>
         </div>
         <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
@@ -419,14 +436,17 @@
         <p class="details-run" id="details-run"></p>
       </div>
       <div class="modal-footer">
+        <!-- The tender's decision, then only what it can be marked next: decisions move forward, dropped is final -->
         <div class="footer-group" role="group" aria-label="Decision">
-          <button type="button" class="button button-secondary decision-button decision-shortlist" id="shortlist-btn"
-                  aria-pressed="false">
-            <i class="bi bi-bookmark-check" aria-hidden="true"></i> <span>Shortlist</span>
+          <span class="decision-line decision-now" id="decision-now" aria-live="polite"></span>
+          <button type="button" class="button button-secondary" id="reviewed-btn">
+            <i class="bi bi-check2-circle" aria-hidden="true"></i> Mark reviewed
           </button>
-          <button type="button" class="button button-secondary decision-button decision-drop" id="drop-btn"
-                  aria-pressed="false">
-            <i class="bi bi-x-circle" aria-hidden="true"></i> <span>Drop</span>
+          <button type="button" class="button button-secondary" id="shortlist-btn">
+            <i class="bi bi-bookmark-check" aria-hidden="true"></i> Shortlist
+          </button>
+          <button type="button" class="button button-secondary" id="drop-btn">
+            <i class="bi bi-x-circle" aria-hidden="true"></i> Drop
           </button>
         </div>
         <div class="footer-group">
@@ -467,12 +487,49 @@
         <div class="profile-form" id="company-form"></div>
       </div>
       <div class="modal-footer">
-        <p class="company-note">Tenders checked from now on use the saved details. To update a verdict already
+        <p class="company-note" id="company-note">Tenders checked from now on use the saved details. To update a verdict already
           given, check that tender again.</p>
+        <!-- Why the last save was refused: here, not in a toast, which would cover Save -->
+        <p class="company-note editor-error" id="company-error" role="alert" hidden></p>
         <div class="footer-group">
           <button type="button" class="button button-secondary" data-bs-dismiss="modal">Cancel</button>
           <button type="button" class="button button-primary" id="company-save" aria-keyshortcuts="Control+S">
             Save profile
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Watchlist editor. A click outside does not close it, so edits are not lost by accident. -->
+<div class="modal fade" id="watchlist-modal" tabindex="-1" aria-labelledby="watchlist-title" aria-hidden="true"
+     data-bs-backdrop="static">
+  <div class="modal-dialog modal-xl modal-dialog-scrollable modal-fullscreen-lg-down">
+    <div class="modal-content">
+      <div class="modal-header align-items-start">
+        <div class="details-heading">
+          <h2 class="details-title" id="watchlist-title">Watchlist</h2>
+          <p class="details-facts">The departments the team tracks. A tender belongs to the first department, from the
+            top, whose organisation patterns, states and description it matches and whose least value it reaches.</p>
+        </div>
+        <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">
+          <i class="bi bi-x-lg" aria-hidden="true"></i>
+        </button>
+      </div>
+      <div class="modal-body">
+        <!-- Filled by app.js from /api/watchlist/rules: the settings, the state groups, then the departments -->
+        <div class="profile-form" id="watchlist-form"></div>
+      </div>
+      <div class="modal-footer">
+        <p class="company-note" id="watchlist-note">The rules apply when TenderTiger is searched: the list changes at
+          the next Search again.</p>
+        <!-- Why the last save was refused: here, not in a toast, which would cover Save -->
+        <p class="company-note editor-error" id="watchlist-error" role="alert" hidden></p>
+        <div class="footer-group">
+          <button type="button" class="button button-secondary" data-bs-dismiss="modal">Cancel</button>
+          <button type="button" class="button button-primary" id="watchlist-save" aria-keyshortcuts="Control+S">
+            Save watchlist
           </button>
         </div>
       </div>

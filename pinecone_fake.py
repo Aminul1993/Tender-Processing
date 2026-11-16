@@ -2,7 +2,8 @@
 An in-memory stand-in for pinecone.Pinecone, for the tests: just the calls services/pinecone_service.py makes, with
 Pinecone's errors (404 for a missing index or namespace, 409 for an index that exists, 403 QUOTA_EXCEEDED past
 max_indexes indexes or max_namespaces namespaces in an index). Embeddings are bags of words hashed into dimension
-buckets, so texts sharing words are near each other.
+buckets, so texts sharing words are near each other. Sparse values are taken by a dotproduct index only, as Pinecone
+does, and a query with a sparse vector adds its sparse dot product to the dense one.
 """
 import hashlib
 import math
@@ -75,7 +76,14 @@ class FakeIndex:
         self._client.calls.append(('upsert', namespace, len(vectors)))
         self._client.fail('upsert')
         dimension = self._index()['dimension']
+        metric = self._index()['metric']
         for vector in vectors:
+            if vector.get('sparse_values') and metric != 'dotproduct':
+                raise ApiError('Sparse vectors are only supported for indexes with the dotproduct metric, '
+                               f'not {metric}', 400)
+            sparse = vector.get('sparse_values') or {}
+            if len(sparse.get('indices') or []) != len(set(sparse.get('indices') or []))                     or len(sparse.get('indices') or []) != len(sparse.get('values') or [])                     or len(sparse.get('indices') or []) > 1000:
+                raise ApiError('Invalid sparse vector', 400)
             if len(vector['values']) != dimension:
                 raise ApiError(f'Vector dimension {len(vector["values"])} does not match {dimension}', 400)
             if not any(vector['values']):
@@ -85,18 +93,24 @@ class FakeIndex:
         store = self._namespace(namespace, create=True)
         with self._client.lock:
             for vector in vectors:
-                store[vector['id']] = {'values': list(vector['values']), 'metadata': dict(vector.get('metadata') or {})}
+                store[vector['id']] = {'values': list(vector['values']), 'metadata': dict(vector.get('metadata') or {}),
+                                       'sparse': dict(zip((vector.get('sparse_values') or {}).get('indices') or [],
+                                                          (vector.get('sparse_values') or {}).get('values') or []))}
             position = self._client.log_positions[(self.name, namespace)] =                 self._client.log_positions.get((self.name, namespace), 0) + 1
         return SimpleNamespace(upserted_count=len(vectors), response_info=FakeInfo(committed=position))
 
-    def query(self, vector, top_k, namespace='', filter=None, include_metadata=False, **options):
+    def query(self, vector, top_k, namespace='', filter=None, include_metadata=False, sparse_vector=None, **options):
         self._client.calls.append(('query', namespace, top_k))
         self._client.fail('query')
+        if sparse_vector and self._index()['metric'] != 'dotproduct':
+            raise ApiError('Sparse queries need an index with the dotproduct metric', 400)
+        query_sparse = dict(zip((sparse_vector or {}).get('indices') or [], (sparse_vector or {}).get('values') or []))
         scored = []
         for identifier, record in (self._namespace(namespace) or {}).items():
             if not _matches(record['metadata'], filter):
                 continue
             score = sum(a * b for a, b in zip(vector, record['values']))
+            score += sum(value * record.get('sparse', {}).get(index, 0.0) for index, value in query_sparse.items())
             scored.append(SimpleNamespace(id=identifier, score=score,
                                           metadata=dict(record['metadata']) if include_metadata else None))
         scored.sort(key=lambda match: (-match.score, match.id))
@@ -212,13 +226,14 @@ class FakePinecone:
                 raise ForbiddenError('Request failed: QUOTA_EXCEEDED: max serverless indexes reached', 403)
             self.indexes[name] = {'dimension': dimension, 'namespaces': {}, 'tags': dict(tags or {}),
                                   'metric': metric, 'spec': spec}
-        return SimpleNamespace(name=name, dimension=dimension, status={'ready': True})
+        return SimpleNamespace(name=name, dimension=dimension, metric=metric, status={'ready': True})
 
     def describe_index(self, name):
         with self.lock:
             if name not in self.indexes:
                 raise NotFoundError(f'Index {name} not found', 404)
-            return SimpleNamespace(name=name, dimension=self.indexes[name]['dimension'], status={'ready': True})
+            return SimpleNamespace(name=name, dimension=self.indexes[name]['dimension'],
+                                   metric=self.indexes[name]['metric'], status={'ready': True})
 
     def delete_index(self, name, timeout=None):
         self.calls.append(('delete_index', name))
@@ -238,6 +253,10 @@ class FakePinecone:
     def namespaces(self, index='tender-processing'):
         """The namespaces of the index, as {name: {id: record}}."""
         return self.indexes[index]['namespaces'] if index in self.indexes else {}
+
+    def sparse(self, namespace, identifier, index='tender-processing'):
+        """The sparse values of a record, {index: value} ({} for none)."""
+        return self.namespaces(index)[namespace][identifier].get('sparse', {})
 
     def chunks(self, namespace, index='tender-processing'):
         """The chunk records of a namespace, as {id: metadata}."""

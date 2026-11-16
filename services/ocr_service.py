@@ -3,8 +3,11 @@ OCR of what a PDF's text layer leaves out: every page of a scan, a page with no 
 (scanned, or drawn as vector graphics), and large images on the other pages (a scanned form pasted into an RFP).
 Each is rendered and read locally with PaddleOCR first; only one PaddleOCR is unsure of, or that holds a table, is
 sent to the vision model OCR_MODEL, which can also lay a table out as markdown. Clean prose costs no LLM tokens.
+With a cache (cache_service.Cache), each page or image read is kept by the SHA-256 of its image, so it is never read
+twice: not when another of its file's pages could not be read, nor when it turns up again in a changed file.
 """
 import base64
+import hashlib
 import logging
 import os
 import statistics
@@ -66,13 +69,15 @@ class _ScanUnread(Exception):
     """A page of a scan could not be read, so none of it is."""
 
 
-def add_ocr(path, text, llm, max_chars=None):
+def add_ocr(path, text, llm, max_chars=None, cache=None):
     """
     text, the text layer of the PDF at path (as MarkItDown read it), with what OCR reads of the rest after it: every
     page when text is empty, otherwise each page with no text layer and each large image on the other pages (see
     _parts_to_ocr()). Each is a '## Page <n>' or '## Page <n>, image <k>' section: PaddleOCR's reading, or llm's (an
     OCR_MODEL chat model) for one PaddleOCR is unsure of or that holds a table. Blank ones are left out. PaddleOCR
-    reads one page at a time while llm reads those sent to it, OCR_CONCURRENCY at a time.
+    reads one page at a time while llm reads those sent to it, OCR_CONCURRENCY at a time. With cache (a
+    cache_service.Cache), a page or image read before (the same image, under OCR_SETTINGS) is taken from it, and each
+    one read now is added to it.
     Returns (text, unread): the text with what OCR read, and the parts that could not be read ('page 16',
     'page 132, image 1'), which a PDF with a text layer is checked without. A scan (text empty) with a page that
     could not be read gives ('', []) instead, as does one with no text at all, so the file is listed as not checked
@@ -97,22 +102,25 @@ def add_ocr(path, text, llm, max_chars=None):
         sections = [text] if text else []
         characters = len(text)  # of the text so far, as returned
         sent = Counter()  # why parts went to OCR_MODEL
+        cached = 0  # parts taken from the cache
         unread = []
         # The parts read so far and not yet added, in order: (page number, heading, its text, the Future of llm's
-        # reading, or the error that stopped it)
+        # reading, or the error that stopped it; the SHA-256 of its image, to cache llm's reading under)
         pending = []
 
         def settle(wait):
             """Adds the parts at the head of pending that are read (every one, when wait) to sections, in order."""
             nonlocal characters
             while pending and (wait or not isinstance(pending[0][2], Future) or pending[0][2].done()):
-                number, heading, read = pending.pop(0)
+                number, heading, read, digest = pending.pop(0)
                 part = heading[0].lower() + heading[1:]
                 try:
                     if isinstance(read, Exception):
                         raise read
                     if isinstance(read, Future):
                         read = read.result()
+                        if cache:
+                            cache.save_page_text(digest, OCR_SETTINGS, read)
                 except Exception as error:
                     log.warning('Could not OCR %s of %s: %s', part, path.name, error,
                                 exc_info=(type(error), error, error.__traceback__))
@@ -129,17 +137,25 @@ def add_ocr(path, text, llm, max_chars=None):
 
         try:
             for number, clip, heading in parts:
+                digest = None
                 try:
                     pixmap = document[number - 1].get_pixmap(dpi=_DPI, clip=clip, colorspace=pymupdf.csRGB,
                                                              alpha=False)
-                    with _ENGINE:
-                        read, reason = _read_locally(pixmap)
-                    if reason:
-                        sent[reason] += 1
-                        read = _VISION.submit(_read_with_vision, llm, pixmap.tobytes('png'))
+                    digest = image_digest(pixmap) if cache else None
+                    read = cache.page_text(digest, OCR_SETTINGS) if cache else None
+                    if read is not None:
+                        cached += 1
+                    else:
+                        with _ENGINE:
+                            read, reason = _read_locally(pixmap)
+                        if reason:
+                            sent[reason] += 1
+                            read = _VISION.submit(_read_with_vision, llm, pixmap.tobytes('png'))
+                        elif cache:
+                            cache.save_page_text(digest, OCR_SETTINGS, read)
                 except Exception as error:
                     read = error
-                pending.append((number, heading, read))
+                pending.append((number, heading, read, digest))
                 settle(wait=False)
                 # No further ahead of the parts added than OCR_CONCURRENCY: past max_chars, at most that many are
                 # read for nothing
@@ -151,31 +167,44 @@ def add_ocr(path, text, llm, max_chars=None):
         except _ScanUnread:
             return '', []
         finally:
-            for _, _, read in pending:  # left over by an error or ScanTooLong: those not started yet never are
+            for _, _, read, _ in pending:  # left over by an error or ScanTooLong: those not started yet never are
                 if isinstance(read, Future):
                     read.cancel()
-    log.info('OCR of %s: %d page(s) and %d image(s), %d read by PaddleOCR (%s), %d by %s %s, %d not read', path.name,
-             pages, len(parts) - pages, len(parts) - sum(sent.values()) - len(unread), PADDLEOCR_MODEL,
-             sum(sent.values()), OCR_MODEL, dict(sent), len(unread))
+    log.info('OCR of %s: %d page(s) and %d image(s), %d from the cache, %d read by PaddleOCR (%s), %d by %s %s, '
+             '%d not read', path.name, pages, len(parts) - pages, cached,
+             len(parts) - cached - sum(sent.values()) - len(unread), PADDLEOCR_MODEL, sum(sent.values()), OCR_MODEL,
+             dict(sent), len(unread))
     return '\n\n'.join(sections), unread
 
 
-def ocr_parts(path, max_chars=None):
+def ocr_parts(path, max_chars=None, cache=None):
     """
     How many pages and images add_ocr() would OCR in the PDF at path, told without any OCR (the text layer as
     PyMuPDF reads it stands in for MarkItDown's): 0 when there are none, when the PDF cannot be opened, or when its
-    page count says it is too long to OCR under max_chars.
+    page count says it is too long to OCR under max_chars. With cache, those in it are not counted (each is rendered
+    to tell, which takes a fraction of a second, against seconds to read one).
     """
     try:
         with pymupdf.open(path) as document:
             text = sum(len(page.get_text().strip()) for page in document)
             parts = _parts_to_ocr(document, every_page=not text)
+            pages = sum(1 for _, clip, _ in parts if clip is None)
+            if max_chars is not None and text + pages * CHARS_PER_PAGE > max_chars:
+                return 0
+            if cache:
+                parts = [(number, clip) for number, clip, _ in parts if cache.page_text(image_digest(
+                    document[number - 1].get_pixmap(dpi=_DPI, clip=clip, colorspace=pymupdf.csRGB, alpha=False)),
+                    OCR_SETTINGS) is None]
     except Exception:
         return 0
-    pages = sum(1 for _, clip, _ in parts if clip is None)
-    if max_chars is not None and text + pages * CHARS_PER_PAGE > max_chars:
-        return 0
     return len(parts)
+
+
+def image_digest(pixmap):
+    """The SHA-256 of a rendered page or image, its size and pixels: what its OCR is cached under."""
+    digest = hashlib.sha256(f'{pixmap.width}x{pixmap.height}x{pixmap.n}:'.encode('ascii'))
+    digest.update(pixmap.samples_mv)
+    return digest.hexdigest()
 
 
 def _parts_to_ocr(document, every_page):

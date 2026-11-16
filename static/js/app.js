@@ -15,7 +15,11 @@
   const NOTIFY_KEY = 'tender-processing.notify';
   const FILTERS_KEY = 'tender-processing.search-filters';
   const PAGE_SIZE_KEY = 'tender-processing.page-size';
+  const SOURCE_KEY = 'tender-processing.list-source';
   const PAGE_SIZES = [20, 50, 100, 500];  // tenders a page may hold, as /api/tenders takes them
+  const WATCHLIST_POLL_MS = 5000;   // how often a watchlist search in progress is asked about
+  const WATCHLIST_ONLY = '__watchlist__';  // the organisation filter's "Watchlist departments" option
+  const DEPARTMENT = 'department:';  // the organisation filter's value for one department, in the watchlist
   // How the quantity, value and EMD filters compare, by the names the API takes
   const COMPARISONS = [['gt', '>'], ['gte', '≥'], ['lt', '<'], ['lte', '≤'], ['eq', '='], ['between', 'Between']];
   const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
@@ -36,7 +40,16 @@
     [/\bcannot\s+determine\b/, 'status-unknown', 1],
     [/\bmet\b/, 'status-met', 2],
   ];
+  // The team's decisions on a tender; one without any is pending. NEXT_DECISIONS: what each can be marked next, as
+  // services/decision_service.NEXT has it (the server refuses any other)
+  const NEXT_DECISIONS = {
+    pending: ['reviewed', 'shortlisted', 'dropped'],
+    reviewed: ['shortlisted', 'dropped'],
+    shortlisted: ['dropped'],
+    dropped: [],
+  };
   const DECISIONS = {
+    reviewed: {label: 'Reviewed', icon: 'bi-check2-circle', cls: 'decision-reviewed'},
     shortlisted: {label: 'Shortlisted', icon: 'bi-bookmark-check-fill', cls: 'decision-shortlisted'},
     dropped: {label: 'Dropped', icon: 'bi-x-circle', cls: 'decision-dropped'},
   };
@@ -62,11 +75,20 @@
     search: $('search'),
     orgFilter: $('filter-organisation'),
     refreshBtn: $('refresh-btn'),
+    watchlistBtn: $('watchlist-btn'),
+    watchlistBar: $('watchlist-bar'),
+    watchlistStatus: $('watchlist-status'),
+    watchlistRefresh: $('watchlist-refresh'),
+    watchlistEdit: $('watchlist-edit'),
+    watchlistModal: $('watchlist-modal'),
+    watchlistForm: $('watchlist-form'),
+    watchlistSave: $('watchlist-save'),
+    watchlistNote: $('watchlist-note'),
+    watchlistError: $('watchlist-error'),
     filtersBtn: $('filters-btn'),
     filtersCount: $('filters-count'),
     filtersForm: $('search-filters'),
     filtersClear: $('filters-clear'),
-    filtersDefault: $('filters-default'),
     filtersApply: $('filters-apply'),
     decisionFilter: $('filter-decision'),
     closingFilter: $('filter-closing'),
@@ -101,6 +123,8 @@
     modalFiles: $('details-files'),
     modalCriteria: $('details-criteria'),
     modalRun: $('details-run'),
+    decisionNow: $('decision-now'),
+    reviewedBtn: $('reviewed-btn'),
     shortlistBtn: $('shortlist-btn'),
     dropBtn: $('drop-btn'),
     copyBtn: $('copy-details'),
@@ -112,6 +136,8 @@
     companyModal: $('company-modal'),
     companyForm: $('company-form'),
     companySave: $('company-save'),
+    companyNote: $('company-note'),
+    companyError: $('company-error'),
     closedOpen: $('closed-open'),
     closedModal: $('closed-modal'),
     closedFacts: $('closed-facts'),
@@ -124,6 +150,7 @@
   };
   const detailsModal = new bootstrap.Modal(els.modal);
   const companyModal = new bootstrap.Modal(els.companyModal);
+  const watchlistModal = new bootstrap.Modal(els.watchlistModal);
   const closedModal = new bootstrap.Modal(els.closedModal);
   const estimateModal = new bootstrap.Modal(els.estimateModal);
   // The organisation filter with a search box in its list, like select2. Tom Select keeps the <select>'s value
@@ -161,7 +188,12 @@
     decisions: new Map(),     // tcno -> {decision, decided_at}
     verdictFilter: '',        // the selected tab: a verdict, 'awaiting_approval', 'failed', 'pending', or '' for all
     searchFilters: {},        // the TenderTiger filters the list was loaded with, as /api/tenders query parameters
-    sort: {key: 'closing', order: 'asc'},  // how TenderTiger sorts the list: closing soonest first
+    source: 'tendertiger',    // the list shown: 'tendertiger' (its search, with searchFilters) or 'watchlist'
+    loadedSource: null,       // the source the rows shown came from
+    total: null,              // how many tenders the watchlist holds in all; TenderTiger gives no total
+    watchlist: null,          // the watchlist's last status, from /api/watchlist/status
+    watchlistTimer: null,     // polls a watchlist search in progress
+    sort: {key: 'closing', order: 'asc'},  // how the list is sorted: closing soonest first
     job: null,                // last /api/progress response, null while no job has run
     averageSeconds: null,     // average time per tender whose documents were read, for estimates
     averageRecheckSeconds: null,  // average time per tender re-checked against its Pinecone namespace
@@ -177,7 +209,8 @@
     deep: {tcno: null, timer: null, status: null},  // the open tender's deep analysis, polled while it runs
     // The profile editor: the blocks being edited, and the saved blocks as JSON to spot unsaved edits
     company: {blocks: [], saved: '[]'},
-    companyError: null,       // the editor's last save problem, closed again on the next save
+    // The watchlist editor: its fields (see rulesForm()), and the saved fields as JSON to spot unsaved edits
+    rules: {form: null, saved: ''},
     closed: null,             // the Closed tenders popup: {directory, closed, unknown} from /api/closed-downloads
     estimate: null,           // the OCR estimate before a bulk regenerate: {tcnos, data from /api/ocr-estimate}
   };
@@ -337,10 +370,6 @@
 
   const isClosed = (tender) => Boolean(tender) && numberOr(tender.days_left, 0) < 0;
   const isRunning = () => Boolean(state.job && state.job.status === 'running');
-  const isDropped = (tcno) => {
-    const decision = state.decisions.get(tcno);
-    return Boolean(decision && decision.decision === 'dropped');
-  };
   const verdictOf = (key) => VERDICTS[key] || {label: key || 'Unknown', tone: 'none'};
 
   /** 'closed', 'soon' (closing within URGENT_DAYS, today included) or 'open' (later, or no closing date given). */
@@ -352,9 +381,9 @@
 
   // The options of the decision and closing filters: whether a tender's decision / closing status falls under each
   const DECISION_FILTERS = {
-    not_dropped: (decision) => decision !== 'dropped',
     shortlisted: (decision) => decision === 'shortlisted',
-    none: (decision) => !decision,
+    none: (decision) => !decision,  // pending
+    reviewed: (decision) => decision === 'reviewed',
     dropped: (decision) => decision === 'dropped',
   };
   const CLOSING_FILTERS = {
@@ -416,26 +445,33 @@
   /* ---------- tender table ---------- */
 
   /**
-   * Loads a page of size tenders that TenderTiger finds with filters, in the order TenderTiger sorts them by (by
-   * default the filters, page, size and order the list has); true when it worked.
+   * Loads a page of size tenders, in that order (by default the filters, page, size and order the list has): those
+   * TenderTiger finds with filters, sorted by TenderTiger, or with the Watchlist pressed the watchlist's, sorted by
+   * the server. True when it worked.
    */
   async function loadTenders({quiet = false, filters = state.searchFilters, page = state.page, sort = state.sort,
     size = state.pageSize} = {}) {
     els.refreshBtn.disabled = true;
+    const source = state.source;
+    const watchlist = source === 'watchlist';
     try {
       const query = new URLSearchParams({
-        ...filters, sort: sort.key, order: sort.order, page_size: size, ...(page > 1 ? {page} : {}),
+        ...(watchlist ? {} : filters), sort: sort.key, order: sort.order, page_size: size, ...(page > 1 ? {page} : {}),
       });
-      const data = await api(`/api/tenders?${query}`);
+      const data = await api(`${watchlist ? '/api/watchlist' : '/api/tenders'}?${query}`);
+      if (source !== state.source) return false;  // switched to the other list while this one loaded
       // TenderTiger tells the end of the list only by an empty page: stay on the page shown
       if (page > 1 && !data.tenders.length) {
         state.hasMore = false;
         renderPager();
-        toast(`TenderTiger has no tenders on page ${page}, so page ${page - 1} is the last.`, 'success');
+        toast(`${watchlist ? 'The watchlist' : 'TenderTiger'} has no tenders on page ${page}, so page ${page - 1} is the last.`, 'success');
         return false;
       }
-      const sameSearch = JSON.stringify(filters) === JSON.stringify(state.searchFilters);
-      setSearchFilters(filters);
+      const sameSearch = source === state.loadedSource && JSON.stringify(filters) === JSON.stringify(state.searchFilters);
+      state.loadedSource = source;
+      if (!watchlist) setSearchFilters(filters);
+      state.total = watchlist ? data.total : null;
+      if (watchlist) setWatchlistStatus(data.watchlist);
       state.tenders = data.tenders;
       state.page = data.page;
       state.hasMore = data.has_more;
@@ -463,23 +499,32 @@
       renderTable();
       return true;
     } catch (error) {
+      if (source !== state.source) return false;
       // The server's message already says what failed; a network error does not
-      const reason = /tender list/i.test(error.message) ? error.message : `Could not load the tender list: ${error.message}`;
+      const reason = watchlist ? `Could not load the watchlist: ${error.message}`
+        : /tender list/i.test(error.message) ? error.message : `Could not load the tender list: ${error.message}`;
       if (quiet) {
         toast(reason);
         return false;
       }
       const retry = el('button', {cls: 'button button-secondary button-sm', text: 'Try again', attrs: {type: 'button'}});
       retry.addEventListener('click', () => loadTenders());
+      const back = el('button', {cls: 'link-button ms-2', text: "Show TenderTiger's list", attrs: {type: 'button'}});
+      back.addEventListener('click', () => setSource('tendertiger'));
       els.body.replaceChildren(el('tr', {cls: 'message-row', attrs: {role: 'row'}}, [
         el('td', {attrs: {colspan: '7', role: 'cell'}}, [
           el('div', {cls: 'message-error', text: reason}),
-          el('div', {cls: 'message-hint', text: 'Check the internet connection and the TenderTiger subscription, then try again.'}),
+          el('div', {cls: 'message-hint', text: watchlist
+            ? 'The watchlist is read from the database: check it is running, then try again.'
+            : 'Check the internet connection and the TenderTiger subscription, then try again.'}),
+          watchlist ? editWatchlistButton() : null,
           retry,
+          watchlist ? back : null,
           // Filters remembered from an earlier visit may be the problem
-          filterCount(filters) ? clearFiltersButton(' ms-2') : null,
+          !watchlist && filterCount(filters) ? clearFiltersButton(' ms-2') : null,
         ]),
       ]));
+      state.total = null;
       state.tenders = [];
       state.rows.clear();
       state.emptyRow = null;
@@ -492,19 +537,39 @@
     }
   }
 
+  /**
+   * The organisation filter's options: the organisations of the page shown, after "Watchlist departments" when some
+   * are on the watchlist; in the watchlist, its departments instead.
+   */
   function fillOrganisationFilter() {
     const current = els.orgFilter.value;
-    // By the name the table shows, so one organisation sent in two cases is listed once
-    const organisations = [...new Set(state.tenders.map((t) => titleCase(t.organisation)).filter(Boolean))]
-      .sort((a, b) => a.localeCompare(b));
-    const value = organisations.includes(current) ? current : '';
-    // Full names, so a search matches any part of them; the field cuts a long name short with an ellipsis
-    const options = [{value: '', text: 'All organisations'}, ...organisations.map((name) => ({value: name, text: name}))];
+    let options;
+    if (state.source === 'watchlist') {
+      const departments = new Map();
+      state.tenders.forEach((t) => t.watchlist && departments.set(t.watchlist.name, t.watchlist));
+      const ordered = [...departments.values()].sort((a, b) => (a.sl ?? 999) - (b.sl ?? 999) || a.name.localeCompare(b.name));
+      options = [{value: '', text: 'All departments'},
+        ...ordered.map((d) => ({value: `${DEPARTMENT}${d.name}`, text: d.name === d.full_name ? d.name : `${d.name} · ${d.full_name}`}))];
+    } else {
+      // By the name the table shows, so one organisation sent in two cases is listed once
+      const organisations = [...new Set(state.tenders.map((t) => titleCase(t.organisation)).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b));
+      // Full names, so a search matches any part of them; the field cuts a long name short with an ellipsis
+      options = [{value: '', text: 'All organisations'},
+        ...(state.tenders.some((t) => t.watchlist) ? [{value: WATCHLIST_ONLY, text: 'Watchlist departments'}] : []),
+        ...organisations.map((name) => ({value: name, text: name}))];
+    }
+    els.orgFilter.setAttribute('aria-label', state.source === 'watchlist' ? 'Filter by department' : 'Filter by organisation');
+    const value = options.some((option) => option.value === current) ? current : '';
     if (orgPicker) {
       orgPicker.clear(true);
       orgPicker.clearOptions();
       orgPicker.addOptions(options);
+      // The empty option survives clearOptions() as the selected one, so addOptions() skips its new label
+      orgPicker.updateOption('', options[0]);
       orgPicker.setValue(value, true);
+      orgPicker.control.setAttribute('aria-label', els.orgFilter.getAttribute('aria-label'));
+      orgPicker.settings.placeholder = state.source === 'watchlist' ? 'Search departments' : 'Search organisations';
       return;
     }
     els.orgFilter.replaceChildren(...options.map((option) => el('option', {text: option.text, attrs: {value: option.value}})));
@@ -522,7 +587,9 @@
       const days = numberOr(t.days_left);
       return days !== null && days >= 0 && days <= URGENT_DAYS;
     }).length;
-    const parts = [`${plural(state.tenders.length, 'tender')}${isPaged() ? ` on page ${state.page}` : ''}`];
+    const parts = [state.total !== null
+      ? `${plural(state.total, 'watchlist tender')}${isPaged() ? `, ${state.tenders.length} on page ${state.page}` : ''}`
+      : `${plural(state.tenders.length, 'tender')}${isPaged() ? ` on page ${state.page}` : ''}`];
     if (total) parts.push(`₹${crore(total)} Cr total value`);
     parts.push(`${soon} closing within ${URGENT_DAYS} days`);
     // Each part stays on one line, so a narrow screen breaks between them, not inside
@@ -539,7 +606,7 @@
     if (!state.tenders.length) {
       const filtered = filterCount(state.searchFilters) > 0;
       els.body.replaceChildren(el('tr', {cls: 'message-row', attrs: {role: 'row'}}, [
-        el('td', {attrs: {colspan: '7', role: 'cell'}}, filtered ? [
+        el('td', {attrs: {colspan: '7', role: 'cell'}}, state.source === 'watchlist' ? emptyWatchlist() : filtered ? [
           el('div', {cls: 'mb-2', text: 'TenderTiger found no live tenders with these filters.'}), clearFiltersButton(),
         ] : [document.createTextNode('TenderTiger found no live tenders. Reload later to check again.')]),
       ]));
@@ -593,10 +660,12 @@
           t.published_date ? el('span', {text: `Published ${displayDate(t.published_date)}`}) : null,
         ]),
         place ? el('div', {cls: 'org-inline', text: place}) : null,
+        departmentTag(t.watchlist, 'org-watch-inline'),  // shown where the organisation column is not
       ]),
       el('td', {cls: 'cell-org', attrs: {role: 'cell'}}, [
         el('div', {cls: 'org-name', text: organisation || '—', attrs: {title: organisation}}),
         location ? el('div', {cls: 'org-loc', text: location}) : null,
+        departmentTag(t.watchlist),
       ]),
       el('td', {cls: 'cell-value', attrs: {role: 'cell', 'data-label': 'Value'}}, amount
         ? [document.createTextNode(crore(amount)), el('span', {cls: 'unit', text: ' Cr'})]
@@ -610,11 +679,25 @@
     ]);
     row.dataset.tcno = t.tcno;
     row.dataset.organisation = organisation;
-    row.dataset.search = [t.tcno, t.name, t.reference, t.organisation, t.location].join(' ').toLowerCase();
+    row.dataset.department = t.watchlist ? t.watchlist.name : '';
+    row.dataset.search = [t.tcno, t.name, t.reference, t.organisation, t.location, t.watchlist && t.watchlist.name]
+      .join(' ').toLowerCase();
     row.classList.toggle('is-selected', checkbox.checked);
     row.classList.toggle('is-locked', checkbox.disabled);
     updateRow(t.tcno, row);
     return row;
+  }
+
+  /** The watchlist department a tender falls under, under its organisation: "ER", its full name on hover. */
+  function departmentTag(department, cls = '') {
+    if (!department) return null;
+    const minimum = department.min_value_cr !== null && department.min_value_cr !== undefined
+      ? `₹${department.min_value_cr} Cr and above` : '';
+    const title = [department.full_name, department.sector, minimum].filter(Boolean).join(' · ');
+    return el('div', {cls: `org-watch ${cls}`.trim(), attrs: {title: `On the watchlist: ${title}`}}, [
+      icon('bi-bookmark-star-fill'), el('span', {text: department.name}),
+      el('span', {cls: 'visually-hidden', text: ` (watchlist: ${title})`}),
+    ]);
   }
 
   /** Redraws a row's eligibility cell, drop button and state classes, when what they show changed. */
@@ -630,11 +713,13 @@
     row.querySelector('.cell-verdict').replaceChildren(
       el('div', {cls: 'verdict-stack'}, verdictCell(tcno, result, status, decision)));
 
+    // Any tender but a dropped one can be dropped; dropped is final
     const dropped = Boolean(decision && decision.decision === 'dropped');
     const dropButton = row.querySelector('.row-drop');
-    dropButton.replaceChildren(icon(dropped ? 'bi-arrow-counterclockwise' : 'bi-x'));
-    dropButton.setAttribute('aria-label', `${dropped ? 'Restore' : 'Drop'} tender ${tcno}`);
-    dropButton.title = dropped ? 'Restore tender' : 'Drop tender';
+    dropButton.replaceChildren(icon('bi-x'));
+    dropButton.setAttribute('aria-label', `Drop tender ${tcno}`);
+    dropButton.title = 'Drop tender';
+    dropButton.hidden = dropped;
     row.classList.toggle('is-dropped', dropped);
     row.dataset.category = category(tcno);
   }
@@ -780,13 +865,17 @@
   function applyFilters() {
     const terms = els.search.value.trim().toLowerCase().split(/\s+/).filter(Boolean);
     const organisation = els.orgFilter.value;
+    const inOrganisation = (row) => !organisation
+      || (organisation === WATCHLIST_ONLY ? Boolean(row.dataset.department)
+        : organisation.startsWith(DEPARTMENT) ? row.dataset.department === organisation.slice(DEPARTMENT.length)
+          : row.dataset.organisation === organisation);
     let shown = 0;
     for (const tender of state.tenders) {
       const row = state.rows.get(tender.tcno);
       if (!row) continue;
       row.hidden = !(
         terms.every((term) => row.dataset.search.includes(term))
-        && (!organisation || row.dataset.organisation === organisation)
+        && inOrganisation(row)
         && (!state.verdictFilter || row.dataset.category === state.verdictFilter)
         && inStatusFilters(tender)
       );
@@ -1076,6 +1165,8 @@
       return;
     }
     els.filtersApply.disabled = true;
+    // The filters search TenderTiger, whichever list is shown
+    if (state.source === 'watchlist') await setSource('tendertiger', {load: false});
     const loaded = await loadTenders({quiet: true, filters, page: 1});
     els.filtersApply.disabled = false;
     if (loaded) setFiltersOpen(false);
@@ -1086,39 +1177,15 @@
   /** Empties the form, and loads the list without filters when it has some. */
   async function clearSearchFilters() {
     fillFilterForm({});
+    if (state.source === 'watchlist') {
+      // The filters search TenderTiger: cleared from the watchlist, its list without them
+      await setSource('tendertiger', {load: false});
+      await loadTenders({quiet: true, filters: {}, page: 1});
+      return;
+    }
     // Still loaded with the filters if that failed, so the form shows them again
     if (filterCount(state.searchFilters) && !(await loadTenders({quiet: true, filters: {}, page: 1}))) {
       fillFilterForm(state.searchFilters);
-    }
-  }
-
-  /**
-   * Puts the filters of default_filters.json into the form and loads the list with them, leaving the form open on
-   * what was applied. A missing or broken file, or a range that cannot be searched, says so and loads nothing.
-   */
-  async function applyDefaultFilters() {
-    // aria-disabled, not disabled, while it loads: a disabled button loses the keyboard focus to the page
-    const button = els.filtersDefault;
-    if (button.getAttribute('aria-disabled') === 'true') return;
-    button.setAttribute('aria-disabled', 'true');
-    try {
-      fillFilterForm(await api('/api/default-filters'));
-      const filters = formFilters();
-      const problem = rangeProblem(filters);
-      if (problem) {
-        const [field, message] = problem;
-        field.setCustomValidity(message);
-        field.reportValidity();
-      } else if (!(await loadTenders({quiet: true, filters, page: 1}))) {
-        fillFilterForm(state.searchFilters);  // still loaded with the filters it had
-      }
-    } catch (error) {
-      // A bare "Not Found" is the server's, not the endpoint's: a server started before it was added
-      toast(error.message === 'Not Found'
-        ? 'Could not apply the default filters: the server is running an older version. Restart it and try again.'
-        : `Could not apply the default filters: ${error.message}`);
-    } finally {
-      button.removeAttribute('aria-disabled');
     }
   }
 
@@ -1126,6 +1193,127 @@
     const button = el('button', {cls: `link-button${cls}`, text: 'Clear filters', attrs: {type: 'button'}});
     button.addEventListener('click', clearSearchFilters);
     return button;
+  }
+
+  /* ---------- the watchlist ---------- */
+
+  /**
+   * Shows TenderTiger's list ('tendertiger', with the search filters) or the watchlist's ('watchlist', as its last
+   * search saved it), from page 1, and remembers the choice for the next visit. The search filters always search
+   * TenderTiger: applied from the watchlist, they switch to TenderTiger's list (see applySearchFilters()).
+   */
+  async function setSource(source, {load = true} = {}) {
+    state.source = source;
+    const watchlist = source === 'watchlist';
+    els.watchlistBtn.setAttribute('aria-pressed', String(watchlist));
+    els.watchlistBar.hidden = !watchlist;
+    if (watchlist && !els.filtersForm.hidden) setFiltersOpen(false);
+    if (orgPicker) orgPicker.setValue('', true);
+    else els.orgFilter.value = '';
+    try {
+      localStorage.setItem(SOURCE_KEY, source);
+    } catch (_) {
+      // Storage blocked: the choice lasts until the page is reloaded
+    }
+    if (!watchlist) {
+      clearTimeout(state.watchlistTimer);
+      state.watchlistTimer = null;
+    }
+    renderWatchlistBar();
+    // Not showList(): a page of the other list may still be loading, and its rows are not wanted
+    if (load) await loadTenders({page: 1});
+  }
+
+  /** Keeps the watchlist's status, polls while it is being searched, and reloads it once the search is done. */
+  function setWatchlistStatus(status) {
+    const was = state.watchlist && state.watchlist.status;
+    state.watchlist = status;
+    renderWatchlistBar();
+    clearTimeout(state.watchlistTimer);
+    state.watchlistTimer = null;
+    if (status && status.status === 'running') {
+      state.watchlistTimer = setTimeout(pollWatchlist, WATCHLIST_POLL_MS);
+    } else if (was === 'running' && status) {
+      if (status.status === 'completed') {
+        toast(`Watchlist searched: ${plural(status.tenders, 'tender')} from ${plural(status.departments, 'department')}.`, 'success');
+      } else if (status.status === 'failed') {
+        toast(`The watchlist search failed: ${status.error}`, 'warning');
+      }
+      if (state.source === 'watchlist') loadTenders({quiet: true, page: 1});
+    }
+  }
+
+  async function pollWatchlist() {
+    state.watchlistTimer = null;
+    if (state.source !== 'watchlist') return;
+    try {
+      setWatchlistStatus(await api('/api/watchlist/status'));
+    } catch (_) {
+      state.watchlistTimer = setTimeout(pollWatchlist, POLL_RETRY_MS);  // the server is restarting, say
+    }
+  }
+
+  /** The watchlist bar: how many tenders it holds and when it was searched, or how far the search in progress got. */
+  function renderWatchlistBar() {
+    const status = state.watchlist;
+    const button = els.watchlistRefresh;
+    const running = Boolean(status && status.status === 'running');
+    button.setAttribute('aria-disabled', String(running || !status));
+    button.lastChild.textContent = running ? ' Searching…' : ' Search again';
+    if (!status) {
+      els.watchlistStatus.textContent = '';
+      return;
+    }
+    const parts = [];
+    if (running) {
+      parts.push(`Searching TenderTiger: ${status.searched} of ${plural(status.searches, 'search', 'searches')} done`,
+        `${plural(status.found, 'tender')} found so far`);
+    } else {
+      if (status.status === 'failed') parts.push(`The last search failed: ${status.error}`);
+      if (status.refreshed_at) {
+        parts.push(`${plural(status.tenders, 'tender')} from ${plural(status.departments, 'department')}`);
+        parts.push(`searched ${formatWhen(status.refreshed_at)}`);
+      } else if (status.status !== 'failed') {
+        parts.push('Not searched yet');
+      }
+      if (status.changed) parts.push('the watchlist changed since: search again to apply it');
+      if (status.capped && status.capped.length) {
+        parts.push(`${plural(status.capped.length, 'search', 'searches')} found more than TenderTiger serves`);
+      }
+    }
+    els.watchlistStatus.replaceChildren(...parts.flatMap((part, index) => [
+      index ? document.createTextNode(' · ') : null, el('span', {cls: index ? '' : 'watchlist-lead', text: part}),
+    ]).filter(Boolean));
+    els.watchlistBar.classList.toggle('is-running', running);
+    els.watchlistBar.classList.toggle('is-failed', status.status === 'failed');
+  }
+
+  /** What an empty watchlist shows: the search in progress, or a way to start one. */
+  function emptyWatchlist() {
+    const status = state.watchlist || {};
+    if (status.status === 'running') {
+      return [el('div', {cls: 'mb-1'}, [
+        el('span', {cls: 'spinner-border spinner-border-sm me-2', attrs: {'aria-hidden': 'true'}}),
+        document.createTextNode('Searching TenderTiger for the watchlist’s organisations…'),
+      ]), el('div', {cls: 'message-hint', text: 'The first search takes about 15 minutes; the list fills in when it is done.'})];
+    }
+    if (!status.refreshed_at) {
+      const start = el('button', {cls: 'button button-secondary button-sm', text: 'Search TenderTiger now', attrs: {type: 'button'}});
+      start.addEventListener('click', refreshWatchlist);
+      return [el('div', {cls: 'mb-2', text: 'The watchlist has not been searched yet. A search takes about 15 minutes.'}), start];
+    }
+    return [document.createTextNode('The last search found no tender of the watchlist’s departments. Search again later to check.')];
+  }
+
+  /** Search again: asks the server to search TenderTiger for the watchlist's organisations, in the background. */
+  async function refreshWatchlist() {
+    if (els.watchlistRefresh.getAttribute('aria-disabled') === 'true' && state.watchlist) return;
+    try {
+      setWatchlistStatus(await api('/api/watchlist/refresh', {method: 'POST'}));
+      if (!state.tenders.length) renderTable();
+    } catch (error) {
+      toast(`Could not search for the watchlist: ${error.message}`);
+    }
   }
 
   /* ---------- processing and progress ---------- */
@@ -2301,20 +2489,22 @@
     if (next) openDetails(next);
   }
 
+  const decisionButtons = () => [[els.reviewedBtn, 'reviewed'], [els.shortlistBtn, 'shortlisted'], [els.dropBtn, 'dropped']];
+
+  /** The window's decision: what the tender is (Pending, or Reviewed / Shortlisted / Dropped with the date), then only
+   * the buttons of what it can be marked next. */
   function updateDecisionButtons() {
     const entry = state.decisions.get(state.details.tcno);
-    const decision = entry ? entry.decision : null;
-    const set = (button, value, verb) => {
-      const pressed = decision === value;
-      button.setAttribute('aria-pressed', String(pressed));
-      button.querySelector('span').textContent = pressed ? DECISIONS[value].label : verb;
-      button.title = pressed ? 'Click again to clear the decision' : '';
-    };
-    set(els.shortlistBtn, 'shortlisted', 'Shortlist');
-    set(els.dropBtn, 'dropped', 'Drop');
+    const shown = entry && DECISIONS[entry.decision];
+    els.decisionNow.className = `decision-line decision-now ${shown ? shown.cls : 'decision-pending'}`;
+    els.decisionNow.replaceChildren(...(shown
+      ? [icon(shown.icon), document.createTextNode(`${shown.label} ${formatDate(entry.decided_at)}`)]
+      : [icon('bi-hourglass-split'), document.createTextNode('Pending')]));
+    const next = NEXT_DECISIONS[shown ? entry.decision : 'pending'];
+    decisionButtons().forEach(([button, value]) => { button.hidden = !next.includes(value); });
   }
 
-  /** Saves shortlisted / dropped / null for a tender and redraws what shows it. Returns true on success. */
+  /** Marks a tender reviewed / shortlisted / dropped and redraws what shows it. True on success. */
   async function saveDecision(tcno, decision) {
     try {
       const data = await api(`/api/decision/${encodeURIComponent(tcno)}`, {method: 'PUT', body: JSON.stringify({decision})});
@@ -2330,13 +2520,18 @@
     }
   }
 
-  /** The modal's Shortlist / Drop: choosing the current decision again clears it. */
-  async function toggleDecision(value) {
-    const tcno = state.details.tcno;
-    const entry = state.decisions.get(tcno);
-    els.shortlistBtn.disabled = els.dropBtn.disabled = true;
-    await saveDecision(tcno, entry && entry.decision === value ? null : value);
-    els.shortlistBtn.disabled = els.dropBtn.disabled = false;
+  /**
+   * The window's Mark reviewed / Shortlist / Drop. The button pressed then goes, with any before it, so the keyboard
+   * focus moves on to the next one left, or to Copy text once the tender is dropped.
+   */
+  async function markDecision(value) {
+    const buttons = decisionButtons().map(([button]) => button);
+    buttons.forEach((button) => { button.disabled = true; });
+    await saveDecision(state.details.tcno, value);
+    buttons.forEach((button) => { button.disabled = false; });
+    if (!document.activeElement || document.activeElement.hidden || document.activeElement === document.body) {
+      (buttons.find((button) => !button.hidden) || els.copyBtn).focus();
+    }
   }
 
   /* ---------- closed downloads ---------- */
@@ -2348,17 +2543,17 @@
     return mb < 1024 ? `${mb.toFixed(1)} MB` : `${(mb / 1024).toFixed(2)} GB`;
   }
 
-  /** Opens the list of closed tenders whose documents are still in the download folder; a fresh scan each time. */
+  /** Opens the list of checked tenders that have closed; a fresh load each time. */
   function openClosed() {
     closedModal.show();
     loadClosed();
   }
 
-  /** Scans the download folder into the popup; a failed scan says why and offers Try again. */
+  /** Loads the closed tenders into the popup; a failed load says why and offers Try again. */
   async function loadClosed() {
     els.closedFacts.textContent = '';
     els.closedBody.setAttribute('aria-busy', 'true');
-    els.closedBody.replaceChildren(loadingLine('Looking through the download folder…'));
+    els.closedBody.replaceChildren(loadingLine('Loading the closed tenders…'));
     try {
       state.closed = await api('/api/closed-downloads');
       renderClosed();
@@ -2366,7 +2561,7 @@
       const retry = el('button', {cls: 'button button-secondary button-sm', text: 'Try again', attrs: {type: 'button'}});
       retry.addEventListener('click', loadClosed);
       els.closedBody.replaceChildren(el('div', {cls: 'closed-empty'}, [
-        el('p', {cls: 'message-error', text: `Could not look through the download folder: ${error.message}`}),
+        el('p', {cls: 'message-error', text: `Could not load the closed tenders: ${error.message}`}),
         retry,
       ]));
     } finally {
@@ -2374,13 +2569,16 @@
     }
   }
 
-  /** One table of tenders: closed ones with their closing date (closed-dated), the others without. */
-  function closedTable(tenders, label, withDate) {
-    const head = ['Tender', ...(withDate ? ['Closed'] : []), 'Files', ''];
+  /**
+   * One table of tenders: closed ones with their closing date (closed-dated), the others without; withFiles adds how
+   * many files each folder holds and their size (the folders the database holds no result for).
+   */
+  function closedTable(tenders, label, withDate, withFiles = false) {
+    const head = ['Tender', ...(withDate ? ['Closed'] : []), ...(withFiles ? ['Files'] : []), ''];
     return el('div', {cls: 'closed-wrap'}, [
       el('table', {cls: withDate ? 'closed-table closed-dated' : 'closed-table', attrs: {'aria-label': label}}, [
-        el('thead', {}, [el('tr', {}, head.map((text, n) => el('th', {
-          cls: n === head.length - 2 ? 'closed-num' : '', attrs: {scope: 'col'},
+        el('thead', {}, [el('tr', {}, head.map((text) => el('th', {
+          cls: text === 'Files' ? 'closed-num' : '', attrs: {scope: 'col'},
         }, [text ? document.createTextNode(text) : el('span', {cls: 'visually-hidden', text: 'Delete'})])))]),
         el('tbody', {}, tenders.map((tender) => el('tr', {}, [
           el('td', {}, [
@@ -2391,10 +2589,10 @@
             el('div', {text: displayDate(tender.closing_date)}),
             el('div', {cls: 'closed-meta', text: `${plural(tender.days_closed, 'day')} ago`}),
           ]) : null,
-          el('td', {cls: 'closed-num text-nowrap'}, [
+          withFiles ? el('td', {cls: 'closed-num text-nowrap'}, [
             el('div', {text: plural(tender.files, 'file')}),
             el('div', {cls: 'closed-meta', text: formatBytes(tender.bytes)}),
-          ]),
+          ]) : null,
           el('td', {cls: 'closed-action'}, [
             el('button', {
               cls: 'button button-danger button-sm',
@@ -2409,43 +2607,92 @@
   /** The popup from state.closed, the last /api/closed-downloads response less the tenders deleted since. */
   function renderClosed() {
     const data = state.closed;
-    const size = (tenders) => tenders.reduce((total, tender) => total + tender.bytes, 0);
-    // "3 tenders, 45.2 MB"; nothing while none has closed
-    els.closedFacts.textContent = data.closed.length
-      ? `${plural(data.closed.length, 'tender')}, ${formatBytes(size(data.closed))}` : '';
+    // "3 tenders"; nothing while none has closed
+    els.closedFacts.textContent = data.closed.length ? plural(data.closed.length, 'tender') : '';
     const parts = [];
     if (data.closed.length) {
-      parts.push(closedTable(data.closed, 'Closed tenders with downloaded files', true));
+      parts.push(closedTable(data.closed, 'Closed tenders', true));
     } else {
       // The tenders without a closing date below have most likely closed, so this says only what is known
       parts.push(el('p', {cls: 'closed-empty', text: data.unknown.length
-        ? 'No tender known to have closed has files left in the download folder.'
-        : 'No closed tender has files left in the download folder.'}));
+        ? 'No checked tender is known to have closed.' : 'No checked tender has closed.'}));
     }
     if (data.unknown.length) {
       parts.push(el('section', {cls: 'closed-unknown', attrs: {'aria-labelledby': 'closed-unknown-title'}}, [
         el('h3', {cls: 'closed-subtitle', attrs: {id: 'closed-unknown-title'},
-          text: `No closing date on record · ${plural(data.unknown.length, 'tender')}, ${formatBytes(size(data.unknown))}`}),
+          text: `No closing date on record · ${plural(data.unknown.length, 'tender')}`}),
         el('p', {cls: 'closed-note', text: 'Checked before the app kept closing dates. A tender gets its date when it '
           + 'next appears in the tender list; one TenderTiger no longer lists has most likely closed.'}),
-        closedTable(data.unknown, 'Tenders with downloaded files and no closing date on record', false),
+        closedTable(data.unknown, 'Checked tenders with no closing date on record', false),
       ]));
     }
+    parts.push(strayPart(data.stray));
     els.closedBody.replaceChildren(...parts);
   }
 
   /**
-   * Delete: after a confirmation, deletes everything kept for the tender (its downloaded documents, result, deep
-   * analysis, decision and Pinecone namespace), takes it off the list and moves focus to the next Delete, or to Close.
+   * The popup's last part: a button that looks through the download folder for tender folders the database holds no
+   * result for (stray undefined), the search in progress (null), or what it found.
+   */
+  function strayPart(stray) {
+    const title = 'In the download folder, not in the database';
+    const children = [];
+    if (stray === undefined || stray === null) {
+      const find = el('button', {
+        cls: 'button button-secondary button-sm', attrs: {type: 'button', 'data-find-stray': ''},
+      }, stray === null
+        ? [el('span', {cls: 'spinner-border spinner-border-sm', attrs: {'aria-hidden': 'true'}}),
+          document.createTextNode(' Looking through the download folder…')]
+        : [icon('bi-folder2-open'), document.createTextNode(' Find folders not in the database')]);
+      if (stray === null) find.disabled = true;
+      children.push(el('p', {cls: 'closed-note', text: 'Tender folders with no result on record: a check that '
+        + 'never finished, or an older version’s. They are not listed above, as the list comes from the database.'}),
+      find);
+    } else {
+      const size = stray.reduce((total, tender) => total + tender.bytes, 0);
+      children.push(el('h3', {cls: 'closed-subtitle', attrs: {id: 'closed-stray-title'},
+        text: `${title} · ${plural(stray.length, 'tender')}${stray.length ? `, ${formatBytes(size)}` : ''}`}));
+      children.push(stray.length
+        ? closedTable(stray, 'Tender folders the database holds no result for', false, true)
+        : el('p', {cls: 'closed-empty', text: 'None: every tender folder has its result in the database.'}));
+    }
+    return el('section', {cls: 'closed-unknown closed-stray', attrs: {'aria-label': title}}, children);
+  }
+
+  /** Looks through the download folder for tender folders the database holds no result for, and lists them. */
+  async function findStray() {
+    state.closed = {...state.closed, stray: null};
+    renderClosed();
+    try {
+      const data = await api('/api/stray-downloads');
+      state.closed = {...state.closed, stray: data.tenders};
+      renderClosed();
+      const title = $('closed-stray-title');
+      if (title) title.scrollIntoView({block: 'nearest'});
+      (els.closedBody.querySelector('.closed-stray [data-delete]') || els.closedModal.querySelector('[data-bs-dismiss="modal"]')).focus();
+    } catch (error) {
+      state.closed = {...state.closed, stray: undefined};
+      renderClosed();
+      toast(`Could not look through the download folder: ${error.message}`);
+    }
+  }
+
+  /**
+   * Delete: after a confirmation, deletes everything kept for the tender (its result, deep analysis and decision in
+   * the database, its downloaded documents and its Pinecone namespace), takes it off the list and moves focus to the
+   * next Delete, or to Close.
    */
   async function deleteClosed(button) {
     const tcno = button.dataset.delete;
-    const tender = [...state.closed.closed, ...state.closed.unknown].find((item) => item.tcno === tcno);
-    if (!tender || !window.confirm(`Delete tender ${tcno}?
-
-Its ${plural(tender.files, 'downloaded file')} `
-      + `(${formatBytes(tender.bytes)}), its result and deep analysis, the decision on it and its Pinecone namespace `
-      + 'are all deleted, for good. Statuses marked by hand stay in the company profile.')) return;
+    const stray = (state.closed.stray || []).find((item) => item.tcno === tcno);
+    const tender = stray || [...state.closed.closed, ...state.closed.unknown].find((item) => item.tcno === tcno);
+    const what = stray
+      ? `Its folder (${plural(stray.files, 'file')}, ${formatBytes(stray.bytes)}) and its Pinecone namespace, if it `
+        + 'has one, are deleted, for good.'
+      : 'Its result and deep analysis, the decision on it, its downloaded files and its Pinecone namespace are all '
+        + 'deleted, for good. Statuses marked by hand on its criteria stay with the bid team’s marks, for the tenders '
+        + 'checked later.';
+    if (!tender || !window.confirm(`Delete tender ${tcno}?\n\n${what}`)) return;
     const buttons = [...els.closedBody.querySelectorAll('[data-delete]')];
     const next = buttons[buttons.indexOf(button) + 1];
     button.disabled = true;
@@ -2461,7 +2708,8 @@ Its ${plural(tender.files, 'downloaded file')} `
       return;
     }
     const keep = (item) => item.tcno !== tcno;
-    state.closed = {...state.closed, closed: state.closed.closed.filter(keep), unknown: state.closed.unknown.filter(keep)};
+    state.closed = {...state.closed, closed: state.closed.closed.filter(keep), unknown: state.closed.unknown.filter(keep),
+      ...(state.closed.stray ? {stray: state.closed.stray.filter(keep)} : {})};
     renderClosed();
     const focus = next && els.closedBody.querySelector(`[data-delete="${CSS.escape(next.dataset.delete)}"]`);
     (focus || els.closedModal.querySelector('[data-bs-dismiss="modal"]')).focus();
@@ -2487,6 +2735,7 @@ Its ${plural(tender.files, 'downloaded file')} `
       state.company = {blocks: profile.blocks, saved: JSON.stringify(profile.blocks)};
       renderCompany(profile);
       renderCompanyForm();
+      setEditorError(els.companyNote, els.companyError, null);
       companyModal.show();
     } catch (error) {
       toast(`Could not load the company profile: ${error.message}`);
@@ -2772,13 +3021,23 @@ Its ${plural(tender.files, 'downloaded file')} `
     return null;
   }
 
+  /**
+   * Shows why an editor's save was refused in its footer (box), in place of its note; null clears it. Not a toast:
+   * a toast stays until closed, over the footer's Save button.
+   */
+  function setEditorError(note, box, message) {
+    box.textContent = message || '';
+    box.hidden = !message;
+    note.hidden = Boolean(message);
+  }
+
   const companyChanged = () => JSON.stringify(state.company.blocks) !== state.company.saved;
 
   async function saveCompany() {
-    if (state.companyError) state.companyError.hide();
+    setEditorError(els.companyNote, els.companyError, null);
     const unnamed = unnamedPart();
     if (unnamed) {
-      state.companyError = toast(unnamed.message);
+      setEditorError(els.companyNote, els.companyError, `Not saved: ${unnamed.message}`);
       unnamed.field.focus();
       return;
     }
@@ -2790,9 +3049,310 @@ Its ${plural(tender.files, 'downloaded file')} `
       companyModal.hide();
       toast('Company profile saved. Tenders checked from now on use it.', 'success');
     } catch (error) {
-      state.companyError = toast(`Could not save the company profile: ${error.message}`);
+      setEditorError(els.companyNote, els.companyError, `Not saved: ${error.message}`);
     } finally {
       els.companySave.disabled = false;
+    }
+  }
+
+  /* ---------- watchlist editor ---------- */
+
+  // A department's fields, as the editor's columns: [field, column name, kind]. 'lines' are one per line; a
+  // department's states are comma-separated, none for any state.
+  const DEPARTMENT_FIELDS = [
+    ['sl', 'Sl', 'number'],
+    ['sector', 'Sector'],
+    ['name', 'Name'],
+    ['full_name', 'Full name'],
+    ['states', 'States (none: any)'],
+    ['organisations', 'Organisation patterns', 'lines'],
+    ['search', 'Names searched for', 'lines'],
+    ['brief', 'Description must match'],
+    ['min_value_cr', 'Least value, ₹ Cr', 'number'],
+  ];
+  const editWatchlistButton = () => {
+    const button = el('button', {cls: 'button button-secondary button-sm me-2', text: 'Edit watchlist', attrs: {type: 'button'}});
+    button.addEventListener('click', openWatchlistEditor);
+    return button;
+  };
+
+  /** Loads the saved rules into the editor and opens it; a fresh load, in case someone else changed them. */
+  async function openWatchlistEditor() {
+    els.watchlistEdit.disabled = true;
+    try {
+      const form = rulesForm(await api('/api/watchlist/rules'));
+      state.rules = {form, saved: JSON.stringify(form)};
+      renderRulesForm();
+      setEditorError(els.watchlistNote, els.watchlistError, null);
+      watchlistModal.show();
+    } catch (error) {
+      toast(`Could not load the watchlist: ${error.message}`);
+    } finally {
+      els.watchlistEdit.disabled = false;
+    }
+  }
+
+  /**
+   * The rules of /api/watchlist/rules as the editor's fields: every value a string; filters and state groups as
+   * [name, value] rows, a group's states and a department's comma-separated, its patterns and names one per line.
+   */
+  function rulesForm(rules) {
+    const text = (value) => (value === undefined || value === null ? '' : String(value));
+    return {
+      about: text(rules.about),
+      min_value_cr: text(rules.min_value_cr),
+      filters: Object.entries(rules.filters || {}).map(([name, value]) => [name, text(value)]),
+      state_groups: Object.entries(rules.state_groups || {}).map(([name, states]) => [name, states.join(', ')]),
+      departments: (rules.departments || []).map((department) => ({
+        sl: text(department.sl), sector: text(department.sector), name: text(department.name),
+        full_name: text(department.full_name),
+        states: Array.isArray(department.states) ? department.states.join(', ') : '',
+        organisations: (department.organisations || []).join('\n'), search: (department.search || []).join('\n'),
+        brief: text(department.brief), min_value_cr: text(department.min_value_cr),
+      })),
+    };
+  }
+
+  /**
+   * The editor's fields as /api/watchlist/rules takes them: {body, rows}, rows being the editor row of each
+   * department sent. Rows left empty are dropped.
+   */
+  function rulesBody(form) {
+    const parts = (value, separator) => value.split(separator).map((part) => part.trim()).filter(Boolean);
+    const optional = (value) => value.trim() || null;
+    const number = (value) => (value.trim() === '' ? null : Number(value));
+    const filled = form.departments.map((department, row) => [department, row])
+      .filter(([department]) => Object.values(department).some((value) => value.trim()));
+    const filters = form.filters.filter(([name]) => name.trim()).map(([name, value]) => {
+      const trimmed = value.trim();
+      return [name.trim(), trimmed === 'true' ? true : trimmed === 'false' ? false : trimmed];
+    });
+    return {
+      rows: filled.map(([, row]) => row),
+      body: {
+        about: optional(form.about),
+        min_value_cr: number(form.min_value_cr),
+        filters: Object.fromEntries(filters),
+        state_groups: Object.fromEntries(form.state_groups.filter(([name]) => name.trim())
+          .map(([name, states]) => [name.trim(), parts(states, ',')])),
+        departments: filled.map(([department]) => ({
+          sl: number(department.sl), sector: optional(department.sector), name: department.name.trim(),
+          full_name: optional(department.full_name),
+          states: parts(department.states, ',').length ? parts(department.states, ',') : 'any',
+          organisations: parts(department.organisations, '\n'), search: parts(department.search, '\n'),
+          brief: optional(department.brief), min_value_cr: number(department.min_value_cr),
+        })),
+      },
+    };
+  }
+
+  /** A section of the editor: its heading, with a line on what it holds. */
+  const rulesHeading = (text, hint) => el('div', {cls: 'profile-heading-row profile-heading-row-2 watchlist-heading'}, [
+    el('h3', {cls: 'profile-heading profile-heading-2', text}),
+    hint ? el('p', {cls: 'watchlist-hint', text: hint}) : null,
+  ]);
+
+  /** The editor: the settings, the search filters, the state groups, then the departments. */
+  function renderRulesForm() {
+    const {form} = state.rules;
+    const minimum = el('input', {
+      cls: 'profile-input', attrs: {type: 'number', min: '0', step: 'any', id: 'rules-min', 'data-field': 'min_value_cr'},
+    });
+    minimum.value = form.min_value_cr;
+    const about = el('textarea', {cls: 'profile-input profile-text', attrs: {rows: '2', id: 'rules-about', 'data-field': 'about'}});
+    about.value = form.about;
+    els.watchlistForm.replaceChildren(
+      el('div', {cls: 'watchlist-settings'}, [
+        el('div', {}, [
+          el('label', {cls: 'profile-label', text: 'Least tender value, ₹ Cr', attrs: {for: 'rules-min'}}), minimum,
+          el('p', {cls: 'watchlist-hint', text: 'For a department without its own. Tenders with no value given are not tracked.'}),
+        ]),
+        el('div', {}, [el('label', {cls: 'profile-label', text: 'Note', attrs: {for: 'rules-about'}}), about]),
+      ]),
+      rulesHeading('Search filters', 'Every search is narrowed by these, named as GET /api/tenders takes them: closing_from = today, bid_doc = true.'),
+      pairTable('filters', ['Filter', 'Value']),
+      rulesHeading('State groups', 'A name a department’s states can use for several states, comma-separated.'),
+      pairTable('state_groups', ['Group', 'States']),
+      rulesHeading('Departments', 'From the top, the first that claims a tender names it. Patterns are regular expressions, any case; each name searched for must match one of them.'),
+      departmentsTable(),
+    );
+  }
+
+  /** The filters or the state groups (list): a two-column table of fields, with Add row and a remove button per row. */
+  function pairTable(list, columns) {
+    const rows = state.rules.form[list].map((pair, r) => el('tr', {}, [
+      ...columns.map((column, c) => {
+        const input = el('input', {
+          cls: c === 0 ? 'profile-cell profile-cell-key' : 'profile-cell',
+          attrs: {type: 'text', 'aria-label': `${column}, row ${r + 1}`, 'data-list': list, 'data-row': r, 'data-col': c},
+        });
+        input.value = pair[c];
+        return el('td', {}, [input]);
+      }),
+      el('td', {cls: 'profile-remove-cell'}, [el('button', {
+        cls: 'icon-button profile-remove',
+        attrs: {type: 'button', 'aria-label': `Remove row ${r + 1}${pair[0] ? `: ${pair[0]}` : ''}`, 'data-remove-pair': list, 'data-row': r},
+      }, [icon('bi-x-lg')])]),
+    ]));
+    return el('div', {attrs: {id: `rules-${list}`}}, [
+      el('div', {cls: 'profile-table-wrap'}, [el('table', {cls: 'profile-table'}, [
+        el('thead', {}, [el('tr', {}, [
+          ...columns.map((column) => el('th', {cls: 'watchlist-th', text: column, attrs: {scope: 'col'}})),
+          el('th', {cls: 'profile-remove-cell', attrs: {scope: 'col'}}, [el('span', {cls: 'visually-hidden', text: 'Remove'})]),
+        ])]),
+        el('tbody', {}, rows),
+      ])]),
+      el('div', {cls: 'profile-table-foot'}, [el('button', {cls: 'link-button profile-add', attrs: {type: 'button', 'data-add-pair': list}}, [
+        icon('bi-plus-lg'), document.createTextNode(' Add row'),
+      ])]),
+    ]);
+  }
+
+  /** The departments: a box to find one, then a row of fields each, to move up or down or remove, and Add department. */
+  function departmentsTable() {
+    const {departments} = state.rules.form;
+    const find = el('input', {cls: 'profile-input watchlist-find', attrs: {type: 'search', id: 'rules-find', placeholder: 'Find a department', 'aria-label': 'Find a department'}});
+    const rows = departments.map((department, d) => {
+      const label = department.name || `Department ${d + 1}`;
+      const cells = DEPARTMENT_FIELDS.map(([field, column, kind]) => {
+        const attrs = {'aria-label': `${column}, ${label}`, 'data-dept': d, 'data-field': field};
+        const input = kind === 'lines'
+          ? el('textarea', {cls: 'profile-cell watchlist-lines', attrs: {rows: '2', ...attrs}})
+          : el('input', {
+            cls: `profile-cell${field === 'name' ? ' profile-cell-key' : ''}${kind === 'number' ? ' watchlist-number' : ''}`,
+            attrs: kind === 'number' ? {type: 'number', min: '0', step: field === 'sl' ? '1' : 'any', ...attrs} : {type: 'text', ...attrs},
+          });
+        input.value = department[field];
+        return el('td', {}, [input]);
+      });
+      const action = (name, iconName, text, disabled) => el('button', {
+        cls: 'icon-button profile-remove', attrs: {type: 'button', 'aria-label': `${text}: ${label}`, [`data-${name}`]: d, ...(disabled ? {disabled: ''} : {})},
+      }, [icon(iconName)]);
+      return el('tr', {attrs: {'data-dept-row': d}}, [
+        ...cells,
+        el('td', {cls: 'watchlist-actions-cell'}, [el('div', {cls: 'watchlist-row-actions'}, [
+          action('move-up', 'bi-arrow-up', 'Move up', d === 0),
+          action('move-down', 'bi-arrow-down', 'Move down', d === departments.length - 1),
+          action('remove-dept', 'bi-x-lg', 'Remove'),
+        ])]),
+      ]);
+    });
+    const node = el('div', {attrs: {id: 'rules-departments'}}, [
+      find,
+      el('div', {cls: 'profile-table-wrap'}, [el('table', {cls: 'profile-table watchlist-table'}, [
+        el('thead', {}, [el('tr', {}, [
+          ...DEPARTMENT_FIELDS.map(([, column]) => el('th', {cls: 'watchlist-th', text: column, attrs: {scope: 'col'}})),
+          el('th', {cls: 'watchlist-actions-cell', attrs: {scope: 'col'}}, [el('span', {cls: 'visually-hidden', text: 'Order and remove'})]),
+        ])]),
+        el('tbody', {}, rows),
+      ])]),
+      el('div', {cls: 'profile-table-foot'}, [el('button', {cls: 'link-button profile-add', attrs: {type: 'button', 'data-add-dept': ''}}, [
+        icon('bi-plus-lg'), document.createTextNode(' Add department'),
+      ])]),
+    ]);
+    return node;
+  }
+
+  /** Redraws the departments, keeping what the find box holds, and returns their element. */
+  function redrawDepartments() {
+    const query = ($('rules-find') || {}).value || '';
+    const node = departmentsTable();
+    $('rules-departments').replaceWith(node);
+    $('rules-find').value = query;
+    findDepartments();
+    return node;
+  }
+
+  /** Shows only the departments whose sl, sector, name or full name hold what the find box does. */
+  function findDepartments() {
+    const query = $('rules-find').value.trim().toLowerCase();
+    state.rules.form.departments.forEach((department, d) => {
+      const text = [department.sl, department.sector, department.name, department.full_name].join(' ').toLowerCase();
+      els.watchlistForm.querySelector(`[data-dept-row="${d}"]`).hidden = Boolean(query) && !text.includes(query);
+    });
+  }
+
+  /** Focuses a department's first field, showing it first if the find box hides it. */
+  function focusDepartment(d) {
+    const row = els.watchlistForm.querySelector(`[data-dept-row="${d}"]`);
+    if (!row) return;
+    if (row.hidden) {
+      $('rules-find').value = '';
+      findDepartments();
+    }
+    const field = row.querySelector('input, textarea');
+    field.focus({preventScroll: true});
+    row.scrollIntoView({block: 'center'});
+  }
+
+  function addDepartment() {
+    const empty = Object.fromEntries(DEPARTMENT_FIELDS.map(([field]) => [field, '']));
+    state.rules.form.departments.push(empty);
+    $('rules-find').value = '';
+    redrawDepartments();
+    focusDepartment(state.rules.form.departments.length - 1);
+  }
+
+  /** Removes a department and moves focus to the one that took its place, or to Add department. */
+  function removeDepartment(d) {
+    const {departments} = state.rules.form;
+    departments.splice(d, 1);
+    const node = redrawDepartments();
+    const next = node.querySelector(`[data-remove-dept="${Math.min(d, departments.length - 1)}"]`);
+    (next || node.querySelector('[data-add-dept]')).focus();
+  }
+
+  /** Moves a department one place up (step -1) or down (1): the order in which departments claim tenders. */
+  function moveDepartment(d, step) {
+    const {departments} = state.rules.form;
+    const to = d + step;
+    if (to < 0 || to >= departments.length) return;
+    [departments[d], departments[to]] = [departments[to], departments[d]];
+    const node = redrawDepartments();
+    const same = node.querySelector(`[data-${step < 0 ? 'move-up' : 'move-down'}="${to}"]`);
+    (same && !same.disabled ? same : node.querySelector(`[data-${step < 0 ? 'move-down' : 'move-up'}="${to}"]`)).focus();
+  }
+
+  function addPairRow(list) {
+    state.rules.form[list].push(['', '']);
+    const node = pairTable(list, list === 'filters' ? ['Filter', 'Value'] : ['Group', 'States']);
+    $(`rules-${list}`).replaceWith(node);
+    node.querySelector('tbody tr:last-child input').focus();
+  }
+
+  function removePairRow(list, row) {
+    state.rules.form[list].splice(row, 1);
+    const node = pairTable(list, list === 'filters' ? ['Filter', 'Value'] : ['Group', 'States']);
+    $(`rules-${list}`).replaceWith(node);
+    const buttons = node.querySelectorAll('[data-remove-pair]');
+    (buttons[Math.min(row, buttons.length - 1)] || node.querySelector('[data-add-pair]')).focus();
+  }
+
+
+  const rulesChanged = () => Boolean(state.rules.form) && JSON.stringify(state.rules.form) !== state.rules.saved;
+
+  /**
+   * Saves the rules. A refused save says why, from the server, and focuses the department it names. Saved, the
+   * list is loaded again, so the departments' names on it follow.
+   */
+  async function saveWatchlistRules() {
+    setEditorError(els.watchlistNote, els.watchlistError, null);
+    const {body, rows} = rulesBody(state.rules.form);
+    els.watchlistSave.disabled = true;
+    try {
+      const form = rulesForm(await api('/api/watchlist/rules', {method: 'PUT', body: JSON.stringify(body)}));
+      state.rules = {form, saved: JSON.stringify(form)};
+      watchlistModal.hide();
+      toast('Watchlist saved. Search again to apply it to the list.', 'success');
+      // The list stays as the last search saved it; the bar now says the watchlist changed since
+      if (state.source === 'watchlist') pollWatchlist();
+    } catch (error) {
+      setEditorError(els.watchlistNote, els.watchlistError, `Not saved: ${error.message}`);
+      // The server counts the departments it was sent from 1
+      const named = /department (\d+)/.exec(error.message);
+      if (named && rows[Number(named[1]) - 1] !== undefined) focusDepartment(rows[Number(named[1]) - 1]);
+    } finally {
+      els.watchlistSave.disabled = false;
     }
   }
 
@@ -2811,9 +3371,10 @@ Its ${plural(tender.files, 'downloaded file')} `
     showList({page: Math.floor(((state.page - 1) * state.pageSize) / size) + 1, size});
   });
   els.filtersBtn.addEventListener('click', () => setFiltersOpen(els.filtersForm.hidden));
+  els.watchlistBtn.addEventListener('click', () => setSource(state.source === 'watchlist' ? 'tendertiger' : 'watchlist'));
+  els.watchlistRefresh.addEventListener('click', refreshWatchlist);
   els.filtersForm.addEventListener('submit', applySearchFilters);
   els.filtersClear.addEventListener('click', clearSearchFilters);
-  els.filtersDefault.addEventListener('click', applyDefaultFilters);
   // A range problem shown on one field is gone once any filter changes
   els.filtersForm.addEventListener('input', () => {
     [...els.filtersForm.elements].forEach((field) => field.setCustomValidity && field.setCustomValidity(''));
@@ -2889,7 +3450,7 @@ Its ${plural(tender.files, 'downloaded file')} `
     }
     const dropButton = event.target.closest('.row-drop');
     if (dropButton) {
-      saveDecision(dropButton.dataset.tcno, isDropped(dropButton.dataset.tcno) ? null : 'dropped');
+      saveDecision(dropButton.dataset.tcno, 'dropped');
       return;
     }
     if (event.target.closest('input, button, a, label, select')) return;
@@ -2910,8 +3471,44 @@ Its ${plural(tender.files, 'downloaded file')} `
 
   els.prevBtn.addEventListener('click', () => moveDetails(-1));
   els.nextBtn.addEventListener('click', () => moveDetails(1));
-  els.shortlistBtn.addEventListener('click', () => toggleDecision('shortlisted'));
-  els.dropBtn.addEventListener('click', () => toggleDecision('dropped'));
+  els.reviewedBtn.addEventListener('click', () => markDecision('reviewed'));
+  els.shortlistBtn.addEventListener('click', () => markDecision('shortlisted'));
+  els.dropBtn.addEventListener('click', () => markDecision('dropped'));
+
+  els.watchlistEdit.addEventListener('click', openWatchlistEditor);
+  els.watchlistSave.addEventListener('click', saveWatchlistRules);
+  els.watchlistForm.addEventListener('input', (event) => {
+    const {field, list, row, col, dept} = event.target.dataset;
+    const {form} = state.rules;
+    if (event.target.id === 'rules-find') findDepartments();
+    else if (dept !== undefined) form.departments[Number(dept)][field] = event.target.value;
+    else if (list !== undefined) form[list][Number(row)][Number(col)] = event.target.value;
+    else if (field !== undefined) form[field] = event.target.value;
+  });
+  els.watchlistForm.addEventListener('click', (event) => {
+    const button = event.target.closest('button');
+    if (!button) return;
+    const {addPair, removePair, row, addDept, removeDept, moveUp, moveDown} = button.dataset;
+    if (addPair !== undefined) addPairRow(addPair);
+    else if (removePair !== undefined) removePairRow(removePair, Number(row));
+    else if (addDept !== undefined) addDepartment();
+    else if (removeDept !== undefined) removeDepartment(Number(removeDept));
+    else if (moveUp !== undefined) moveDepartment(Number(moveUp), -1);
+    else if (moveDown !== undefined) moveDepartment(Number(moveDown), 1);
+  });
+  // Ctrl+S / Cmd+S saves the watchlist; Cancel, the close button and Esc ask before throwing away edits
+  els.watchlistModal.addEventListener('keydown', (event) => {
+    if (event.key.toLowerCase() !== 's' || !(event.ctrlKey || event.metaKey) || event.altKey) return;
+    event.preventDefault();
+    if (!els.watchlistSave.disabled) saveWatchlistRules();
+  });
+  els.watchlistModal.addEventListener('hide.bs.modal', (event) => {
+    if (rulesChanged() && !window.confirm('Discard your changes to the watchlist?')) event.preventDefault();
+  });
+  els.watchlistModal.addEventListener('shown.bs.modal', () => $('rules-min').focus());
+  els.watchlistModal.addEventListener('hidden.bs.modal', () => {
+    if (state.source === 'watchlist') els.watchlistEdit.focus();
+  });
 
   els.companyEdit.addEventListener('click', openCompany);
   els.companySave.addEventListener('click', saveCompany);
@@ -2981,6 +3578,7 @@ Its ${plural(tender.files, 'downloaded file')} `
   els.closedBody.addEventListener('click', (event) => {
     const button = event.target.closest('[data-delete]');
     if (button && !button.disabled) deleteClosed(button);
+    else if (event.target.closest('[data-find-stray]:not(:disabled)')) findStray();
   });
   els.closedModal.addEventListener('hidden.bs.modal', () => els.closedOpen.focus());
 
@@ -3013,6 +3611,7 @@ Its ${plural(tender.files, 'downloaded file')} `
       if (saved && typeof saved === 'object' && !Array.isArray(saved)) setSearchFilters(saved);
       const size = Number(localStorage.getItem(PAGE_SIZE_KEY));
       if (PAGE_SIZES.includes(size)) state.pageSize = size;
+      if (localStorage.getItem(SOURCE_KEY) === 'watchlist') await setSource('watchlist', {load: false});
     } catch (_) {
       // Storage blocked or unreadable: start without filters, 20 a page
     }

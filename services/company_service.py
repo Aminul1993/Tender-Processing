@@ -1,9 +1,12 @@
 """
-The company profile as a form: splits the profile markdown into the blocks the editor shows (title,
-section headings, tables of fields, free text) and turns the edited blocks back into markdown. Also keeps the
-profile's table of the criteria statuses the bid team marked by hand.
+The company profile every tender is checked against, kept in the database as its blocks (CompanyStore), and as a
+form: splits the profile markdown into the blocks the editor shows (title, section headings, tables of fields, free
+text) and turns the edited blocks back into markdown. Also keeps, apart from the profile, the criteria statuses the
+bid team marked by hand, which the tenders checked after are given with it.
 """
 import re
+from collections import defaultdict
+from contextlib import contextmanager
 
 _HEADING = re.compile(r'^(#{1,6})\s+(.*?)\s*$')
 _RULE = re.compile(r'^(-{3,}|\*{3,}|_{3,})$')
@@ -11,17 +14,114 @@ _SEPARATOR = re.compile(r'^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?$')
 _UNESCAPED_PIPE = re.compile(r'(?<!\\)\|')
 _NUMBERING = re.compile(r'^\s*\d+\.\s*')
 
-# What the editor starts from when the profile file is empty or missing
+# The advisory lock a save of the profile is made under
+_PROFILE_LOCK = 7_260_003
+
+
+class CompanyStore:
+    """
+    The company profile, edited on the page, in db (a services.database.Database): its blocks (parse_profile()) in
+    the company_profile_blocks table, in order, and the rows of its tables in company_profile_rows, each the child of
+    its table's block. Also the statuses the bid team marked by hand on tenders' criteria (the criterion_marks table),
+    one per tender and criterion.
+    """
+
+    def __init__(self, db):
+        self.db = db
+
+    def read(self):
+        """The profile as markdown, '' before one is saved."""
+        return render_profile(self.blocks())
+
+    def blocks(self):
+        """The profile's blocks, in the shape parse_profile() gives; [] before one is saved."""
+        with self.db.connection() as connection:
+            blocks = connection.execute('SELECT id, type, level, text, columns FROM company_profile_blocks '
+                                        'ORDER BY position').fetchall()
+            rows = connection.execute('SELECT block_id, cells FROM company_profile_rows '
+                                      'ORDER BY block_id, position').fetchall()
+        cells = defaultdict(list)
+        for block_id, row in rows:
+            cells[block_id].append(row)
+        found = []
+        for block_id, kind, level, text, columns in blocks:
+            if kind == 'heading':
+                found.append({'type': kind, 'level': level, 'text': text})
+            elif kind == 'table':
+                found.append({'type': kind, 'columns': columns, 'rows': cells[block_id]})
+            elif kind == 'text':
+                found.append({'type': kind, 'text': text})
+            else:
+                found.append({'type': kind})
+        return found
+
+    def save(self, text):
+        """Saves the profile markdown, as its blocks and table rows, in place of the last, all or nothing."""
+        with self._locked() as connection:
+            connection.execute('DELETE FROM company_profile_blocks')  # and their rows
+            for position, block in enumerate(parse_profile(text)):
+                block_id = connection.execute(
+                    'INSERT INTO company_profile_blocks (position, type, level, text, columns) '
+                    'VALUES (%s, %s, %s, %s, %s) RETURNING id',
+                    (position, block['type'], block.get('level'), block.get('text'), block.get('columns'))
+                ).fetchone()[0]
+                if block['type'] == 'table' and block['rows']:
+                    with connection.cursor() as cursor:
+                        cursor.executemany('INSERT INTO company_profile_rows (block_id, position, cells) '
+                                           'VALUES (%s, %s, %s)',
+                                           [(block_id, number, row) for number, row in enumerate(block['rows'])])
+
+    def marks(self):
+        """Every status marked by hand, as MARKED_COLUMNS rows, in the order they were first marked."""
+        with self.db.connection() as connection:
+            rows = connection.execute('SELECT criterion, requirement, status, tcno, marked_on FROM criterion_marks '
+                                      'ORDER BY seq').fetchall()
+        return [[criterion, requirement, MARK_LABELS[status], tcno, marked_on]
+                for criterion, requirement, status, tcno, marked_on in rows]
+
+    def mark(self, tcno, criterion, status, marked_on):
+        """
+        Records the status the bid team marked by hand on criterion (a result's criterion, with its 'criterion'
+        name and 'requirement') of tender tcno, in place of its last: 'met', 'not_met' or 'unknown', marked_on the
+        date. None removes it.
+        """
+        key = (str(tcno), _key(criterion['criterion']))
+        with self.db.connection() as connection:
+            if status is None:
+                connection.execute('DELETE FROM criterion_marks WHERE tcno = %s AND criterion_key = %s', key)
+            else:
+                connection.execute(
+                    'INSERT INTO criterion_marks (tcno, criterion_key, criterion, requirement, status, marked_on) '
+                    'VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (tcno, criterion_key) DO UPDATE SET '
+                    'criterion = excluded.criterion, requirement = excluded.requirement, status = excluded.status, '
+                    'marked_on = excluded.marked_on',
+                    (*key, criterion['criterion'], criterion.get('requirement') or '', status, marked_on))
+
+    def for_tender(self, tcno):
+        """
+        The profile to check tender tcno against: with the marks of the other tenders, not its own (see
+        profile_for_tender()). '' while the profile is empty.
+        """
+        return profile_for_tender(self.read(), [row for row in self.marks() if row[3] != str(tcno)])
+
+    @contextmanager
+    def _locked(self):
+        with self.db.transaction() as connection:
+            connection.execute('SELECT pg_advisory_xact_lock(%s)', (_PROFILE_LOCK,))
+            yield connection
+
+
+# What the editor starts from when the profile is empty
 EMPTY_PROFILE = [
     {'type': 'heading', 'level': 1, 'text': 'Company Profile'},
     {'type': 'table', 'columns': ['Item', 'Value'], 'rows': [['Company Name', '']]},
 ]
 
-# The section of the profile that records the statuses the bid team marks by hand on tenders' criteria (see
-# record_mark()), so the tenders checked after know what the team found
+# The table of the statuses the bid team marked by hand on tenders' criteria, given with the profile (see
+# profile_for_tender()), so the tenders checked after know what the team found
 MARKED_HEADING = 'Criteria marked by the bid team'
 MARKED_COLUMNS = ['Criterion', 'Requirement', 'Status', 'TCNO', 'Marked on']
-# As the profile, and the model reading it, words each status
+# As that table, and the model reading it, words each status
 MARK_LABELS = {'met': 'Met', 'not_met': 'Not met', 'unknown': 'Cannot determine'}
 
 
@@ -116,73 +216,18 @@ def unnamed_part(blocks):
     return None
 
 
-def record_mark(markdown, tcno, criterion, status, marked_on):
+def profile_for_tender(markdown, marks):
     """
-    The profile markdown with the status the bid team marked by hand on criterion (a result's criterion, with its
-    'criterion' name and 'requirement') of tender tcno recorded in the MARKED_HEADING table, replacing the row of
-    that criterion and tender: status is 'met', 'not_met' or 'unknown', marked_on the date. None removes the row,
-    and the section with its last row. The section is added at the end of the profile when it has none.
+    The profile markdown a tender is checked against: the profile, with marks (MARKED_COLUMNS rows, the statuses
+    the bid team marked by hand on other tenders' criteria) in a MARKED_HEADING table at its end; the profile alone
+    without marks, and '' while it is empty. A tender's own marks are never given: the app carries them over to its
+    new result (TenderProcessor._carry_marks()), so the model must not see them and return them as its own finding.
     """
-    key = (str(tcno), _key(criterion['criterion']))
-
-    def change(rows):
-        kept = [row for row in rows if _mark_key(row) != key]
-        if status:
-            at = next((index for index, row in enumerate(rows) if _mark_key(row) == key), len(kept))
-            kept.insert(at, [criterion['criterion'], criterion.get('requirement') or '', MARK_LABELS[status],
-                             str(tcno), marked_on])
-        return kept
-    return _change_marks(markdown, change)
-
-
-def profile_for_tender(markdown, tcno):
-    """
-    The profile markdown to check tender tcno against: without the tender's own rows in the MARKED_HEADING table.
-    Its marks are carried over to its new result by the app (TenderProcessor._carry_marks()), so the model must
-    not see them and return them as its own finding.
-    """
-    return _change_marks(markdown, lambda rows: [row for row in rows if row[3].strip() != str(tcno)])
-
-
-def _change_marks(markdown, change):
-    """
-    Applies change to the rows of the MARKED_HEADING table (a list, empty when there is none) and returns the
-    markdown, as it was when the rows did not change.
-    """
-    blocks = parse_profile(markdown)
-    heading, table = _marks_table(blocks)
-    rows = table['rows'] if table else []
-    changed = change(list(rows))
-    if changed == rows:
+    if not markdown.strip() or not marks:
         return markdown
-    if table is None:
-        if heading is None:
-            blocks += [{'type': 'rule'}, {'type': 'heading', 'level': 2, 'text': MARKED_HEADING}]
-            heading = len(blocks) - 1
-        table = {'type': 'table', 'columns': list(MARKED_COLUMNS), 'rows': []}
-        blocks.insert(heading + 1, table)
-    table['rows'] = changed
-    if not changed:
-        del blocks[heading:heading + 2]
-    return render_profile(blocks)
-
-
-def _marks_table(blocks):
-    """
-    The index in blocks of the MARKED_HEADING heading (a number before the name is ignored) and the table of
-    MARKED_COLUMNS right under it: (None, None) without the heading, (index, None) without the table.
-    """
-    for index, block in enumerate(blocks):
-        if block['type'] == 'heading' and _key(_NUMBERING.sub('', block['text'])) == _key(MARKED_HEADING):
-            below = blocks[index + 1] if index + 1 < len(blocks) else {}
-            columns = [_key(column) for column in below.get('columns', [])]
-            return index, below if columns == [_key(column) for column in MARKED_COLUMNS] else None
-    return None, None
-
-
-def _mark_key(row):
-    """A MARKED_COLUMNS row's tender and criterion, for matching."""
-    return row[3].strip(), _key(row[0])
+    return markdown.rstrip() + '\n\n---\n\n' + render_profile([
+        {'type': 'heading', 'level': 2, 'text': MARKED_HEADING},
+        {'type': 'table', 'columns': list(MARKED_COLUMNS), 'rows': marks}])
 
 
 def _key(text):
