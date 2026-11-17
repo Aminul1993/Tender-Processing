@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from ext import TENDER_PAGE_SIZE, TENDERTIGER_URL, tender_list
+from utils.tendertiger import TENDER_PAGE_SIZE, TENDERTIGER_URL, tender_list
 
 log = logging.getLogger(__name__)
 
@@ -171,11 +171,16 @@ def search_fields(filters):
                                                    qty_to, value_to or emd_to
       gem, bidding, funding                        gem or non_gem, ncb or icb, funded or non_funded
       msme, bid_doc, startup                       true for MSME tenders, those with bid documents, startup tenders
-    Filters left empty are left out. Raises ValueError for a range with one end missing or ending before it starts.
+    Filters left empty are left out. Raises ValueError for a range with one end missing or ending before it starts,
+    and for text with an apostrophe (').
     """
     fields = {}
     for name, field in TEXT_FILTERS.items():
         text = ' '.join(str(filters.get(name) or '').split())
+        if "'" in text:
+            # TenderTiger's search finds nothing at all with one: "collector office" lists tenders, "collector's
+            # office" none, so the team is told rather than shown an empty list
+            raise ValueError(f"Leave the apostrophe out of {text!r}: TenderTiger's search finds nothing with one.")
         if text:
             # The search page sends the word search in lower case
             fields[field] = text.lower() if name == 'word' else text

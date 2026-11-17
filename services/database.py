@@ -16,6 +16,7 @@ The app's PostgreSQL database (DATABASE_URL), shared by the web app and its work
                           (services/company_service.py)
   app_state               small JSON documents by name: when the watchlist was last refreshed, and last searched
   criterion_marks         the statuses the bid team marked by hand on tenders' criteria (services/company_service.py)
+  pacing                  when the next request to TenderTiger may go, whichever process sends it (Database.pace())
   texts, pages, vectors   the cache of what is slow or paid for to work out (services/cache_service.py)
 
 The tables are made on first connect, in DATABASE_SCHEMA (made too). The database itself must exist. The downloaded
@@ -70,6 +71,7 @@ CREATE TABLE IF NOT EXISTS watchlist_tenders (tcno text PRIMARY KEY, tender json
 ALTER TABLE watchlist_tenders ADD COLUMN IF NOT EXISTS department json;
 CREATE TABLE IF NOT EXISTS app_state (
     name text PRIMARY KEY, value json NOT NULL, saved_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS pacing (name text PRIMARY KEY, next_at timestamptz NOT NULL);
 CREATE TABLE IF NOT EXISTS texts (sha256 text, reader text, text text NOT NULL, PRIMARY KEY (sha256, reader));
 CREATE TABLE IF NOT EXISTS pages (sha256 text, reader text, text text NOT NULL, PRIMARY KEY (sha256, reader));
 CREATE TABLE IF NOT EXISTS vectors (model text, sha256 text, vector bytea NOT NULL, PRIMARY KEY (model, sha256));
@@ -147,6 +149,21 @@ class Database:
                 yield connection
             finally:
                 self._held.connection = None
+
+    def pace(self, name, seconds):
+        """
+        Takes the next turn of name, the turns of every process using this database at least seconds apart, by the
+        database's clock: returns the seconds to wait before it (0 when it is now). Concurrent callers queue on the row,
+        so each gets a turn of its own.
+        """
+        with self.connection() as connection:
+            wait = connection.execute(
+                'INSERT INTO pacing (name, next_at) VALUES (%(name)s, clock_timestamp() + make_interval(secs => %(gap)s)) '
+                'ON CONFLICT (name) DO UPDATE SET '
+                'next_at = GREATEST(pacing.next_at, clock_timestamp()) + make_interval(secs => %(gap)s) '
+                'RETURNING extract(epoch FROM next_at - clock_timestamp())::float8 - %(gap)s',
+                {'name': name, 'gap': float(seconds)}).fetchone()[0]
+        return max(0.0, wait)
 
     def value(self, name):
         """The JSON document saved under name in app_state, or None."""

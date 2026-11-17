@@ -7,12 +7,14 @@ from pathlib import Path
 
 import requests
 
-from ext import TENDERTIGER_URL, extract_zip_recursive, tendertiger_checked, tendertiger_session
-from utils.files import filename_from_response
+from utils.files import ZipTooLarge, extract_zip_recursive, filename_from_response
+from utils.tendertiger import TENDERTIGER_URL, tendertiger_checked, tendertiger_session
 
 log = logging.getLogger(__name__)
 
 CHUNK_SIZE = 1024 * 1024
+# How many times the download limit (MAX_DOWNLOAD_MB) its zips may unpack to; more is a zip bomb, not documents
+UNPACKED_FACTOR = 4
 
 
 class DownloadError(Exception):
@@ -22,38 +24,60 @@ class DownloadError(Exception):
 def download_tender_documents(tender, tcno_folder, timeout=120, max_bytes=500 * 1024 * 1024,
                               on_progress=None):
     """
-    Downloads all documents of tender (a raw tender from the tender list) from TenderTiger and leaves
-    them in tcno_folder, which is emptied first so a re-run never mixes old and new documents. A zip
-    (recognised by its content, not its name) is extracted with extract_zip_recursive, so nested zips
-    are unpacked as well.
+    Downloads all documents of tender (a raw tender from the tender list) from TenderTiger and puts them
+    in tcno_folder in place of what it held, so a re-run never mixes old and new documents. The folder is
+    replaced only once every document is downloaded and extracted: a download that fails leaves the last
+    one's documents as they were. A zip (recognised by its content, not its name) is extracted with
+    extract_zip_recursive, so nested zips are unpacked as well.
 
-    Returns the paths of all files in tcno_folder. Raises DownloadError on any failure, and RuntimeError
-    when the TenderTiger login fails.
+    Returns the paths of all files in tcno_folder. Raises DownloadError on any failure (also when a file
+    in tcno_folder is open in another program, so it cannot be replaced), and RuntimeError when the
+    TenderTiger login fails.
     on_progress, if given, is called with a short status message before each step.
     """
     report = on_progress or (lambda message: None)
     tcno_folder = Path(tcno_folder)
-    if tcno_folder.exists():
-        shutil.rmtree(tcno_folder)
-    tcno_folder.mkdir(parents=True)
+    tcno_folder.parent.mkdir(parents=True, exist_ok=True)
 
-    # Download beside the tcno folder, not into it: a zip holding a file with its own name
-    # would otherwise be overwritten while it is still being read
+    # Downloaded and extracted in a staging folder beside the tcno folder (so on the same disk, to be moved in its
+    # place), each in a folder of its own: a zip holding a file with its own name would otherwise be overwritten
+    # while it is still being read
     with tempfile.TemporaryDirectory(dir=tcno_folder.parent, ignore_cleanup_errors=True) as staging:
+        download, documents = Path(staging) / 'download', Path(staging) / 'documents'
+        download.mkdir()
+        documents.mkdir()
         report('Downloading documents')
-        downloaded = _fetch(tender, Path(staging), timeout, max_bytes)
+        downloaded = _fetch(tender, download, timeout, max_bytes)
         if zipfile.is_zipfile(downloaded):
             report('Extracting ZIP files')
             try:
-                extract_zip_recursive(downloaded, tcno_folder)
+                # Documents compress little, so more than UNPACKED_FACTOR times the download is not documents
+                extract_zip_recursive(downloaded, documents, max_bytes=UNPACKED_FACTOR * max_bytes)
+            except ZipTooLarge as exc:
+                raise DownloadError(str(exc)) from exc
             except Exception as exc:  # BadZipFile, encrypted entries, unsupported compression, disk errors
                 raise DownloadError(f'Could not extract {downloaded.name}: {exc}') from exc
         else:
-            shutil.move(downloaded, tcno_folder / downloaded.name)
+            shutil.move(downloaded, documents / downloaded.name)
+        _replace(tcno_folder, documents, Path(staging) / 'replaced')
 
     files = sorted(path for path in tcno_folder.rglob('*') if path.is_file())
     log.info('%d file(s) ready in %s', len(files), tcno_folder)
     return files
+
+
+def _replace(folder, documents, aside):
+    """
+    Puts the documents folder in folder's place. The old folder is moved aside first (into the staging folder, deleted
+    with it), which on Windows fails, changing nothing, while one of its files is open in another program.
+    """
+    if folder.exists():
+        try:
+            folder.rename(aside)
+        except OSError as exc:
+            raise DownloadError(f'The documents in {folder} could not be replaced, as one of them is open in another '
+                                f'program: {exc}') from exc
+    documents.rename(folder)
 
 
 def _open_documents(tender, timeout):

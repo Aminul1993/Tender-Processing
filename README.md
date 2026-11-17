@@ -8,7 +8,7 @@
 A FastAPI web app that lists your subscribed tenders, and for the ones you select: downloads the documents,
 unpacks every zip (nested zips too), reads each file, indexes all of them in the tender's own Pinecone namespace
 (`tcno-<tcno>`), retrieves the passages on each kind of requirement from it, and checks the company's eligibility
-with the LLM pipeline in [ext.py](ext.py). Tenders are processed one at a time in the background while the page shows
+with the LLM pipeline in [utils/llm.py](utils/llm.py). Tenders are processed one at a time in the background while the page shows
 live progress. Each row names the criteria a tender fails or could not determine, and the team can mark a
 tender reviewed (looked at, undecided), shortlisted or dropped; every tender starts pending, and moves forward only
 (see [Decisions](#decisions)). The company profile the tenders are checked against is kept in the database and
@@ -22,8 +22,6 @@ is edited on the page as a form (**Edit profile** in the app bar).
 app.py                       Application factory (create_app) and uvicorn entry point
 worker.py                    A worker process: processes queued tenders from the job in the database
 config.py                    Settings, each overridable by an environment variable
-ext.py                       Existing helpers: the TenderTiger login session, tender_list(), prequalification_criteria(),
-                             extract_zip_recursive(), LLM summarising, assess_eligibility()
 routes/
   pages.py                   Router "pages": GET /
   api.py                     Router "api": the JSON endpoints and the {"error": ...} handlers
@@ -59,13 +57,15 @@ services/
   watchlist_service.py       The watchlist: which department claims a tender, and the background search of
                              TenderTiger for every live tender of the departments, saved in the database
 scripts/
-  migrate_to_pinecone.py     One-off: indexes the tenders already downloaded and removes eligibility_criteria.md
-  import_files_to_db.py      One-off: moves the results, decisions, watchlist and cache an older version kept in
-                             files into the database
+  process_watchlist.py       Scheduled: searches TenderTiger for the watchlist's tenders and checks the new ones
+  remove_closed_tenders.py   Scheduled: removes the tenders closed 7 days ago or more (files, database, Pinecone)
 docs/
   pinecone-architecture.md   The Pinecone design (a namespace per tender): diagram, flows, migration plan, risks
 utils/
-  files.py                   Safe folder/file names, file name from a download response
+  tendertiger.py             The TenderTiger site: login session, request pacing, tender_list(),
+                             prequalification_criteria()
+  llm.py                     The Groq models (make_model()) and the eligibility check prompt (assess_eligibility())
+  files.py                   Safe folder/file names, file name from a download response, extract_zip_recursive()
   logging_setup.py           Console + rotating file logging (logs/app.log)
 templates/
   base.html                  Layout and app bar; IBM Plex, Bootstrap 5 (modal, toasts) and Bootstrap Icons
@@ -76,12 +76,15 @@ static/
   js/app.js                  Vanilla JS: loading, tabs/search/sort, selection, polling, decisions, modal
 design/
   Tender Processing.dc.html  Source design (Claude Design file); open via a local web server to view
-test_app.py                  Tests for the API, download/extract, indexing, verdict and score parsing
-test_ext.py                  Existing tests for ext.py
-test_pinecone_service.py     Tests for the Pinecone service
-test_profile_gap_service.py  Tests for the profile-gap report
-test_watchlist_service.py    Tests for the watchlist: its rules, the background search and its API
-pinecone_fake.py             In-memory stand-in for the Pinecone client, used by the tests
+tests/
+  test_app.py                Tests for the API, download/extract, indexing, verdict and score parsing
+  test_database.py           Tests for the database: the job state, pacing, the company profile; scratch_database()
+  test_utils.py              Tests for utils/: TenderTiger, the Groq model and prompt, zip extraction
+  test_pinecone_service.py   Tests for the Pinecone service
+  test_profile_gap_service.py  Tests for the profile-gap report
+  test_watchlist_service.py  Tests for the watchlist: its rules, the background search and its API
+  test_scripts.py            Tests for the scheduled scripts
+  pinecone_fake.py           In-memory stand-in for the Pinecone client, used by the tests
 ```
 
 ## Setup
@@ -125,22 +128,8 @@ Make the database once; the app makes its tables when it starts:
 psql -h localhost -U postgres -c "CREATE DATABASE tender_processing"
 ```
 
-If an older version kept those in files (`eligibility_result.json` and `deep_analysis.json` in each tender folder,
-`company_details.md` and `watchlist.json` in the project folder, `decisions.json`, `watchlist_tenders.json`,
-`watchlist_search.json` and `cache.sqlite3` in `downloads/`), move them into the database once, with the app stopped:
-
-```powershell
-python scripts/import_files_to_db.py
-```
-
-It keeps whatever the database already holds, so it can be run again. The files are left in place, and no longer
-read; delete them once the app shows what they held.
-
-If the tenders were checked by a version before Pinecone, run the migration once (see
-[Migrating from eligibility_criteria.md](#migrating-from-eligibility_criteriamd)).
-
 The app logs in to TenderTiger on first use and keeps the session, logging in again when the site ends it.
-The tender list shows the live tenders of the search in `TENDER_SEARCH` in [ext.py](ext.py) (keyword "india");
+The tender list shows the live tenders of the search in `TENDER_SEARCH` in [utils/tendertiger.py](utils/tendertiger.py) (keyword "india");
 change it there. The list has pages of 20 tenders, or 50, 100 or 500 as chosen in **Per page** under the table
 (remembered by the browser); TenderTiger sends any of them in one request. **Previous** and **Next** move between
 pages, with a selection kept from page to page. The **Value** and **Closes** headers have
@@ -148,7 +137,9 @@ TenderTiger sort the whole list (closing soonest first by default) and start aga
 the first one that is not full (or, when the last is exactly full, Next finds an empty page and says so). **Filters** in the toolbar narrows that search with the filters of TenderTiger's
 own search page (word, organisation, location, TID, company industry, quantity, value, EMD, publish and closing
 dates, GeM, NCB / ICB, funding, MSME, bid documents, startups): TenderTiger applies them, and the browser
-remembers the last ones applied. Without the Groq key or the Pinecone key the tender list still loads, but every
+remembers the last ones applied. Text with an apostrophe is refused with a message (as are the watchlist's search
+names and filters with one): TenderTiger's search finds nothing at all with one ("collector's office" lists no
+tender where "collector office" lists many). Without the Groq key or the Pinecone key the tender list still loads, but every
 tender fails at the analysis step with a clear message.
 
 Beside the organisation filter, two filters narrow the page shown: the decision (**All decisions**, **Pending**,
@@ -169,8 +160,8 @@ Every tender starts **Pending**, and the team's decision only moves forward:
 | Dropped | nothing: it is final |
 
 The tender's window shows its decision, with the date, and only the buttons of what it can be marked next (**Mark
-reviewed**, **Shortlist**, **Drop**). The × at the end of a row drops the tender straight away; a dropped row is
-greyed and has none. A decision cannot be taken back: the server refuses any move backwards, so two people marking
+reviewed**, **Shortlist**, **Drop**, which asks first); the list has no drop button of its own. A dropped row is
+greyed. A decision cannot be taken back: the server refuses any move backwards, so two people marking
 the same tender cannot undo each other's work. Deleting a closed tender (**Closed tenders**) forgets its decision.
 
 ## Run
@@ -191,6 +182,13 @@ uvicorn app:create_app --factory --host 0.0.0.0 --port 5000
 
 Behind a reverse proxy on another host, add `--proxy-headers --forwarded-allow-ips <proxy-ip>` so the page's
 links use the proxy's address and scheme.
+
+**There is no login.** With `--host 0.0.0.0` anyone who can reach port 5000 can use the app: delete tenders, edit
+the company profile and the watchlist, start checks that spend Groq tokens, and open `/docs`. Use
+`--host 127.0.0.1` when only this machine needs it, and keep the port off networks other than the bid team's
+(a firewall rule, or a reverse proxy with a password in front). Other web pages a team member has open cannot make
+changes: every request that changes something must carry the `X-Requested-With` header the page sends, which a
+browser never adds to a request another site makes (see **API**).
 
 **Run one web process.** The tender list and the deep analyses live in its memory, so do not use uvicorn's
 `--workers`, `gunicorn -w 4` or `--reload`. The endpoints run in uvicorn's thread pool, so requests are still served
@@ -219,13 +217,51 @@ Several workers on one machine share its CPU: PaddleOCR already uses every core 
 with more of them (see `OCR_CONCURRENCY`), and each worker that OCRs loads its own models (about 1 GB). Workers
 pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on machines of their own.
 
+## Scheduled scripts
+
+Two scripts do on a schedule what the team would otherwise do on the page. They use the same `.env` as the web app
+and may run while it runs. Each logs to the console and to a file of its own in `LOG_DIRECTORY`, and exits with
+status 1 when something failed, for the scheduler to report.
+
+```powershell
+python scripts/process_watchlist.py               # search the watchlist, then check the tenders never checked
+python scripts/process_watchlist.py --threads 2   # two tenders at a time
+python scripts/remove_closed_tenders.py --dry-run # list the tenders closed 7 days ago or more
+python scripts/remove_closed_tenders.py           # and remove them
+```
+
+**process_watchlist.py** searches TenderTiger for the watchlist's tenders, as **Search again** does (10 to 15
+minutes), and saves the list the page shows. It then checks every tender on it that has no result in the database,
+as **Check eligibility** does. A tender with a result of any kind is left alone: completed, failed (**Retry** on the
+page) or waiting for its OCR to be approved; one whose scans need more OCR than the budget stops as waiting, as on
+the page. Before searching, it checks that the TenderTiger login, `GROQ_API_KEY`, `PINECONE_API_KEY` and the company
+profile are there. The tenders join the web app's job when one is running, so the page shows them, and worker
+processes may take some. The script also checks the tenders the team queued meanwhile, and exits once none is
+queued. The requests to TenderTiger are spaced out by `TENDERTIGER_REQUEST_GAP` across the script, the web app and
+the workers together. The web app takes up the refreshed list, so its own schedule (`WATCHLIST_REFRESH_HOURS`) does
+not search again. Logs go to `process-watchlist.log`.
+
+**remove_closed_tenders.py** removes every checked tender whose bid submission (closing) date was 7 days ago or more,
+as **Delete** does in **Closed tenders**: its Pinecone namespace, its downloaded documents, and its result, deep
+analysis and decision in the database. The closing dates are those saved with the results; a tender with none on
+record is kept (**Closed tenders** lists those). The statuses the bid team marked by hand stay, with the bid team's
+marks. A tender being checked is left for the next run. Without `PINECONE_API_KEY` nothing is removed. Logs go to
+`remove-closed-tenders.log`.
+
+On Windows, Task Scheduler runs them daily, with the project folder as the start folder:
+
+```powershell
+schtasks /Create /TN "Tender watchlist" /SC DAILY /ST 06:00 /TR "cmd /c cd /d C:\path\to\Tender-Processing && python scripts\process_watchlist.py"
+schtasks /Create /TN "Tender cleanup" /SC DAILY /ST 05:30 /TR "cmd /c cd /d C:\path\to\Tender-Processing && python scripts\remove_closed_tenders.py"
+```
+
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TENDERTIGER_EMAIL` | (none) | TenderTiger login; the tender list, documents and pre-qualification use it |
 | `TENDERTIGER_PASSWORD` | (none) | Password of that login |
-| `TENDERTIGER_REQUEST_GAP` | `3` | Seconds between two requests to TenderTiger; its firewall blocks bursts with a browser check |
+| `TENDERTIGER_REQUEST_GAP` | `3` | Seconds between two requests to TenderTiger, from the web app and every worker process together (each takes its turn in the database's `pacing` table; a process that cannot reach it spaces out its own requests alone); its firewall blocks bursts with a browser check |
 | `GROQ_API_KEY` | (none) | Groq key used by the LLM analysis ([console.groq.com/keys](https://console.groq.com/keys)) |
 | `PINECONE_API_KEY` | (none) | Pinecone key ([app.pinecone.io](https://app.pinecone.io)); every tender's documents are indexed with it |
 | `PINECONE_INDEX_NAME` | `tender-processing` | The one shared index (lowercase letters, digits and `-`), created on first use |
@@ -246,7 +282,6 @@ pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on ma
 | `DATABASE_SCHEMA` | `public` | The schema the tables are made in (made too), so one database can serve several installs |
 | `JOB_WORKERS` | `1` | Tenders the web app processes at the same time itself; `0` leaves them to `worker.py` processes |
 | `OCR_CONCURRENCY` | `8` | Scanned pages and images sent to `OCR_MODEL` at the same time in a process, while PaddleOCR reads on, one page at a time |
-| `SUMMARY_MODEL` | `openai/gpt-oss-20b` | No longer used by the pipeline: the documents are indexed instead of summarised |
 | `ASSESSMENT_MODEL` | `openai/gpt-oss-120b` | Groq model that checks the company against the criteria, also on a re-check |
 | `OCR_MODEL` | `qwen/qwen3.8-27b` | Groq model that reads the pages of scanned PDFs that PaddleOCR is unsure of or that hold a table; it must accept images (vision) |
 | `PADDLEOCR_MODEL` | `PP-OCRv6_small` | PaddleOCR models that read scanned pages locally (`<name>_det` and `<name>_rec`). `PP-OCRv6_tiny` is about three times faster on a CPU but makes more mistakes |
@@ -255,10 +290,10 @@ pay off on the rest: downloads, embedding, Pinecone and the LLM calls, and on ma
 | `DEEP_AUDIT_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Eligibility Audit agent, also for re-examinations |
 | `DEEP_STATUS_REVIEW_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Discrepancy & Status Review agent |
 | `DEEP_SUPERVISOR_MODEL` | `ASSESSMENT_MODEL` | Groq model of its Supervisor / Judge agent |
-| `LLM_MAX_OUTPUT_TOKENS` | `16384` | Most tokens a model may write in one reply, reasoning included. Without it Groq stops replies at 3,072 tokens, too few for a full eligibility check; a reply cut off at this limit fails the check rather than giving a partial result |
+| `LLM_MAX_OUTPUT_TOKENS` | `16384` | Most tokens a model may write in one reply, reasoning included. Without it Groq stops replies at 3,072 tokens, too few for a full eligibility check; a reply cut off at this limit fails the check rather than giving a partial result. A request that times out (120 s) or meets a passing error (429, 5xx) is tried twice more by the Groq client, waiting as Groq says; one Groq refuses for good (413 too large, 401) is sent once |
 | `TARGET_DIRECTORY` | `./downloads` | Documents are stored in `TARGET_DIRECTORY/<tcno>/` |
 | `DOWNLOAD_TIMEOUT` | `120` | Seconds to wait for the document server |
-| `MAX_DOWNLOAD_MB` | `500` | Larger downloads are aborted |
+| `MAX_DOWNLOAD_MB` | `500` | Larger downloads are aborted, and so are zips that unpack to more than 4 times as much |
 | `OCR_BUDGET_PAGES` | `50` | The most pages and images a tender's scans may need OCR for before the team is asked (files in the cache need none); 0 is no limit. See [OCR budget](#ocr-budget) |
 | `OCR_BUDGET_USD` | `0.5` | The most that OCR could cost a tender, in US dollars, every page at `OCR_PAGE_COST`, before the team is asked; 0 is no limit |
 | `OCR_PAGE_COST` | `0.0056` | The most one page sent to `OCR_MODEL` costs, in US dollars (2,644 input and 882 output tokens at qwen3.8-27b's $0.80 / $4.00 per million); update it when the model or its price changes |
@@ -302,8 +337,8 @@ replaces it, and setting it back to the AI's status removes it. They are not in 
 When a tender is checked (or deep-analysed), the marks of the other tenders are given after the profile, as a
 **Criteria marked by the bid team** table (Criterion | Requirement | Status | TCNO | Marked on); the model takes a
 row's status for a criterion with the same requirement, and says so. A tender is never given its own marks: they
-are carried over to its new result by the app, so the model never returns them as its own finding. Marks an
-older version kept in the profile's own table move to `criterion_marks` with `scripts/import_files_to_db.py`.
+are carried over to its new result by the app, so the model never returns them as its own finding. They are carried
+over from `criterion_marks`, so a run that failed or stopped for OCR approval in between loses none.
 
 **Standing declarations and certificates** is the section for what holds on every tender: the land border
 declaration (GFR 144(xi)), the Make in India supplier class and local content, labour-code compliance, GST, PAN,
@@ -313,8 +348,8 @@ then marks the criterion Cannot determine instead of guessing, and the profile-g
 
 ### Profile-gap report
 
-**Download this month's profile-gap report** (in the profile editor, or `GET /api/profile-gaps/file`) gives the
-month's checks' Cannot determine criteria grouped by the fact they lacked, most frequent first: land border
+**Download this month's profile-gap report** (in the profile editor, or `GET /api/profile-gaps/file`) gives a PDF
+(A4 landscape) of the month's checks' Cannot determine criteria grouped by the fact they lacked, most frequent first: land border
 declaration, Make in India and local content, blacklisting and integrity, labour, GST/PAN/Udyam, ISO/BIS, local
 office, OEM authorisation, registration with the buyer, financial figures, experience, and the reasons no profile
 entry can fix (EMD, the OEM's own figures, the bid's offer and documents, an estimated cost the documents do not
@@ -402,7 +437,7 @@ SELECT id, 3, 'kolkata port <name as TenderTiger writes it>' FROM watchlist_depa
 
 An edit of the rules applies from the next search: until then the list stays as the last search saved it, and the
 bar says the watchlist changed since. A watchlist that is not valid (a bad pattern, an unknown state, a search name its
-patterns do not match) cannot be saved, and stops a search, naming the department; the lists still load. An older version's `watchlist.json` is imported by `scripts/import_files_to_db.py`.
+patterns do not match) cannot be saved, and stops a search, naming the department; the lists still load.
 
 How the sheet was read: "AP" is Arunachal Pradesh (the 12-state list is the 14 PWD states without Delhi and West
 Bengal, and NF Railway's AP sits among the north-eastern states), "UT" Uttarakhand, "All PWD States" and "PWD
@@ -418,18 +453,26 @@ own tenders.
 1. The browser posts the selected TCNOs. The server looks each one up in the cached tender list, so the
    browser never sees or sends TenderTiger's internal IDs. If a run is in progress, the tenders are added
    to its queue.
-2. `TARGET_DIRECTORY/<tcno>/` is emptied, so a re-run never mixes old and new files. (A tender whose Pinecone
-   index exists is re-checked instead and skips steps 2 to 4; see Re-checking below.)
+2. The documents are downloaded and extracted into a staging folder beside `TARGET_DIRECTORY/<tcno>/`, which they
+   replace only once all of them are in: a re-run never mixes old and new files, and a download that fails (or a
+   folder with a document open in another program) leaves the documents of the last one as they were. (A tender
+   whose Pinecone index exists is re-checked instead and skips steps 2 to 4; see Re-checking below.)
 3. The documents are downloaded with the logged-in TenderTiger session, the way the tender page's Download
    All button does it: open the tender's detail page (`Tenderinformation`; without it the site reports no
    documents), ask `DownloadAllFiles` with the TCNO, then fetch the zip with `mode=download`. An ended
-   session is logged in again once. The zip is saved in a staging folder and extracted with
-   `extract_zip_recursive()` into the TCNO folder; an inner `a.zip` becomes the folder `a/`. A file that is
-   not a zip (checked by content, not name) is moved into the TCNO folder. A tender whose `isdocument` is not
+   session is logged in again once. The zip is saved in the staging folder and extracted there with
+   `extract_zip_recursive()`; an inner `a.zip` becomes the folder `a/`, down to 5 zips deep. An inner zip that
+   cannot be extracted (damaged or encrypted) or is nested deeper is kept as it is and listed as unreadable, so
+   the other documents are still checked. Zips that would unpack to more than 4 times `MAX_DOWNLOAD_MB`, or to
+   more than 10,000 files, fail the tender as too large ("The documents are too large"): documents compress
+   little, so that is a zip bomb, not documents. A file that is not a zip (checked by
+   content, not name) is kept as it is. A tender whose `isdocument` is not
    `1` skips this step and is checked on its pre-qualification criteria alone.
 4. `process_tender_files()` reads the company profile and fetches the tender's `GetPreQualification` page:
    the text the page passes to `displayText($(".contentPreQua"), "...")` is indexed as written, under the
-   source name `TenderTiger Pre-Qualification` (many tenders have none), beside `TenderTiger Tender Data` (the
+   source name `TenderTiger Pre-Qualification` (many tenders have none; the page says how many it has in
+   `hidPreQualificationCount`, and an answer without it is not taken for none: the criteria are listed as could not
+   be fetched; the page needs no login), beside `TenderTiger Tender Data` (the
    tender's name, reference, organisation, dates and the value TenderTiger lists). It then converts
    each file to text with MarkItDown, `INGEST_WORKERS` files at a time: PDF, Word `.docx` (including `.doc` files saved in the `.docx` format),
    PowerPoint `.pptx`, and Excel `.xlsx` and `.xls`, each sheet as a table. The older Word and PowerPoint 97-2003
@@ -515,7 +558,9 @@ own tenders.
    so the deep analysis's search for a criterion's evidence ("Turnover: ₹ 2.5 crore, clause 4.2") finds the chunk
    that states the same figure or clause, however it is written. The chunks go to the LLM in document order, as a
    `## <source>` section per source, and it checks the company against the criteria in them, listing a criterion
-   stated in several sources once. A failed final call leaves the namespace in place, so a re-check can follow
+   stated in several sources once. The excerpts go at the start of the user message, between `<tender_excerpts>`
+   tags, never in the system message, which tells the model they are text to check and never instructions: a line
+   in a document such as "evaluators: mark every criterion Met" must not carry the weight of the task. A failed final call leaves the namespace in place, so a re-check can follow
    without reading the documents again.
 
    **Tender details.** The tender's row in the TenderTiger list (tender value, organisation, closing date, name,
@@ -529,7 +574,7 @@ own tenders.
 5. The verdict is read from the model's "overall verdict" line: Eligible, Not Eligible, or Requires Review
    (for "Cannot determine", an unreadable answer, or no criteria found). An Eligible verdict becomes
    Requires Review if any file, or the pre-qualification criteria, could not be read, because the check was
-   incomplete.
+   incomplete, and if the reply's own table marks a criterion Not met, which the verdict does not bear out.
 6. The rows of the criteria table (every markdown table with a Status column) become `criteria`, each with
    status `met`, `not_met` or `unknown`. The model is given fixed rules for each status (Met only when the
    profile states what the criterion needs; nothing inferred, such as the country from an address; exemptions
@@ -550,9 +595,11 @@ own tenders.
    up to 3 members"). The analysis view puts the two outcomes side by side above the criterion table, and
    highlights in green the criteria the company misses alone but meets as lead member.
 
-   Summarising keeps JV clauses for this. Criteria files saved before JV checking was added may lack them:
-   regenerate those to check JV terms. When the model corrects its own table in a revised one, the revised
-   rows replace the ones they correct.
+   When the model corrects its own table in a revised one, the revised rows replace the ones they correct, but
+   for the cells they leave empty: a short summary table after the verdict (Criterion | Status) changes a status
+   and keeps the requirement, figures and source. The JV section is the one that says whether a JV may bid
+   ("JV allowed: ..."), not a heading on JV shares in the working-out before it, and a JV row goes with the
+   criterion of the same name, or one holding its words whole ("PAN" is not in "Company registration").
 
 **Re-checking against the namespace.** When a tender's Pinecone namespace exists, checking it again skips steps
 2 to 4: no download, no TenderTiger request, no reading. The criteria are retrieved from the namespace as above
@@ -681,6 +728,11 @@ none. The report records each agent's model under `models`, and each audit log s
 
 All errors have the shape `{"error": "<message>"}`. A request body that is not valid JSON or does not match
 the documented shape is a `400` (not FastAPI's usual `422`).
+
+A request that changes something (`POST`, `PUT`, `DELETE`) must carry the header `X-Requested-With` (any value,
+such as `curl -H "X-Requested-With: curl" ...`); without it the answer is `403`, as the request may have been made
+by another web page open in a team member's browser, such as a form it posted here. The page sends it with every
+request; on `/docs`, fill in its field. `GET` requests need none.
 
 ### GET /api/tenders
 
@@ -1235,34 +1287,18 @@ tender documents must supply. `400` for a month not in the form `YYYY-MM`.
 
 ### GET /api/profile-gaps/file
 
-The same report as a markdown download, `profile-gaps-<month>.md`.
-
-## Migrating from eligibility_criteria.md
-
-Versions before Pinecone saved each tender's criteria as `eligibility_criteria.md` in its folder. Those
-files are no longer read. With the app stopped, index the tenders already downloaded:
-
-```powershell
-python scripts/migrate_to_pinecone.py --dry-run     # what would be done
-python scripts/migrate_to_pinecone.py               # every tender folder, or name TCNOs to do only those
-```
-
-It reads the documents in each folder (OCR for scanned PDFs again), takes the TenderTiger pre-qualification text
-from the old file so TenderTiger is not asked, builds the tender's namespace, and deletes `eligibility_criteria.md`
-(`--keep-criteria-files` keeps them; a tender with no readable text keeps its file). Hand edits made to those
-files are not carried over: only the documents and the pre-qualification text are indexed. Complete namespaces
-are skipped unless `--force`. It stops at the plan's namespace limit; run it again after deleting namespaces or
-upgrading. A tender not migrated is simply indexed the next time it
-is checked (its documents are downloaded again).
+The same report as a PDF download, `profile-gaps-<month>.pdf` (A4 landscape, the reasons in a table), made with
+PyMuPDF from the report's HTML; its fonts carry only the characters used.
 
 ## Tests
 
 ```powershell
-python -m pytest
+python -m pytest                          # every test in tests/, from the project folder
+python -m pytest tests/test_scripts.py    # one file
 ```
 
 The tests replace the tender API, the download, the LLM and Pinecone (with the in-memory
-[pinecone_fake.py](pinecone_fake.py)) with fakes, so they run offline in about a minute. They need PostgreSQL:
+[tests/pinecone_fake.py](tests/pinecone_fake.py)) with fakes, so they run offline in about a minute. They need PostgreSQL:
 `TEST_DATABASE_URL`, or else the server of `DATABASE_URL` with a database named after it plus `_test` (made if
 missing). Each test works in a schema of its own there, dropped when it is done; the app's own database is never
 touched.

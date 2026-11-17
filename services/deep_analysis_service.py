@@ -32,7 +32,6 @@ import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 
-from ext import DEEP_AUDIT_MODEL, DEEP_PROFILER_MODEL, DEEP_STATUS_REVIEW_MODEL, DEEP_SUPERVISOR_MODEL, make_model
 from psycopg.types.json import Json
 
 from services.analysis_service import (QUALIFICATION_SECTION, REQUIRES_REVIEW, TokenUsage,
@@ -41,6 +40,7 @@ from services.company_service import parse_profile
 from services.pinecone_service import NamespaceIncomplete, VectorStoreError
 from services.processing_service import TenderBusy, explain_error
 from utils.files import safe_name
+from utils.llm import DEEP_AUDIT_MODEL, DEEP_PROFILER_MODEL, DEEP_STATUS_REVIEW_MODEL, DEEP_SUPERVISOR_MODEL, make_model
 
 log = logging.getLogger(__name__)
 
@@ -52,7 +52,7 @@ AGENT_TITLES = {
 }
 # The agents that call the LLM, whose tokens are counted
 LLM_AGENTS = AGENTS[1:]
-# The Groq model each of them runs on, set in .env (DEEP_PROFILER_MODEL and so on; see ext.py)
+# The Groq model each of them runs on, set in .env (DEEP_PROFILER_MODEL and so on; see utils/llm.py)
 AGENT_MODELS = {'profiler': DEEP_PROFILER_MODEL, 'audit': DEEP_AUDIT_MODEL, 'status_review': DEEP_STATUS_REVIEW_MODEL,
                 'supervisor': DEEP_SUPERVISOR_MODEL}
 # How many times the supervisor may send disputed criteria back to the audit agent, and how many criteria a time

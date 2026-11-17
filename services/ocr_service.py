@@ -19,7 +19,7 @@ from concurrent.futures import wait as wait_for
 import numpy as np
 import pymupdf
 
-from ext import OCR_MODEL
+from utils.llm import OCR_MODEL
 
 log = logging.getLogger(__name__)
 

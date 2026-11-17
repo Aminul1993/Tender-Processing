@@ -251,12 +251,11 @@
             <button type="button" class="sort-button" data-sort="closing">Closes <i class="bi sort-arrow" aria-hidden="true"></i></button>
           </th>
           <th scope="col" role="columnheader">Eligibility</th>
-          <th scope="col" role="columnheader"><span class="visually-hidden">Drop</span></th>
         </tr>
       </thead>
       <tbody id="tender-body" role="rowgroup">
         <tr class="message-row" role="row">
-          <td colspan="7" role="cell">
+          <td colspan="6" role="cell">
             <span class="spinner-border spinner-border-sm me-2" aria-hidden="true"></span> Loading tenders…
           </td>
         </tr>
@@ -473,9 +472,9 @@
       <div class="modal-header align-items-start">
         <div class="details-heading">
           <h2 class="details-title" id="company-title">Company profile</h2>
-          <p class="details-facts" id="company-help">Every tender is checked against these details and nothing else. Keep figures
+          <p class="details-facts">Every tender is checked against these details and nothing else. Keep figures
             exact; a criterion whose figure is missing becomes Needs review.
-            <a href="/api/profile-gaps/file" download>Download this month's profile-gap report</a>: what the checks
+            <a href="/api/profile-gaps/file" download>Download this month's profile-gap report (PDF)</a>: what the checks
             most often could not find here.</p>
         </div>
         <button type="button" class="icon-button" data-bs-dismiss="modal" aria-label="Close">

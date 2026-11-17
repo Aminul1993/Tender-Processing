@@ -87,7 +87,7 @@ sequenceDiagram
     P->>S: reset_namespace(tcno)
     S->>PC: create the index if missing, delete_all in tcno-<tcno>, upsert manifest {status: building}
     Note over S,PC: the namespace limit is checked here, before any download or OCR
-    P->>TT: download documents (folder emptied first)
+    P->>TT: download documents (they replace the folder once all are in)
     P->>A: process_tender_files(folder, index, tender)
     A->>TT: pre-qualification text
     A->>A: read_documents (parallel; PaddleOCR a page at a time, vision pages 8 at a time)
@@ -157,7 +157,8 @@ Regenerating keeps what has not changed, in the namespace and in the cache:
    keeps its chunks: its manifest is rewritten as `building` and `kept`, so it no longer counts as complete. Any
    other is emptied. It fails here, before any download, if the plan has no room. The manifest write is waited on
    until searches see it, so `ingest` reads this manifest back, never the one before.
-2. The folder is emptied and the documents are downloaded again.
+2. The documents are downloaded again; they replace the folder only once all are in, so a failed download leaves
+   the last ones.
 3. The documents are read again. A file unchanged to the byte comes from the text cache; a page or image whose
    rendered image was read before comes from the page cache (a file whose OCR failed on some pages, or a reissued
    scan, has only the other pages read).
@@ -213,8 +214,8 @@ recorded, with a warning. Report version 3: `inputs.criteria_source` is `Pinecon
 | Errors | none | `503` without `PINECONE_API_KEY`, `502` when Pinecone fails (`{"error": ...}` as before) |
 | Deep analysis report | `version: 2` | `version: 3`, with `inputs.excerpts` |
 
-Results saved in files by an older version lose `criteria_file` (or the `index_name` of the brief index-per-tender
-version) when `scripts/import_files_to_db.py` moves them into the database.
+Results saved in files by an older version lost `criteria_file` (or the `index_name` of the brief index-per-tender
+version) when an import script, since removed, moved them into the database.
 
 ## Files changed
 
@@ -226,18 +227,19 @@ version) when `scripts/import_files_to_db.py` moves them into the database.
 | `services/deep_analysis_service.py` | `load_knowledge()` from the namespace replaces the criteria file; report version 3 |
 | `routes/api.py` | `has_indexed_criteria`, `GET /api/namespace/{tcno}` (and a `DELETE`, since removed), `VectorStoreError` handler |
 | `app.py`, `config.py`, `.env.example` | Service from config; `PINECONE_API_KEY`, `PINECONE_INDEX_NAME`, `PINECONE_NAMESPACE_PREFIX=tcno-` and tuning settings |
-| `ext.py` | The assessment prompt speaks of retrieved excerpts |
+| `ext.py` (now `utils/llm.py`) | The assessment prompt speaks of retrieved excerpts |
 | `static/js/app.js`, `templates/index.html` | `has_indexed_criteria` / `namespace`, and wording |
 | `utils/logging_setup.py` | Quiets the Pinecone SDK's per-request INFO logs |
-| `scripts/migrate_to_pinecone.py` | **New.** One-off migration |
-| `pinecone_fake.py`, `test_pinecone_service.py`, `test_app.py` | In-memory Pinecone (namespaces, LSNs, quotas), 30 service tests, analysis and API tests on namespaces |
+| `scripts/migrate_to_pinecone.py` | **New.** One-off migration; since removed, once it had run |
+| `tests/pinecone_fake.py`, `tests/test_pinecone_service.py`, `tests/test_app.py` | In-memory Pinecone (namespaces, LSNs, quotas), 30 service tests, analysis and API tests on namespaces |
 | `requirements.txt` | `pinecone==10.3.0` |
 
 ## Migration plan
 
 1. **Deploy** with `PINECONE_API_KEY` in `.env` and stop the app. The shared index already exists in the project
    (made by the live test, empty). Otherwise the first build creates it.
-2. **Dry run:** `python scripts/migrate_to_pinecone.py --dry-run`, then run it for real. It reads the documents
+2. **Dry run:** `python scripts/migrate_to_pinecone.py --dry-run`, then run it for real (the script has since been
+   removed: a tender not migrated is indexed when next checked). It reads the documents
    already on disk and takes the pre-qualification text from the old `eligibility_criteria.md`, so no TenderTiger
    request is made. It builds each namespace, then deletes the `.md` file. A tender with no readable text keeps
    its file. Scanned PDFs are OCR'd again: PaddleOCR locally, and Groq tokens for their unsure and table pages. Complete namespaces are skipped, so the script

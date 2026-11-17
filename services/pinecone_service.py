@@ -176,18 +176,12 @@ class Retrieval:
         return sections
 
 
-def split_pieces(text, max_chars):
-    """
-    Splits text into pieces of at most max_chars, each ending at a paragraph break, else a line break, else a space
-    found in the second half of the piece, so a piece is never cut short by a break near its start nor ends mid-word
-    (unless a single word is longer than max_chars).
-    """
-    text = text.strip()
-    return [text[start:end] for start, end in _piece_spans(text, max_chars)]
-
-
 def _piece_spans(text, max_chars):
-    """split_pieces() of text, already stripped, as the (start, end) of each piece in it."""
+    """
+    Splits text, already stripped, into pieces of at most max_chars, each ending at a paragraph break, else a line
+    break, else a space found in the second half of the piece, so a piece is never cut short by a break near its start
+    nor ends mid-word (unless a single word is longer than max_chars). Returns the (start, end) of each piece in text.
+    """
     spans, start = [], 0
     while start < len(text):
         end = min(start + max_chars, len(text))
@@ -207,7 +201,7 @@ def _piece_spans(text, max_chars):
 
 def chunk_text(text, size=1600, overlap=200):
     """
-    Splits text into chunks of about size characters (see split_pieces()). Each chunk after the first starts with
+    Splits text into chunks of about size characters (see _piece_spans()). Each chunk after the first starts with
     the last overlap characters of the one before (from a word boundary), so a criterion split across two chunks is
     whole in one of them. Returns [(chunk, overlap)], where overlap is the number of leading characters the chunk
     repeats from the previous one.
@@ -792,7 +786,9 @@ class PineconeService:
         built or left half-built. Raises VectorStoreError when Pinecone cannot be reached.
         """
         namespace = self.namespace(tcno)
-        if namespace not in self.namespaces():
+        # Listed afresh before it is taken as missing: the list kept here can be up to cache_seconds old, and another
+        # process (a worker) may have built the namespace since
+        if namespace not in self.namespaces() and namespace not in self.namespaces(refresh=True):
             return None
         try:
             found = self._read_manifest(namespace, ('complete',))

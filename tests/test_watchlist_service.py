@@ -7,6 +7,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import psycopg
 from fastapi.testclient import TestClient
 
 from app import create_app
@@ -15,7 +16,7 @@ from services import tender_service, watchlist_service
 from services.company_service import CompanyStore
 from services.watchlist_service import (Watchlist, WatchlistError, WatchlistMissing, WatchlistRunner, read_rules,
                                         save_rules)
-from test_database import scratch_database
+from tests.test_database import scratch_database
 
 TODAY = date.today()
 
@@ -73,7 +74,7 @@ class WatchlistRulesTest(unittest.TestCase):
 
     def test_the_rules_are_kept_in_departments_with_their_names_as_children(self):
         db = scratch_database(self)
-        with self.assertRaisesRegex(WatchlistMissing, 'watchlist_departments'):
+        with self.assertRaisesRegex(WatchlistMissing, 'add its departments with Edit watchlist'):
             Watchlist.load(db)
         rules = {**RULES, 'about': 'From the sheet', 'min_value_cr': 25,
                  'departments': [{**RULES['departments'][0], 'min_value_cr': 2}, *RULES['departments'][1:]]}
@@ -136,6 +137,7 @@ class WatchlistRulesTest(unittest.TestCase):
             ({'states': ['West Bengali']}, "'West Bengali' is neither a state nor a state group"),
             ({'organisations': ['^eastern (railway']}, 'is not a valid regular expression'),
             ({'search': ['south eastern railway']}, "the search name 'south eastern railway' matches none"),
+            ({'search': ["eastern railway's office"]}, 'leave the apostrophe out of the search name'),
             ({'states': []}, 'must be "any" or a list'),
             ({'name': ''}, 'with a "name"'),
         ]:
@@ -145,6 +147,8 @@ class WatchlistRulesTest(unittest.TestCase):
             self.assertIn('the watchlist, department 1', str(raised.exception))
         with self.assertRaisesRegex(WatchlistError, 'the watchlist, filters, closing_from'):
             self.load({**RULES, 'filters': {'closing_from': 'soon'}})
+        with self.assertRaisesRegex(WatchlistError, "Leave the apostrophe out of \"collector's office\""):
+            self.load({**RULES, 'filters': {'word': "collector's office"}})
 
 
 class WatchlistRunnerTest(unittest.TestCase):
@@ -176,7 +180,7 @@ class WatchlistRunnerTest(unittest.TestCase):
     def refresh(self, runner):
         runner.start()
         deadline = time.monotonic() + 5
-        while runner.running() and time.monotonic() < deadline:
+        while runner.status()['status'] == 'running' and time.monotonic() < deadline:
             time.sleep(0.01)
         return runner.status()
 
@@ -218,6 +222,19 @@ class WatchlistRunnerTest(unittest.TestCase):
             self.assertEqual(runner.page(page_size=20)[1], 5)
         with self.assertRaisesRegex(ValueError, 'Show 20, 50, 100 or 500'):
             runner.page(page_size=30)
+
+    def test_by_value_tenders_with_no_value_or_another_currency_come_last(self):
+        runner = self.runner()
+        er = {'sl': 1, 'name': 'ER'}
+        rows = [(dict(tender(1, 'Eastern Railway', 'Bihar', closes=1, value='0')), er),  # TenderTiger's "no value"
+                (dict(tender(2, 'Eastern Railway', 'Bihar', closes=2, value='50000000'), currcode='usd'), er),
+                (dict(tender(3, 'Eastern Railway', 'Bihar', closes=3, value='20000000'), currcode='inr'), er),
+                (dict(tender(4, 'Eastern Railway', 'Bihar', closes=4, value='9000000')), er)]
+        watchlist_service.save_list(self.db, rows, '2026-11-17T06:00:00+00:00')
+
+        for order, expected in (('asc', ['4', '3', '1', '2']), ('desc', ['3', '4', '1', '2'])):
+            tenders, _ = runner.page(page_size=20, sort='value', order=order)
+            self.assertEqual([t['tcno'] for t in tenders], expected, order)
 
     def test_an_edited_watchlist_applies_at_the_next_search(self):
         runner = self.runner()
@@ -270,15 +287,53 @@ class WatchlistRunnerTest(unittest.TestCase):
             status = self.refresh(runner)
         self.assertEqual((status['status'], status['error'], status['tenders']), ('failed', 'firewall', 5))
 
+    def test_a_refresh_whose_list_cannot_be_saved_is_failed_not_completed(self):
+        runner = self.runner()
+        before = self.refresh(runner)
+        rules = json.loads(json.dumps(RULES))
+        rules['departments'][0]['states'] = ['Bihar']
+        save_rules(self.db, rules)
+        with mock.patch.object(watchlist_service, 'save_list', side_effect=psycopg.OperationalError('server closed')), \
+                self.assertLogs('services.watchlist_service', 'ERROR'):
+            status = self.refresh(runner)
+
+        self.assertEqual(status['status'], 'failed')
+        self.assertEqual(status['error'], 'The tenders found could not be saved in the database: server closed')
+        # The list is the last one saved, and not taken as searched with the new rules nor as refreshed just now
+        self.assertEqual((status['tenders'], status['refreshed_at'], status['changed']),
+                         (5, before['refreshed_at'], True))
+
+    def age(self, refreshed_hours=None):
+        """As if the last refresh started RETRY_SECONDS ago, and, given refreshed_hours, finished that long ago."""
+        started = datetime.now(timezone.utc) - timedelta(seconds=watchlist_service.RETRY_SECONDS + 1)
+        self.db.set_value(watchlist_service.SEARCHED, {'started_at': started.isoformat()})
+        if refreshed_hours is not None:
+            refreshed = self.db.value(watchlist_service.REFRESHED)
+            refreshed['refreshed_at'] = (datetime.now(timezone.utc) - timedelta(hours=refreshed_hours)).isoformat()
+            self.db.set_value(watchlist_service.REFRESHED, refreshed)
+
     def test_the_schedule_refreshes_an_old_or_missing_list_and_waits_after_a_failure(self):
         runner = self.runner()
         self.assertTrue(runner.due())  # never refreshed
         self.refresh(runner)
         self.assertFalse(runner.due())
-        runner._refreshed_at = (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(timespec='seconds')
-        runner._attempted_at -= timedelta(seconds=watchlist_service.RETRY_SECONDS)
+        self.age(refreshed_hours=25)
         self.assertTrue(runner.due())
         self.assertIsNone(WatchlistRunner(self.db, refresh_hours=0).schedule())
+
+    def test_a_refresh_another_process_made_is_taken_up(self):
+        app = self.runner()  # the web app, its list 25 hours old
+        self.refresh(app)
+        self.age(refreshed_hours=25)
+        self.assertTrue(app.due())
+        before = app.status()['refreshed_at']
+        script = self.runner()  # scripts/process_watchlist.py, searching meanwhile
+        self.assertEqual(script.start(wait=True)['status'], 'completed')
+
+        # The app shows when the script refreshed the list, and its schedule does not search again
+        self.assertNotEqual(app.status()['refreshed_at'], before)
+        self.assertEqual(app.status()['refreshed_at'], script.status()['refreshed_at'])
+        self.assertFalse(app.due())
 
     def test_a_restart_during_a_refresh_does_not_start_another_at_once(self):
         with mock.patch('services.tender_service.tender_list', side_effect=RuntimeError('the app was stopped')):
@@ -286,7 +341,7 @@ class WatchlistRunnerTest(unittest.TestCase):
         self.assertEqual(status['refreshed_at'], None)
         restarted = self.runner()
         self.assertFalse(restarted.due())
-        restarted._attempted_at -= timedelta(seconds=watchlist_service.RETRY_SECONDS)
+        self.age()
         self.assertTrue(restarted.due())
 
 
@@ -314,7 +369,7 @@ class WatchlistApiTest(unittest.TestCase):
         self.addCleanup(patch.stop)
         tender_service._tenders.clear()
         self.addCleanup(tender_service._tenders.clear)
-        self.client = TestClient(create_app(TestConfig))
+        self.client = TestClient(create_app(TestConfig), headers={'X-Requested-With': 'test'})  # as the page
 
     def wait_for_refresh(self):
         deadline = time.monotonic() + 5
@@ -327,7 +382,7 @@ class WatchlistApiTest(unittest.TestCase):
 
     def test_without_a_watchlist_the_list_still_loads(self):
         self.assertEqual(self.client.get('/api/watchlist').json()['total'], 0)
-        self.assertIn('watchlist_departments', self.client.post('/api/watchlist/refresh').json()['error'])
+        self.assertIn('Edit watchlist', self.client.post('/api/watchlist/refresh').json()['error'])
         with mock.patch('services.tender_service.tender_list', return_value={'TenderList': self.listed}):
             rows = self.client.get('/api/tenders').json()['tenders']
         self.assertEqual([row['watchlist'] for row in rows], [None, None, None])

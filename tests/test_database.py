@@ -1,19 +1,15 @@
 """
-Tests of the database's job state and of the import of an older version's files. Also gives every test that needs
-the database one of its own: scratch_database().
+Tests of the database's job state, pacing and company profile. Also gives every test that needs the database one of
+its own: scratch_database().
 
 The tests use TEST_DATABASE_URL, or DATABASE_URL's server with the database <name>_test (made if missing), never the
 app's own database. Each test gets a schema of its own there, dropped once it is done.
 """
-import json
 import os
-import sqlite3
-import tempfile
+import threading
 import time
 import unittest
 import uuid
-from contextlib import closing
-from pathlib import Path
 
 import psycopg
 from dotenv import load_dotenv
@@ -22,12 +18,9 @@ from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 load_dotenv()
 
-from services.cache_service import Cache  # noqa: E402
 from services.company_service import CompanyStore  # noqa: E402
 from services.database import Database  # noqa: E402
-from services.decision_service import DecisionStore  # noqa: E402
 from services.job_state import JobState  # noqa: E402
-from services.watchlist_service import load_list  # noqa: E402
 
 _test_url = None
 
@@ -108,6 +101,34 @@ class JobStateTest(unittest.TestCase):
         self.assertEqual(self.state.result('1'), {'tcno': '1', 'verdict': 'Eligible'})
 
 
+class PacingTest(unittest.TestCase):
+    def test_turns_are_spaced_out_across_processes(self):
+        db = scratch_database(self)
+        other = Database(db.url, db.schema)  # another process's connections to the same database
+        self.addCleanup(other.pool.close)
+        turns, lock = [], threading.Lock()
+
+        def take_turn(database):
+            wait = database.pace('tendertiger', 0.5)
+            with lock:
+                turns.append(time.monotonic() + wait)  # when its turn comes
+
+        threads = [threading.Thread(target=take_turn, args=(database,)) for database in (db, other, db, other)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        # Asked for at once, each is given a turn of its own, half a second after the one before
+        turns.sort()
+        for before, after in zip(turns, turns[1:]):
+            self.assertAlmostEqual(after - before, 0.5, delta=0.05)
+        # Once the last turn is past, the next is now
+        with db.connection() as connection:
+            connection.execute("UPDATE pacing SET next_at = now() - interval '1 second'")
+        self.assertEqual(other.pace('tendertiger', 0.5), 0)
+
+
 class CompanyStoreTest(unittest.TestCase):
     def test_marks_are_kept_apart_from_the_profile_and_given_to_the_other_tenders(self):
         store = CompanyStore(scratch_database(self))
@@ -151,81 +172,6 @@ class CompanyStoreTest(unittest.TestCase):
         self.assertEqual(store.blocks(), [{'type': 'heading', 'level': 1, 'text': 'ACME'}])
         with db.connection() as connection:
             self.assertEqual(connection.execute('SELECT count(*) FROM company_profile_rows').fetchone(), (0,))
-
-
-class ImportFilesTest(unittest.TestCase):
-    """scripts/import_files_to_db.py moves what an older version kept in files into the database, once."""
-
-    def test_the_files_of_an_older_version_are_imported_once(self):
-        from scripts import import_files_to_db as script
-
-        db = scratch_database(self)
-        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(tmp.cleanup)
-        directory = Path(tmp.name)
-        (directory / '100').mkdir()
-        result = {'tcno': '100', 'name': 'ROB', 'status': 'completed', 'verdict': 'Eligible', 'score': 50,
-                  'duration_seconds': 4.2, 'folder': '/old/place/100', 'criteria_file': 'eligibility_criteria.md'}
-        (directory / '100' / 'eligibility_result.json').write_text(json.dumps(result), encoding='utf-8')
-        (directory / '100' / 'deep_analysis.json').write_text(json.dumps(
-            {'tcno': '100', 'status': 'completed', 'final': {'determination': 'Eligible'}}), encoding='utf-8')
-        (directory / '200').mkdir()
-        (directory / '200' / 'eligibility_result.json').write_text('{"tcno": "200"', encoding='utf-8')  # broken
-        (directory / 'company_details.md').write_text(  # with a BOM, and marks in the profile as before
-            '# ACME\n\n---\n\n## Criteria marked by the bid team\n\n'
-            '| Criterion | Requirement | Status | TCNO | Marked on |\n| --- | --- | --- | --- | --- |\n'
-            '| Net worth | 20 Cr | Not met | 100 | 2026-11-11 |\n', encoding='utf-8-sig')
-        (directory / 'watchlist.json').write_text(json.dumps({'filters': {'bid_doc': True}, 'departments': [
-            {'sl': 1, 'name': 'ER', 'organisations': ['^eastern railway'], 'search': ['eastern railway'],
-             'states': 'any'}]}), encoding='utf-8')
-        (directory / 'decisions.json').write_text(json.dumps(
-            {'100': {'decision': 'shortlisted', 'decided_at': '2026-11-05T10:00:00+00:00'}}), encoding='utf-8')
-        (directory / 'watchlist_tenders.json').write_text(json.dumps(
-            {'refreshed_at': '2026-11-16T06:00:00+00:00', 'read_at': '2026-11-16T05:45:00+00:00',
-             'tenders': [{'tcno': '7', 'companyname': 'Eastern Railway'}]}), encoding='utf-8')
-        (directory / 'watchlist_search.json').write_text('{"started_at": "2026-11-16T05:45:00+00:00"}',
-                                                         encoding='utf-8')
-        with closing(sqlite3.connect(directory / 'cache.sqlite3')) as cache, cache:
-            cache.execute('CREATE TABLE texts (sha256 TEXT, reader TEXT, text TEXT, PRIMARY KEY (sha256, reader))')
-            cache.execute("INSERT INTO texts VALUES ('abc', 'reader 1', 'Turnover at least 5 Cr')")
-
-        with self.assertLogs('import_files_to_db', 'WARNING'):
-            self.assertEqual(script.import_results(db, directory), 1)
-        self.assertEqual(script.import_deep_analyses(db, directory), 1)
-        self.assertTrue(script.import_company(db, directory / 'company_details.md'))
-        self.assertEqual(script.import_marks(db), 1)
-        self.assertEqual(script.import_decisions(db, directory / 'decisions.json'), 1)
-        self.assertEqual(script.import_watchlist_rules(db, directory / 'watchlist.json'), 1)
-        self.assertEqual(script.import_watchlist(db, directory / 'watchlist_tenders.json',
-                                                 directory / 'watchlist_search.json'), 1)
-        self.assertEqual(script.import_cache(db, directory / 'cache.sqlite3'), {'texts': 1})
-
-        saved = JobState(db).result('100')
-        self.assertEqual((saved['folder'], 'criteria_file' in saved), (str(directory / '100'), False))
-        self.assertEqual(JobState(db).briefs()['100']['verdict'], 'Eligible')
-        self.assertEqual(DecisionStore(db).all()['100']['decision'], 'shortlisted')
-        # Each with the department the imported rules give it
-        self.assertEqual(load_list(db), ([({'tcno': '7', 'companyname': 'Eastern Railway'},
-                                           {'sl': 1, 'name': 'ER', 'full_name': 'ER', 'sector': '', 'min_value_cr': None})],
-                                         {'refreshed_at': '2026-11-16T06:00:00+00:00', 'rules': None}))
-        self.assertEqual(Cache(db).text('abc', 'reader 1'), 'Turnover at least 5 Cr')
-        self.assertEqual(CompanyStore(db).read(), '# ACME')  # the marks moved out of it
-        self.assertEqual(CompanyStore(db).marks(), [['Net worth', '20 Cr', 'Not met', '100', '2026-11-11']])
-        with db.connection() as connection:
-            self.assertEqual(connection.execute("SELECT report->'final'->>'determination' FROM deep_analyses "
-                                                "WHERE tcno = '100'").fetchone(), ('Eligible',))
-
-        # Run again, nothing is imported twice, and what the app changed since stays
-        DecisionStore(db).mark('100', 'dropped')
-        with self.assertLogs('import_files_to_db', 'WARNING'):
-            self.assertEqual(script.import_results(db, directory), 0)
-        self.assertEqual(script.import_deep_analyses(db, directory), 0)
-        self.assertFalse(script.import_company(db, directory / 'company_details.md'))
-        self.assertEqual(script.import_marks(db), 0)
-        self.assertEqual(script.import_decisions(db, directory / 'decisions.json'), 0)
-        self.assertEqual(script.import_watchlist_rules(db, directory / 'watchlist.json'), 0)
-        self.assertEqual(script.import_cache(db, directory / 'cache.sqlite3'), {'texts': 0})
-        self.assertEqual(DecisionStore(db).all()['100']['decision'], 'dropped')
 
 
 if __name__ == '__main__':

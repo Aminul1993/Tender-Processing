@@ -4,7 +4,7 @@ import logging
 import mimetypes
 from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -17,14 +17,29 @@ from services.decision_service import DecisionNotAllowed, DecisionStore
 from services.deep_analysis_service import DeepAnalysisRunner, DeepAnalysisRunning
 from services.pinecone_service import VectorStoreError, VectorStoreNotConfigured
 from services.processing_service import NoJobRunning, TenderBusy, TenderProcessor
-from services.profile_gap_service import profile_gap_report, report_markdown
+from services.profile_gap_service import profile_gap_report, report_pdf
 from services.tender_service import TenderFilters, TenderServiceError
 from services.watchlist_service import WatchlistError, WatchlistMissing, WatchlistRunner
 from utils.files import safe_name
 
 log = logging.getLogger(__name__)
 
-api = APIRouter(prefix='/api')
+
+def sent_by_the_page(request: Request, x_requested_with: Annotated[str | None, Header(
+        description='Any value: required on a request that changes something (POST, PUT, DELETE)')] = None):
+    """
+    Refuses a request that changes something unless it carries the X-Requested-With header, as the page's requests do
+    (static/js/app.js, api()). A browser sends a header of its own to another site only once that site allows it
+    (CORS), which this app never does; so without it, the request was made by another web page a team member had
+    open, such as a form posted from it, which could otherwise stop the queue, start a watchlist search or delete a
+    tender. Scripts and the API docs page send the header like the page.
+    """
+    if request.method not in ('GET', 'HEAD', 'OPTIONS') and not x_requested_with:
+        raise HTTPException(403, "A request that changes something must come from the app's page: it is sent with "
+                                 'the X-Requested-With header, which this one does not have.')
+
+
+api = APIRouter(prefix='/api', dependencies=[Depends(sent_by_the_page)])
 
 # What to tell the caller when a request body fails validation, by endpoint name
 BODY_ERRORS = {
@@ -514,10 +529,10 @@ def profile_gaps(processor: Processor, company: Company, month: Month = None):
 
 @api.get('/profile-gaps/file')
 def profile_gaps_file(processor: Processor, company: Company, month: Month = None):
-    """Downloads the profile-gap report of ?month=YYYY-MM (the current month by default) as markdown."""
+    """Downloads the profile-gap report of ?month=YYYY-MM (the current month by default) as a PDF."""
     report = profile_gap_report(processor.saved_results(), company.read(), month)
-    return Response(report_markdown(report), media_type='text/markdown; charset=utf-8',
-                    headers={'Content-Disposition': f'attachment; filename="profile-gaps-{report["month"]}.md"',
+    return Response(report_pdf(report), media_type='application/pdf',
+                    headers={'Content-Disposition': f'attachment; filename="profile-gaps-{report["month"]}.pdf"',
                              'X-Content-Type-Options': 'nosniff'})
 
 

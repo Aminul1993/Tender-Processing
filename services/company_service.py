@@ -97,6 +97,12 @@ class CompanyStore:
                     'marked_on = excluded.marked_on',
                     (*key, criterion['criterion'], criterion.get('requirement') or '', status, marked_on))
 
+    def tender_marks(self, tcno):
+        """The statuses marked by hand on tender tcno's criteria, as (criterion, status) pairs, first marked first."""
+        with self.db.connection() as connection:
+            return connection.execute('SELECT criterion, status FROM criterion_marks WHERE tcno = %s ORDER BY seq',
+                                      (str(tcno),)).fetchall()
+
     def for_tender(self, tcno):
         """
         The profile to check tender tcno against: with the marks of the other tenders, not its own (see

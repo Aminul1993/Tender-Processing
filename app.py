@@ -19,6 +19,7 @@ from services.deep_analysis_service import DeepAnalysisRunner  # noqa: E402
 from services.processing_service import TenderProcessor  # noqa: E402
 from services.watchlist_service import WatchlistRunner  # noqa: E402
 from utils.logging_setup import configure_logging  # noqa: E402
+from utils.tendertiger import share_pacing  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +35,8 @@ def create_app(config_object=Config, vector_store=None):
 
     config_object.TARGET_DIRECTORY.mkdir(parents=True, exist_ok=True)
     db = Database.connect(config_object.DATABASE_URL, config_object.DATABASE_SCHEMA)
+    # TENDERTIGER_REQUEST_GAP between the requests of this process and every worker's together
+    share_pacing(lambda gap: db.pace('tendertiger', gap))
     app.state.tender_processor = TenderProcessor.from_config(config_object, db, index=vector_store)
     # The job outlives a restart: tenders it left queued are taken up again (with none, the threads stop at once)
     app.state.tender_processor.start_workers()

@@ -23,6 +23,7 @@ from config import Config  # noqa: E402
 from services.database import Database, DatabaseError  # noqa: E402
 from services.processing_service import TenderProcessor  # noqa: E402
 from utils.logging_setup import configure_logging  # noqa: E402
+from utils.tendertiger import share_pacing  # noqa: E402
 
 log = logging.getLogger('worker')
 
@@ -36,6 +37,8 @@ def main(argv=None):
         db = Database.connect(Config.DATABASE_URL, Config.DATABASE_SCHEMA)
     except DatabaseError as exc:
         parser.error(str(exc))
+    # TENDERTIGER_REQUEST_GAP between the requests of this process, the web app and the other workers together
+    share_pacing(lambda gap: db.pace('tendertiger', gap))
     Config.TARGET_DIRECTORY.mkdir(parents=True, exist_ok=True)
     processor = TenderProcessor.from_config(Config, db, job_workers=0)
     stop = threading.Event()

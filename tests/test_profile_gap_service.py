@@ -1,7 +1,24 @@
+import unicodedata
 import unittest
 from datetime import date
 
-from services.profile_gap_service import profile_gap_report, profile_statuses, report_markdown, topic
+import pymupdf
+
+from services.profile_gap_service import profile_gap_report, profile_statuses, report_pdf, topic
+
+
+def pdf_text(pdf):
+    """
+    The text of a PDF's pages, its ligatures as their letters: the PDF's layout sets "fi" and the like as one glyph,
+    which reads back as U+FB01.
+    """
+    return unicodedata.normalize('NFKC', ''.join(page.get_text() for page in pymupdf.open(stream=pdf, filetype='pdf')))
+
+
+def pdf_rows(pdf):
+    """The rows of the table on a PDF's first page, each cell's text on one line, its ligatures as their letters."""
+    table = pymupdf.open(stream=pdf, filetype='pdf')[0].find_tables()[0]
+    return [[unicodedata.normalize('NFKC', ' '.join((cell or '').split())) for cell in row] for row in table.extract()]
 
 PROFILE = """# ACME
 
@@ -94,16 +111,27 @@ class ReportTest(unittest.TestCase):
                          [('land_border', 2, 2, 50, 'empty'), ('make_in_india', 2, 1, 50, 'missing')])
         self.assertEqual(report['reasons'][1]['examples'], ['Local Content', 'MII Compliance'])
 
-        markdown = report_markdown(report)
-        self.assertIn('# Profile-gap report: November 2026', markdown)
-        self.assertIn('| 1 | Land border declaration | 2 (50%) | 2 | Empty: fill it in |', markdown)
-        self.assertIn('| 2 | Make in India class and local content | 2 (50%) | 1 | Not in the profile: add it |',
-                      markdown)
+        pdf = report_pdf(report)
+        self.assertTrue(pdf_text(pdf).startswith('Profile-gap report: November 2026'))
+        self.assertEqual(pymupdf.open(stream=pdf, filetype='pdf').metadata['title'],
+                         'Profile-gap report: November 2026')
+        self.assertEqual(pdf_rows(pdf), [
+            ['#', 'Reason', 'Criteria', 'Tenders', 'Company profile', 'Most frequent criteria'],
+            ['1', 'Land border declaration', '2 (50%)', '2', 'Empty: fill it in',
+             'Land Border Restriction; Land Border Eligibility'],
+            ['2', 'Make in India class and local content', '2 (50%)', '1', 'Not in the profile: add it',
+             'Local Content; MII Compliance'],
+        ])
 
     def test_the_current_month_is_the_default_and_an_empty_month_says_so(self):
         report = profile_gap_report([result('1', [criterion('Land Border')])], PROFILE, today=date(2026, 12, 2))
         self.assertEqual((report['month'], report['tenders'], report['reasons']), ('2026-12', 0, []))
-        self.assertIn('No tender check was completed in December 2026.', report_markdown(report))
+        self.assertIn('No tender check was completed in December 2026.', pdf_text(report_pdf(report)))
+
+    def test_any_character_a_criterion_holds_is_written(self):
+        report = profile_gap_report([result('1', [criterion('Turnover ≥ ₹5 Cr — “average” <of 3 years> & more')])],
+                                    PROFILE, '2026-11')
+        self.assertEqual(pdf_rows(report_pdf(report))[1][-1], 'Turnover ≥ ₹5 Cr — “average” <of 3 years> & more')
 
 
 if __name__ == '__main__':

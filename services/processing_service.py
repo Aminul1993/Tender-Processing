@@ -20,7 +20,6 @@ from pathlib import Path
 
 import psycopg
 
-from ext import TENDERTIGER_BLOCKED
 from services.analysis_service import (OcrBudgetExceeded, TokenUsage, criterion_key,
                                        jv_verdict, ocr_estimate, over_budget, process_tender_files,
                                        recheck_saved_criteria, statuses_verdict, tender_files)
@@ -32,6 +31,7 @@ from services.download_service import DownloadError, download_tender_documents
 from services.pinecone_service import NamespaceIncomplete, PineconeService, QuotaExceeded, VectorStoreError
 from services.tender_service import closing_date, get_tender, has_documents, prequalification_url
 from utils.files import safe_name
+from utils.tendertiger import TENDERTIGER_BLOCKED
 
 log = logging.getLogger(__name__)
 
@@ -51,6 +51,8 @@ SUMMARY_KEYS = ('status', 'verdict', 'score', 'error', 'error_title', 'error_act
 # A result's brief in the state (see JobState.briefs()): its summary, and what the run estimates and the closed
 # downloads need
 BRIEF_KEYS = SUMMARY_KEYS + ('tcno', 'name', 'closing_date', 'folder', 'duration_seconds')
+# How long a worker waits after an error (the database out of reach, say) before taking a tender again
+WORKER_RETRY_SECONDS = 5
 
 
 class NoJobRunning(Exception):
@@ -301,15 +303,18 @@ class TenderProcessor:
             log.info('Tender %s: %s by the user (now %s)', tcno, done, updated['verdict'])
             return updated
 
-    def _carry_marks(self, tcno, result):
+    def _carry_marks(self, tcno, result, last):
         """
-        Marks again, on a new result, what the bid team marked by hand on the tender's last one: the statuses of
-        criteria with the same name, and the unreadable sources it checked that are still unreadable. Returns
-        True when anything was marked.
+        Marks again, on a new result, what the bid team marked by hand on the tender: the statuses of criteria with the
+        same name, as recorded with the bid team's marks (CompanyStore.tender_marks()) and on its last result (last),
+        and the unreadable sources it checked that are still unreadable. The recorded marks outlast a run that failed
+        in between, whose result has no criteria. Returns True when anything was marked.
         """
-        last = self.state.result(tcno) or {}
-        marks = {criterion_key(criterion['criterion']): criterion['status']
-                 for criterion in last.get('criteria') or [] if criterion.get('marked_by_user')}
+        recorded = self.company_store.tender_marks(tcno) if self.company_store else []
+        marks = {criterion_key(name): status for name, status in recorded}
+        # And the last result's: a mark that could not be recorded is saved there all the same (see _record_mark())
+        marks.update((criterion_key(criterion['criterion']), criterion['status'])
+                     for criterion in last.get('criteria') or [] if criterion.get('marked_by_user'))
         matched = 0
         for criterion in result['criteria']:
             status = marks.get(criterion_key(criterion['criterion']))
@@ -429,6 +434,10 @@ class TenderProcessor:
         and OSError when a file cannot be deleted (one open in another program, say).
         """
         tcno = str(tcno)
+        # A TCNO is digits: "100091540." would name the same folder (safe_name()) but none of the tender's records, so
+        # it would get past the busy check; a download's staging folder (tmp...) is not a tender's either
+        if not tcno.isdigit():
+            raise LookupError(f'Nothing is kept for tender {tcno}.')
         folder = self.target_directory / safe_name(tcno)
         known = self.state.result(tcno) is not None
         if not known and not folder.is_dir():
@@ -484,6 +493,19 @@ class TenderProcessor:
                 self._threads.append(thread)
                 thread.start()
 
+    def join_workers(self):
+        """
+        Waits until this process's worker threads (start_workers()) have run out of queued tenders and stopped, so a
+        script exits only between tenders.
+        """
+        while True:
+            with self._threads_lock:
+                threads = list(self._threads)
+            if not threads:
+                return
+            for thread in threads:
+                thread.join()
+
     def _work(self, until_empty=False, stop=None):
         """
         Thread body: takes queued tenders one at a time and processes them. until_empty: returns once none is queued
@@ -507,13 +529,10 @@ class TenderProcessor:
                     self.state.wait(timeout=5)
             except Exception:
                 # The database out of reach, say; the tender a worker had is failed once its lease runs out (see
-                # _reap())
+                # _reap()). Tried again after a pause, also by the web app's own threads: nothing would start another
+                # one, and the tenders queued would wait until more were queued.
                 log.exception('Worker %s could not take or finish a tender', self.worker_name)
-                if until_empty:
-                    with self._threads_lock:
-                        self._threads.remove(threading.current_thread())
-                    return
-                (stop or threading.Event()).wait(5)
+                (stop or threading.Event()).wait(WORKER_RETRY_SECONDS)
 
     def _claim(self):
         """Takes the oldest queued tender for this worker: (item, payload, started), or None when none is queued."""
@@ -639,7 +658,11 @@ class TenderProcessor:
             'error_title': None, 'error_action': None, 'files': [], 'folder': str(folder),
             'rechecked': False, 'namespace': None, 'index': None,
         }
+        last = {}
         try:
+            # The last result, with what the team marked on it by hand (see _carry_marks()); the marks are locked while
+            # the tender is processed, so it cannot change meanwhile
+            last = self.state.result(tcno) or {}
             # Strict: a Pinecone that cannot be reached fails the tender now, before any download
             result['rechecked'] = not regenerate and self.index.has_namespace(tcno, strict=True)
             analysis = None
@@ -663,7 +686,7 @@ class TenderProcessor:
             result.update(verdict=analysis['verdict'], details=analysis['details'], score=analysis['score'],
                           criteria=criteria, unreadable_files=unreadable, jv=jv, comparison=comparison,
                           checks=_checks(criteria, unreadable, jv, comparison), index=analysis.get('index'))
-            if self._carry_marks(tcno, result):
+            if self._carry_marks(tcno, result, last):
                 _restatus(result)
             log.info('Tender %s: %s (score %s)', tcno, result['verdict'], result['score'])
         except Exception as exc:
@@ -676,6 +699,10 @@ class TenderProcessor:
                 result.update(status='awaiting_approval', ocr_estimate=exc.estimate)
             else:
                 log.exception('Tender %s failed', tcno)
+            # Kept for the next run to carry over, as this result has nothing to mark them on (the statuses marked by
+            # hand are kept with the bid team's marks)
+            if last.get('unreadable_checked'):
+                result['unreadable_checked'] = last['unreadable_checked']
             if not result['rechecked']:
                 self._discard_incomplete_namespace(tcno)
         result['namespace'] = self.namespace(tcno)
@@ -767,12 +794,21 @@ def explain_error(exc):
                     'TenderTiger sent a page instead of the documents. Retry in a few minutes.')
         if 'timed out' in lower or 'timeout' in lower:
             return ('The document server did not respond', 'Retry in a few minutes.')
+        if 'unpacked' in lower:
+            return ('The documents are too large',
+                    'Their ZIP files unpack to more than 4 times the MAX_DOWNLOAD_MB limit or more than 10,000 files, '
+                    'which documents do not. Check them on TenderTiger; if they are what they should be, raise the '
+                    'limit in .env, restart and retry.')
         if 'larger than' in lower:
             return ('The documents are too large',
                     'The download is over the MAX_DOWNLOAD_MB limit. Raise the limit in .env, restart and retry.')
         if 'could not extract' in lower:
             return ('The ZIP file could not be opened',
                     'The archive may be damaged or encrypted. Retry, or check the documents on TenderTiger.')
+        if 'open in another program' in lower:
+            return ('A document of the tender is open',
+                    'Close the program that has one of its downloaded documents open, then retry. The documents '
+                    'downloaded before are kept as they were.')
         return ('The documents could not be downloaded', 'Retry. If it fails again, check the tender on TenderTiger.')
     if isinstance(exc, QuotaExceeded):
         return ('The Pinecone namespace limit is reached',

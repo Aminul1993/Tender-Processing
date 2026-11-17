@@ -41,8 +41,7 @@ SEARCH_CAP = 10_000   # the most tenders one TenderTiger search serves
 ANY_STATE = 'any'
 # How errors name the watchlist, and what to do without one
 SOURCE = 'the watchlist'
-MISSING = ('There is no watchlist yet: add its departments to the watchlist_departments table (see the README), or '
-           'import a watchlist.json with scripts/import_files_to_db.py.')
+MISSING = 'There is no watchlist yet: add its departments with Edit watchlist on the page.'
 # Seconds between the schedule's checks, and the least time between two refreshes it starts itself (so a refresh
 # that failed, say on TenderTiger's firewall, is not tried again at once)
 SCHEDULE_SECONDS = 15 * 60
@@ -156,7 +155,8 @@ class Watchlist:
             raise WatchlistError('The watchlist needs at least one department.')
         filters = raw.get('filters') or {}
         try:
-            tender_service.stored_filters(filters, f'{SOURCE}, filters')
+            # As a refresh will search with them, so filters it cannot search with are refused before
+            tender_service.search_fields(tender_service.stored_filters(filters, f'{SOURCE}, filters').model_dump())
         except ValueError as exc:
             raise WatchlistError(str(exc)) from None
         groups = raw.get('state_groups') or {}
@@ -186,6 +186,10 @@ class Watchlist:
             # A name its own patterns do not claim would be searched for nothing
             if not any(pattern.search(_norm(name)) for pattern in organisations):
                 raise WatchlistError(f'{where}: the search name {name!r} matches none of its "organisations".')
+            # So would one with an apostrophe, and it would stop the whole refresh (see tender_service.search_fields())
+            if "'" in name:
+                raise WatchlistError(f"{where}: leave the apostrophe out of the search name {name!r}: TenderTiger's "
+                                     'search finds nothing with one.')
         states = entry.get('states')
         if states == ANY_STATE:
             states = None
@@ -397,11 +401,14 @@ class WatchlistRunner:
         WatchlistError when the database cannot be read, and ValueError for the sorting or page size.
         """
         tender_service.check_page(sort, order, page_size)
-        keys = [{'tcno': tcno, 'closingdate': closing, 'tendervalue': value} for tcno, closing, value in self._read(
-            "SELECT tcno, tender->>'closingdate', tender->>'tendervalue' FROM watchlist_tenders")]
+        keys = [{'tcno': tcno, 'closingdate': closing, 'tendervalue': value, 'currcode': currency}
+                for tcno, closing, value, currency in self._read(
+                    "SELECT tcno, tender->>'closingdate', tender->>'tendervalue', tender->>'currcode' "
+                    'FROM watchlist_tenders')]
         # Soonest closing first among equals, and among those without a value
         keys.sort(key=lambda t: tender_service.closing_date(t) or date.max)
-        key = tender_service.closing_date if sort == 'closing' else tender_service.tender_value
+        # By the value in rupees: TenderTiger's 0 is no value, and a value in another currency cannot be compared
+        key = tender_service.closing_date if sort == 'closing' else value_of
         known = sorted((t for t in keys if key(t) is not None), key=key, reverse=order == 'desc')
         ordered = [t['tcno'] for t in known + [t for t in keys if key(t) is None]]
         shown = ordered[(page - 1) * page_size:page * page_size]
@@ -415,6 +422,7 @@ class WatchlistRunner:
         started_at, finished_at, error, capped (names whose tenders did not all fit TenderTiger's search),
         refresh_hours, changed (the rules changed since the last search)}.
         """
+        self._sync()
         try:
             [(tenders, departments)] = self._read(
                 "SELECT count(*), count(DISTINCT department->>'name') FROM watchlist_tenders")
@@ -435,10 +443,11 @@ class WatchlistRunner:
 
     # ---------- refreshing ----------
 
-    def start(self):
+    def start(self, wait=False):
         """
-        Starts a refresh in a background thread, unless one is running, and returns the status. Raises
-        WatchlistMissing / WatchlistError when the database holds no valid watchlist.
+        Starts a refresh in a background thread, unless one is running, and returns the status; with wait, refreshes in
+        this thread and returns the status once it is done (scripts/process_watchlist.py). Raises WatchlistMissing /
+        WatchlistError when the database holds no valid watchlist.
         """
         rules = self.watchlist()
         try:
@@ -456,14 +465,13 @@ class WatchlistRunner:
         if running:
             return self.status()
         self._save_attempt()
-        threading.Thread(target=self._refresh, args=(rules, filters, names), name='watchlist-refresh',
-                         daemon=True).start()
         log.info('Watchlist refresh started: %d organisations to search', len(names))
+        if wait:
+            self._refresh(rules, filters, names)
+        else:
+            threading.Thread(target=self._refresh, args=(rules, filters, names), name='watchlist-refresh',
+                             daemon=True).start()
         return self.status()
-
-    def running(self):
-        with self._lock:
-            return bool(self._run and self._run['status'] == 'running')
 
     def _refresh(self, rules, filters, names):
         found = {}
@@ -489,8 +497,13 @@ class WatchlistRunner:
         refreshed_at = _now()
         try:
             save_list(self.db, rows, refreshed_at, rules.fingerprint)
-        except psycopg.Error:
-            log.exception('Could not save the watchlist in the database; it is lost on restart')
+        except psycopg.Error as exc:
+            # The list shows what the database holds, the last refresh's: not refreshed, so another is due as before
+            log.exception('Could not save the watchlist in the database')
+            with self._lock:
+                self._run.update(status='failed', current=None, finished_at=_now(),
+                                 error=f'The tenders found could not be saved in the database: {exc}')
+            return
         tender_service.remember(tenders)
         with self._lock:
             self._refreshed_at, self._searched_rules = refreshed_at, rules.fingerprint
@@ -546,8 +559,10 @@ class WatchlistRunner:
     def due(self):
         """
         Whether the schedule would refresh now: the list is old or missing, and no refresh started in the last
-        RETRY_SECONDS, in this process or one before it (a restart in the middle of a refresh does not start another).
+        RETRY_SECONDS, in this process or another (a restart in the middle of a refresh does not start another, nor
+        does a refresh scripts/process_watchlist.py made).
         """
+        self._sync()
         with self._lock:
             refreshed_at, attempted_at = self._refreshed_at, self._attempted_at
             running = bool(self._run and self._run['status'] == 'running')
@@ -582,6 +597,21 @@ class WatchlistRunner:
             self._refreshed_at, self._searched_rules = refreshed['refreshed_at'], refreshed.get('rules')
         # Listed again, so they can be processed after a restart
         tender_service.remember([tender for tender, _ in rows])
+
+    def _sync(self):
+        """
+        Takes up, from the database, a refresh another process made (scripts/process_watchlist.py, say): when the
+        saved list was refreshed and with which rules, and when the last refresh started.
+        """
+        try:
+            refreshed, searched = self.db.value(REFRESHED), self.db.value(SEARCHED)
+        except psycopg.Error:
+            return
+        with self._lock:
+            if refreshed:
+                self._refreshed_at, self._searched_rules = refreshed['refreshed_at'], refreshed.get('rules')
+            if searched:
+                self._attempted_at = datetime.fromisoformat(searched['started_at'])
 
     def _load_attempt(self):
         try:

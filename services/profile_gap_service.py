@@ -4,9 +4,13 @@ most frequent first, grouped by the fact each criterion lacked, and whether the 
 now. It reads the saved results only, without any LLM call, so a criterion's reason is found by keywords in its
 name and requirement (TOPICS).
 """
+import html
+import io
 import re
 from collections import Counter
 from datetime import date, datetime, timezone
+
+import pymupdf
 
 from services.company_service import parse_profile
 
@@ -153,41 +157,64 @@ def profile_gap_report(results, profile_markdown, month=None, today=None):
 
 _PROFILE_LABELS = {'stated': 'Stated', 'empty': 'Empty: fill it in', 'missing': 'Not in the profile: add it',
                    None: 'n/a'}
+# The PDF's pages: A4 across, so the six columns fit, with margins of MARGIN points
+PAGE = pymupdf.paper_rect('a4-l')
+MARGIN = 40
+_CSS = """
+body {font-family: sans-serif; font-size: 10pt; color: #1d1d1f;}
+h1 {font-size: 16pt; margin-bottom: 6pt;}
+table {border-collapse: collapse; width: 100%; margin: 8pt 0;}
+th, td {border: 0.5pt solid #9a9a9a; padding: 3pt 4pt; text-align: left; vertical-align: top;}
+th {background-color: #ececec;}
+.note {color: #555555; font-size: 9pt;}
+"""
 
 
-def report_markdown(report):
-    """The report as a markdown document, for the bid team."""
-    lines = [f"# Profile-gap report: {report['label']}", '']
+def report_pdf(report):
+    """The report as a PDF document for the bid team: A4 landscape, its reasons in a table."""
+    story = pymupdf.Story(html=_report_html(report), user_css=_CSS)
+    buffer = io.BytesIO()
+    writer = pymupdf.DocumentWriter(buffer)
+    more = True
+    while more:
+        device = writer.begin_page(PAGE)
+        more, _ = story.place(PAGE + (MARGIN, MARGIN, -MARGIN, -MARGIN))
+        story.draw(device)
+        writer.end_page()
+    writer.close()
+    document = pymupdf.open(stream=buffer.getvalue(), filetype='pdf')
+    document.set_metadata({'title': f"Profile-gap report: {report['label']}", 'creator': 'Tender Processing'})
+    # Only the characters used of each font: the one with the rupee sign, the dashes and the like is large
+    document.subset_fonts()
+    return document.tobytes(garbage=3, deflate=True)
+
+
+def _report_html(report):
+    """The report as the HTML report_pdf() lays out."""
+    label = html.escape(report['label'])
+    parts = [f'<h1>Profile-gap report: {label}</h1>']
     if not report['tenders']:
-        lines.append(f"No tender check was completed in {report['label']}.")
-        return '\n'.join(lines) + '\n'
+        parts.append(f'<p>No tender check was completed in {label}.</p>')
+        return '\n'.join(parts)
     unknown, criteria = report['cannot_determine'], report['criteria']
     share = f' ({round(100 * unknown / criteria)}%)' if criteria else ''
-    lines += [
-        f"{report['tenders']} tender(s) checked in {report['label']}, counting each tender's latest check. Of their "
-        f"{criteria} criteria, {unknown}{share} were marked Cannot determine. Below is what those criteria needed, "
-        'most frequent first.', '',
-    ]
+    parts.append(f"<p>{report['tenders']} tender(s) checked in {label}, counting each tender's latest check. Of "
+                 f'their {criteria} criteria, {unknown}{share} were marked Cannot determine. Below is what those '
+                 'criteria needed, most frequent first.</p>')
     if report['reasons']:
-        lines += ['| # | Reason | Criteria | Tenders | Company profile | Most frequent criteria |',
-                  '| --- | --- | --- | --- | --- | --- |']
-        for rank, reason in enumerate(report['reasons'], 1):
-            examples = '; '.join(_cell(name) for name in reason['examples'])
-            lines.append(f"| {rank} | {reason['reason']} | {reason['criteria']} ({reason['share']}%) | "
-                         f"{reason['tenders']} | {_PROFILE_LABELS[reason['profile']]} | {examples} |")
-        lines += [
-            '',
-            '**Company profile:** *Stated*: the profile has it now; checks made before it was added still lack it, '
-            'so check those tenders again. *Empty* or *Not in the profile*: add the fact, under Standing '
-            'declarations and certificates for a declaration. *n/a*: each bid, or the tender documents, must '
-            'supply it.',
-        ]
-    lines += ['', f"Criteria marked by hand count under the status the model gave. Generated "
-                  f"{report['generated_at'][:10]} from the saved results, without the LLM: reasons are found by "
-                  'keywords in each criterion.']
-    return '\n'.join(lines) + '\n'
-
-
-def _cell(text):
-    """Text as one markdown table cell."""
-    return ' '.join(str(text).split()).replace('|', '\\|')
+        header = ''.join(f'<th>{name}</th>' for name in ('#', 'Reason', 'Criteria', 'Tenders', 'Company profile',
+                                                         'Most frequent criteria'))
+        rows = [f"<tr><td>{rank}</td><td>{html.escape(reason['reason'])}</td>"
+                f"<td>{reason['criteria']} ({reason['share']}%)</td><td>{reason['tenders']}</td>"
+                f"<td>{html.escape(_PROFILE_LABELS[reason['profile']])}</td>"
+                f"<td>{html.escape('; '.join(reason['examples']))}</td></tr>"
+                for rank, reason in enumerate(report['reasons'], 1)]
+        parts += [f'<table><tr>{header}</tr>', *rows, '</table>',
+                  '<p><b>Company profile:</b> <i>Stated</i>: the profile has it now; checks made before it was added '
+                  'still lack it, so check those tenders again. <i>Empty</i> or <i>Not in the profile</i>: add the '
+                  'fact, under Standing declarations and certificates for a declaration. <i>n/a</i>: each bid, or the '
+                  'tender documents, must supply it.</p>']
+    parts.append(f"<p class='note'>Criteria marked by hand count under the status the model gave. Generated "
+                 f"{report['generated_at'][:10]} from the saved results, without the LLM: reasons are found by "
+                 'keywords in each criterion.</p>')
+    return '\n'.join(parts)

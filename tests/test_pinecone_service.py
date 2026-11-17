@@ -5,7 +5,7 @@ from unittest import mock
 
 from pinecone import ForbiddenError, RateLimitError, ServiceError, UnauthorizedError
 
-from pinecone_fake import FakePinecone
+from tests.pinecone_fake import FakePinecone
 from services import sparse_encoder
 from services.document_sections import chunk_sections, headings
 from services.pinecone_service import (MANIFEST_ID, Document, NamespaceIncomplete, PineconeService, QuotaExceeded,
@@ -179,6 +179,16 @@ class NamespaceTest(unittest.TestCase):
         pinned = [chunk for chunk in retrieval.chunks if chunk['queries'] == ['pinned']]
         self.assertEqual(len(pinned), 1)  # always sent, budget or not
         self.assertLessEqual(retrieval.characters - sum(len(chunk['text']) for chunk in pinned), 200)
+
+    def test_a_namespace_another_process_built_is_found_at_once(self):
+        self.assertEqual(self.index.namespaces(), set())  # this process (the web app) has listed none
+        worker = service(self.client)  # a worker process, building the tender's namespace afterwards
+        worker.rebuild_namespace('12345678', [Document('NIT.pdf', NIT, 'nit')])
+
+        # Its cached list is out of date, but a missing namespace is looked for again before it is taken as missing
+        self.assertEqual(self.index.manifest('12345678')['sources'][0]['name'], 'NIT.pdf')
+        self.assertTrue(self.index.retrieve('12345678', {'turnover': ['average annual turnover']}).chunks)
+        self.assertIsNone(self.index.manifest('87654321'))
 
     def test_a_tender_without_a_namespace_cannot_be_retrieved(self):
         with self.assertRaises(NamespaceIncomplete):
@@ -631,38 +641,3 @@ class FailureTest(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
-
-
-class MigrateScriptTest(unittest.TestCase):
-    """scripts/migrate_to_pinecone.py never rebuilds a namespace holding the TenderTiger texts only the app has."""
-
-    def setUp(self):
-        import tempfile
-        from pathlib import Path
-
-        from scripts.migrate_to_pinecone import migrate
-        self.migrate = migrate
-        self.tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(self.tmp.cleanup)
-        self.folder = Path(self.tmp.name) / '1'
-        self.folder.mkdir()
-        (self.folder / 'NIT.txt').write_text(NIT, encoding='utf-8')
-        self.client = FakePinecone()
-        self.index = service(self.client)
-        self.index.rebuild_namespace('1', [Document('TenderTiger Tender Data', 'Value: Rs 98 crore', 'tender_data'),
-                                           Document('NIT.txt', NIT, 'nit')])
-
-    def sources(self):
-        return {meta['source_file'] for meta in self.client.chunks('tcno-1').values()}
-
-    def test_a_complete_namespace_of_an_older_version_is_left_as_it_is(self):
-        self.client.namespaces()['tcno-1'][MANIFEST_ID]['metadata']['schema_version'] = 2  # before sections, sparse
-        self.assertEqual(self.migrate(self.folder, self.index), 'up to date')
-        self.assertEqual(self.sources(), {'TenderTiger Tender Data', 'NIT.txt'})
-
-    def test_a_namespace_a_regenerate_left_unfinished_is_given_back(self):
-        self.index.reset_namespace('1', keep=True)  # a regenerate that stopped before reading anything
-        self.assertIsNone(self.index.manifest('1'))
-        self.assertEqual(self.migrate(self.folder, self.index), 'up to date')
-        self.assertIsNotNone(self.index.manifest('1'))
-        self.assertEqual(self.sources(), {'TenderTiger Tender Data', 'NIT.txt'})

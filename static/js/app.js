@@ -180,6 +180,7 @@
     pageSize: 20,             // tenders a page holds (one of PAGE_SIZES), as /api/tenders reports it
     hasMore: false,           // the page shown was full, so another may follow
     loading: null,            // {page, size} that showList() is loading, null otherwise
+    loadSeq: 0,               // counts the list loads started: only the latest one's answer is shown
     rows: new Map(),          // tcno -> <tr>
     emptyRow: null,           // shown when the filters hide every tender
     selected: new Set(),      // tcnos the user ticked, on any page
@@ -219,7 +220,8 @@
 
   /** fetch() wrapper: parses JSON and throws an Error carrying the API's {"error": ...} message. */
   async function api(path, options = {}) {
-    const headers = {Accept: 'application/json'};
+    // The server refuses a change without it: no other web page can send it (see sent_by_the_page() in routes/api.py)
+    const headers = {Accept: 'application/json', 'X-Requested-With': 'fetch'};
     if (options.body !== undefined) headers['Content-Type'] = 'application/json';
     const response = await fetch(path, {...options, headers});
     let data = null;
@@ -275,8 +277,9 @@
   /** "criteria", or "criterion" for one; likewise "lead member criteria". */
   const criteriaNoun = (count, noun = 'criteria') => (count === 1 ? noun.replace(/criteria$/, 'criterion') : noun);
 
-  /** "Meets all 6 criteria", or "Meets the 1 criterion". */
-  const meetsAll = (total, noun = 'criteria') => `Meets ${total === 1 ? 'the' : 'all'} ${total} ${criteriaNoun(total, noun)}`;
+  /** "Meets all 6 criteria", or "Meets its only criterion". */
+  const meetsAll = (total, noun = 'criteria') => (total === 1
+    ? `Meets its only ${criteriaNoun(total, noun)}` : `Meets all ${total} ${criteriaNoun(total, noun)}`);
 
   /**
    * TenderTiger's often lower-case organisations and places in title case: "national highways authority of india"
@@ -452,14 +455,17 @@
   async function loadTenders({quiet = false, filters = state.searchFilters, page = state.page, sort = state.sort,
     size = state.pageSize} = {}) {
     els.refreshBtn.disabled = true;
+    const seq = ++state.loadSeq;
     const source = state.source;
+    // Superseded: another load started since (the next page, other filters, a reload), or the other list was chosen
+    const stale = () => seq !== state.loadSeq || source !== state.source;
     const watchlist = source === 'watchlist';
     try {
       const query = new URLSearchParams({
         ...(watchlist ? {} : filters), sort: sort.key, order: sort.order, page_size: size, ...(page > 1 ? {page} : {}),
       });
       const data = await api(`${watchlist ? '/api/watchlist' : '/api/tenders'}?${query}`);
-      if (source !== state.source) return false;  // switched to the other list while this one loaded
+      if (stale()) return false;  // a slower, older answer must not replace a newer one
       // TenderTiger tells the end of the list only by an empty page: stay on the page shown
       if (page > 1 && !data.tenders.length) {
         state.hasMore = false;
@@ -499,7 +505,7 @@
       renderTable();
       return true;
     } catch (error) {
-      if (source !== state.source) return false;
+      if (stale()) return false;
       // The server's message already says what failed; a network error does not
       const reason = watchlist ? `Could not load the watchlist: ${error.message}`
         : /tender list/i.test(error.message) ? error.message : `Could not load the tender list: ${error.message}`;
@@ -509,17 +515,22 @@
       }
       const retry = el('button', {cls: 'button button-secondary button-sm', text: 'Try again', attrs: {type: 'button'}});
       retry.addEventListener('click', () => loadTenders());
-      const back = el('button', {cls: 'link-button ms-2', text: "Show TenderTiger's list", attrs: {type: 'button'}});
-      back.addEventListener('click', () => setSource('tendertiger'));
+      // The way to the other list, which may still load: the watchlist is read from the database
+      const back = el('button', {cls: 'link-button ms-2', attrs: {type: 'button'},
+        text: watchlist ? "Show TenderTiger's list" : 'Show the watchlist'});
+      back.addEventListener('click', () => setSource(watchlist ? 'tendertiger' : 'watchlist'));
+      // A message that already says what to set (the TenderTiger login in .env) needs no guess at the network
+      const configIssue = /\.env\b/.test(error.message);
       els.body.replaceChildren(el('tr', {cls: 'message-row', attrs: {role: 'row'}}, [
-        el('td', {attrs: {colspan: '7', role: 'cell'}}, [
+        el('td', {attrs: {colspan: '6', role: 'cell'}}, [
           el('div', {cls: 'message-error', text: reason}),
           el('div', {cls: 'message-hint', text: watchlist
             ? 'The watchlist is read from the database: check it is running, then try again.'
-            : 'Check the internet connection and the TenderTiger subscription, then try again.'}),
+            : configIssue ? 'The watchlist still opens meanwhile: it is read from the database.'
+              : 'Check the internet connection and the TenderTiger subscription, then try again.'}),
           watchlist ? editWatchlistButton() : null,
           retry,
-          watchlist ? back : null,
+          back,
           // Filters remembered from an earlier visit may be the problem
           !watchlist && filterCount(filters) ? clearFiltersButton(' ms-2') : null,
         ]),
@@ -533,7 +544,7 @@
       updateSummary();
       return false;
     } finally {
-      els.refreshBtn.disabled = false;
+      if (seq === state.loadSeq) els.refreshBtn.disabled = false;
     }
   }
 
@@ -606,7 +617,7 @@
     if (!state.tenders.length) {
       const filtered = filterCount(state.searchFilters) > 0;
       els.body.replaceChildren(el('tr', {cls: 'message-row', attrs: {role: 'row'}}, [
-        el('td', {attrs: {colspan: '7', role: 'cell'}}, state.source === 'watchlist' ? emptyWatchlist() : filtered ? [
+        el('td', {attrs: {colspan: '6', role: 'cell'}}, state.source === 'watchlist' ? emptyWatchlist() : filtered ? [
           el('div', {cls: 'mb-2', text: 'TenderTiger found no live tenders with these filters.'}), clearFiltersButton(),
         ] : [document.createTextNode('TenderTiger found no live tenders. Reload later to check again.')]),
       ]));
@@ -616,7 +627,7 @@
     const clear = el('button', {cls: 'link-button', text: 'Show all tenders', attrs: {type: 'button'}});
     clear.addEventListener('click', clearFilters);
     state.emptyRow = el('tr', {cls: 'message-row', attrs: {role: 'row', hidden: ''}}, [
-      el('td', {attrs: {colspan: '7', role: 'cell'}}, [
+      el('td', {attrs: {colspan: '6', role: 'cell'}}, [
         el('div', {cls: 'mb-2', text: 'No tenders match these filters.'}), clear,
       ]),
     ]);
@@ -647,8 +658,6 @@
     const organisation = titleCase(t.organisation);
     const location = titleCase(t.location);
     const place = [organisation, location].filter(Boolean).join(' · ');
-    const dropButton = el('button', {cls: 'row-drop', attrs: {type: 'button'}});
-    dropButton.dataset.tcno = t.tcno;
 
     const row = el('tr', {attrs: {role: 'row'}}, [
       el('td', {cls: 'cell-check', attrs: {role: 'cell'}}, [checkbox]),
@@ -675,7 +684,6 @@
         days ? el('span', {cls: `days-pill ${urgencyClass(t.days_left)}`.trim(), text: days}) : null,
       ]),
       el('td', {cls: 'cell-verdict', attrs: {role: 'cell'}}),
-      el('td', {cls: 'cell-drop', attrs: {role: 'cell'}}, [dropButton]),
     ]);
     row.dataset.tcno = t.tcno;
     row.dataset.organisation = organisation;
@@ -713,14 +721,8 @@
     row.querySelector('.cell-verdict').replaceChildren(
       el('div', {cls: 'verdict-stack'}, verdictCell(tcno, result, status, decision)));
 
-    // Any tender but a dropped one can be dropped; dropped is final
-    const dropped = Boolean(decision && decision.decision === 'dropped');
-    const dropButton = row.querySelector('.row-drop');
-    dropButton.replaceChildren(icon('bi-x'));
-    dropButton.setAttribute('aria-label', `Drop tender ${tcno}`);
-    dropButton.title = 'Drop tender';
-    dropButton.hidden = dropped;
-    row.classList.toggle('is-dropped', dropped);
+    // A dropped tender is greyed: it is out of the running (dropped in its window, and final)
+    row.classList.toggle('is-dropped', Boolean(decision && decision.decision === 'dropped'));
     row.dataset.category = category(tcno);
   }
 
@@ -1989,7 +1991,7 @@
     }
     if (jv.conditions && jv.conditions.length) {
       children.push(el('h3', {cls: 'summary-section-title section-plain', text: 'Other JV conditions'}));
-      children.push(el('ul', {cls: 'mb-0'}, jv.conditions.map((text) => el('li', {text}))));
+      children.push(el('ul', {cls: 'note-list'}, jv.conditions.map((text) => el('li', {text}))));
     }
     return el('section', {cls: 'summary route-compare', attrs: {'aria-label': 'Bidding alone vs as JV lead member'}}, children);
   }
@@ -2325,7 +2327,7 @@
 
   /** A list of items, each drawn by item(), or nothing when there are none. */
   const listOrEmpty = (items, item) => ((items || []).length
-    ? [el('ul', {cls: 'deep-list'}, items.map((entry) => el('li', {}, item(entry))))] : []);
+    ? [el('ul', {cls: 'note-list'}, items.map((entry) => el('li', {}, item(entry))))] : []);
 
   /** One row per criterion: its status in this result, the audit's result, and the supervisor's final status. */
   function deepMatrix(rows) {
@@ -2408,6 +2410,30 @@
     ]);
   }
 
+  let markdownReady = false;
+
+  /**
+   * Has marked show raw HTML in a reply as the text it is: "<Company Letterhead>" is a placeholder in a tender, not a
+   * tag, and would otherwise vanish. Only <br>, which the model breaks table cells with, stays a line break. Once:
+   * marked.use() adds to marked's settings.
+   */
+  function setUpMarkdown() {
+    if (markdownReady) return;
+    markdownReady = true;
+    marked.use({renderer: {html(html) {
+      const raw = typeof html === 'string' ? html : html.text;  // marked 13 and later pass a token
+      if (/^<br\s*\/?>$/i.test(raw.trim())) return '<br>';
+      return raw.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }}});
+  }
+
+  // What the sanitiser removes besides scripts: images (one would load from another site as the analysis opens),
+  // forms and their fields, styles, and ids and names that could take the place of the page's own elements
+  const PURIFY = {
+    FORBID_TAGS: ['img', 'picture', 'video', 'audio', 'style', 'form', 'input', 'button', 'textarea', 'select'],
+    FORBID_ATTR: ['id', 'name', 'style'],
+  };
+
   /** Markdown -> sanitised HTML with table styles; plain text if the libraries did not load. */
   function renderMarkdown(text) {
     const container = document.createElement('div');
@@ -2415,7 +2441,8 @@
       container.append(el('pre', {cls: 'plain-text', text}));
       return container;
     }
-    container.innerHTML = DOMPurify.sanitize(marked.parse(text, {gfm: true, breaks: true}));
+    setUpMarkdown();
+    container.innerHTML = DOMPurify.sanitize(marked.parse(text, {gfm: true, breaks: true}), PURIFY);
 
     // The modal is h2 and "Full analysis" h3, so the model's headings start at h4
     const headings = [...container.querySelectorAll('h1, h2, h3, h4, h5, h6')];
@@ -2505,6 +2532,12 @@
   }
 
   /** Marks a tender reviewed / shortlisted / dropped and redraws what shows it. True on success. */
+  /** Asks before a drop, which is final: the server refuses any decision on a dropped tender. */
+  function confirmDrop(tcno) {
+    return window.confirm(`Drop tender ${tcno}?\n\nDropped is final: the tender cannot be marked anything else `
+      + 'afterwards.');
+  }
+
   async function saveDecision(tcno, decision) {
     try {
       const data = await api(`/api/decision/${encodeURIComponent(tcno)}`, {method: 'PUT', body: JSON.stringify({decision})});
@@ -2525,6 +2558,7 @@
    * focus moves on to the next one left, or to Copy text once the tender is dropped.
    */
   async function markDecision(value) {
+    if (value === 'dropped' && !confirmDrop(state.details.tcno)) return;
     const buttons = decisionButtons().map(([button]) => button);
     buttons.forEach((button) => { button.disabled = true; });
     await saveDecision(state.details.tcno, value);
@@ -3169,7 +3203,7 @@
         ]),
         el('div', {}, [el('label', {cls: 'profile-label', text: 'Note', attrs: {for: 'rules-about'}}), about]),
       ]),
-      rulesHeading('Search filters', 'Every search is narrowed by these, named as GET /api/tenders takes them: closing_from = today, bid_doc = true.'),
+      rulesHeading('Search filters', 'Every search is narrowed by these, each named as in the tender search (closing_from, bid_doc, value and so on). A date may be today, or today+7 for a week on.'),
       pairTable('filters', ['Filter', 'Value']),
       rulesHeading('State groups', 'A name a department’s states can use for several states, comma-separated.'),
       pairTable('state_groups', ['Group', 'States']),
@@ -3446,11 +3480,6 @@
     const pillButton = event.target.closest('.pill-button');
     if (pillButton) {
       openDetails(pillButton.dataset.tcno);
-      return;
-    }
-    const dropButton = event.target.closest('.row-drop');
-    if (dropButton) {
-      saveDecision(dropButton.dataset.tcno, 'dropped');
       return;
     }
     if (event.target.closest('input, button, a, label, select')) return;

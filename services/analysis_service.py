@@ -1,7 +1,7 @@
 """
 Reads every file of a tender, indexes them all in the tender's own Pinecone namespace (tcno-<tcno>, in the shared
 index), retrieves the passages on eligibility from it and checks the company's eligibility against them with the
-LLM pipeline of ext.py:
+LLM pipeline of utils/llm.py:
 
   download -> extract text -> chunk -> embed -> upsert into namespace tcno-<tcno> -> retrieve relevant chunks
   -> assessment
@@ -19,12 +19,12 @@ from pathlib import Path
 from langchain_core.callbacks import UsageMetadataCallbackHandler
 from markitdown import MarkItDown, __version__ as MARKITDOWN_VERSION
 
-from ext import (ASSESSMENT_MODEL, OCR_MODEL, TenderTigerBlocked, assess_eligibility, make_model,
-                 prequalification_criteria)
 from services.cache_service import file_sha256
 from services.ocr_service import OCR_PAGE_COST, OCR_SETTINGS, ScanTooLong, add_ocr, ocr_parts
 from services.pinecone_service import Document, Retrieval, document_type
 from services.tender_service import to_row
+from utils.llm import ASSESSMENT_MODEL, OCR_MODEL, assess_eligibility, make_model
+from utils.tendertiger import TenderTigerBlocked, prequalification_criteria
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ _VERDICT_LABELS = {'eligible': ELIGIBLE, 'not eligible': NOT_ELIGIBLE, 'ineligib
 PREQUALIFICATION_SOURCE = 'TenderTiger Pre-Qualification'
 TENDER_DATA_SOURCE = 'TenderTiger Tender Data'
 # Where versions before the database saved a tender's last result and deep analysis, in its folder: one left there
-# is no document (scripts/import_files_to_db.py imports them)
+# is no document
 LEGACY_RESULT_FILE = 'eligibility_result.json'
 LEGACY_DEEP_ANALYSIS_FILE = 'deep_analysis.json'
 # Tender files that hold no eligibility criteria, so are not read: drawings (one tender's drawings ran to 300k
@@ -305,6 +305,10 @@ def read_documents(tcno_folder, files, usage, max_file_chars=300_000, workers=4,
     def read(path):
         # Relative path, because nested zips often contain files with the same name
         name = path.relative_to(tcno_folder).as_posix()
+        if path.suffix.lower() == '.zip':
+            # An inner zip the download could not extract (damaged, encrypted, nested too deep): not unpacked here
+            # either, where nothing would limit what it unpacks to
+            return name, None, f'{name} (a ZIP file that could not be extracted)'
         digest = file_sha256(path) if cache else None
         text = cache.text(digest, _READER) if cache else None
         unread = []  # the pages and images of a PDF with a text layer that OCR could not read
@@ -575,10 +579,11 @@ def _assess(llm, summaries, skipped, company, nothing_found, tender_details=None
                 'jv': {'allowed': 'unknown', 'max_members': None, 'verdict': None, 'conditions': []}}
     assessment = plain_maths(assess_eligibility(llm, summaries, company, tender_details))
     verdict = parse_verdict(assessment)
-    # A verdict that never saw some documents must not read as complete
-    if skipped and verdict == ELIGIBLE:
-        verdict = REQUIRES_REVIEW
     criteria = parse_criteria(assessment)
+    # Eligible must hold up: not when some documents were never seen (the check is not complete), nor when the reply's
+    # own table says a criterion is not met (the model slipped, or text in a document steered the verdict)
+    if verdict == ELIGIBLE and (skipped or any(criterion['status'] == 'not_met' for criterion in criteria)):
+        verdict = REQUIRES_REVIEW
     jv = parse_jv(assessment)
     comparison = compare_routes(criteria, jv)
     return {'verdict': verdict, 'details': _note_skipped(assessment, skipped), 'score': parse_score(assessment),
@@ -643,9 +648,11 @@ def _same_criterion(name, candidates):
     """The JV row in candidates for the criterion called name, or None."""
     key = criterion_key(name)
     exact = next((row for row in candidates if criterion_key(row['criterion']) == key), None)
+    # Then one name holding the other's words whole: "PAN" is not in "Company registration"
     return exact or next((row for row in candidates
                           if key and criterion_key(row['criterion'])
-                          and (key in criterion_key(row['criterion']) or criterion_key(row['criterion']) in key)),
+                          and (f' {key} ' in f" {criterion_key(row['criterion'])} "
+                               or f" {criterion_key(row['criterion'])} " in f' {key} ')),
                          None)
 
 
@@ -737,7 +744,9 @@ def parse_criteria(assessment):
 class _Rows:
     """
     Criteria rows read from one or more tables, in order. A row replaces the row of the same criterion from an
-    earlier table (a corrected table); within one table, rows of the same name are all kept.
+    earlier table (a corrected table), but for the fields it leaves empty, which keep the earlier row's: a short
+    summary table after the verdict (Criterion | Status) does not blank its requirement, figures and source. Within
+    one table, rows of the same name are all kept.
     """
 
     def __init__(self):
@@ -754,7 +763,8 @@ class _Rows:
         key = criterion_key(row['criterion'])
         earlier = next((entry for entry in self._rows if entry[1] == key and entry[0] < self._table), None)
         if earlier:
-            earlier[0], earlier[2] = self._table, row
+            kept = {field: value for field, value in row.items() if value}
+            earlier[0], earlier[2] = self._table, {**earlier[2], **kept}
         else:
             self._rows.append([self._table, key, row])
 
@@ -852,16 +862,23 @@ def _split_jv(assessment):
     one written in bold ends at any markdown heading, but not at bold lines such as "**Conditions:**".
     """
     lines = (assessment or '').splitlines()
-    start = next((i for i, line in enumerate(lines) if _heading_level(line) and _JV_WORDS.search(line)), None)
-    if start is None:
+    starts = [i for i, line in enumerate(lines) if _heading_level(line) and _JV_WORDS.search(line)]
+    if not starts:
         return lines, []
-    top = min(_heading_level(lines[start]), 6)
 
-    def ends(line):
-        level = _heading_level(line)
-        return bool(re.search(r'overall\s+verdict', line, re.IGNORECASE)) or (level is not None and level <= top)
+    def end_of(start):
+        top = min(_heading_level(lines[start]), 6)
 
-    end = next((i for i in range(start + 1, len(lines)) if ends(lines[i])), len(lines))
+        def ends(line):
+            level = _heading_level(line)
+            return bool(re.search(r'overall\s+verdict', line, re.IGNORECASE)) or (level is not None and level <= top)
+
+        return next((i for i in range(start + 1, len(lines)) if ends(lines[i])), len(lines))
+
+    # The section that says whether a JV may bid, as ELIGIBILITY_TASK asks for, not a heading of the working-out
+    # before it such as "### 2. Joint venture share"; the first one if none says
+    start = next((start for start in starts if _JV_ALLOWED.search('\n'.join(lines[start:end_of(start)]))), starts[0])
+    end = end_of(start)
     return lines[:start] + lines[end:], lines[start:end]
 
 
@@ -886,11 +903,22 @@ def _jv_columns(header):
 
 
 def _status(text):
-    """Met / Not met / anything else, as 'met', 'not_met' or 'unknown'."""
+    """
+    Met / Not met / anything else, as 'met', 'not_met' or 'unknown'. A status starting "Not met" is not met; else one
+    the model hedges is unknown ("Cannot determine whether the 26% share is met", "Partially met"), and "not" a word
+    or two before "met" is not met ("Not fully met", "has not been met"). Only then does "met" alone mean met.
+    """
     text = text.lower()
-    if re.search(r'\bnot\s+met\b', text):
+    if re.match(r'\W*not\s+met\b', text):
+        return 'not_met'
+    if _UNSURE.search(text):
+        return 'unknown'
+    if re.search(r'\bnot(?:\s+\w+){0,2}\s+met\b|\bunmet\b', text):
         return 'not_met'
     return 'met' if re.search(r'\bmet\b', text) else 'unknown'
+
+
+_UNSURE = re.compile(r"\b(?:cannot|can't|could not|unable|unclear|uncertain|undetermined|partial(?:ly)?)\b")
 
 
 def _cell_text(cell):

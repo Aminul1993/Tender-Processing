@@ -44,7 +44,7 @@ class Config:
     PINECONE_CLOUD = os.getenv('PINECONE_CLOUD', 'aws')
     PINECONE_REGION = os.getenv('PINECONE_REGION', 'us-east-1')
     # Pinecone-hosted embedding model and its dimension (llama-text-embed-v2: 384, 512, 768, 1024 or 2048).
-    # Changing either needs every index rebuilt (scripts/migrate_to_pinecone.py --force).
+    # Changing either needs a new PINECONE_INDEX_NAME: each tender is indexed into it when next checked.
     PINECONE_EMBED_MODEL = os.getenv('PINECONE_EMBED_MODEL', 'llama-text-embed-v2')
     PINECONE_EMBED_DIMENSION = int(os.getenv('PINECONE_EMBED_DIMENSION', '1024'))
     # The metric of an index made by the app. dotproduct scores the dense vectors as cosine does and also takes

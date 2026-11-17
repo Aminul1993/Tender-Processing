@@ -347,9 +347,20 @@ kbd {
 .dot-failed { --dot: var(--failed-dot); }
 .dot-approval { --dot: var(--approval-dot); }
 .dot-none { --dot: var(--none-dot); }
-.dot-processing { --dot: var(--processing-dot); }
 
 /* ---------- controls ---------- */
+
+/* Figures are typed, never stepped (step="any"): no browser spinner arrows in the fields */
+input[type="number"] {
+  appearance: textfield;
+  -moz-appearance: textfield;
+}
+
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  margin: 0;
+  -webkit-appearance: none;
+}
 
 .button {
   display: inline-flex;
@@ -481,7 +492,6 @@ kbd {
 .switch-button:focus-visible,
 .sort-button:focus-visible,
 .pill-button:focus-visible,
-.row-drop:focus-visible,
 .run-count:focus-visible,
 .bar-link:focus-visible,
 .link-button:focus-visible,
@@ -887,10 +897,11 @@ select.filter-input {
   gap: 5px;
   align-self: flex-start;
   max-width: 100%;
-  padding: 1px 8px 1px 6px;
+  padding: 0 7px 0 5px;
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: var(--accent-wash);
-  color: var(--accent-strong);
+  background: var(--surface);
+  color: var(--ink-3);
   font-size: 12px;
   font-weight: 500;
   line-height: 1.5;
@@ -903,6 +914,7 @@ select.filter-input {
 }
 
 .org-watch .bi {
+  color: var(--meta);
   font-size: 11px;
 }
 
@@ -1145,7 +1157,7 @@ select.filter-input {
  * Organisation folds into the Tender column so Eligibility stays on screen. Below 768px: one card per tender.
  */
 .tender-table {
-  --cols: 52px minmax(0, 2.6fr) minmax(0, 1.5fr) 120px 150px 190px 44px;
+  --cols: 52px minmax(0, 2.6fr) minmax(0, 1.5fr) 120px 150px 190px;
   display: block;
   width: 100%;
   margin: 0;
@@ -1208,7 +1220,7 @@ select.filter-input {
 
 /*
  * Cells share the row's first line: title, organisation, value, closing date and verdict read across on one
- * baseline, with the checkbox and drop button beside it, however tall the verdict or organisation runs.
+ * baseline, with the checkbox beside it, however tall the verdict or organisation runs.
  */
 .tender-table tbody tr {
   align-items: first baseline;
@@ -1236,7 +1248,6 @@ select.filter-input {
   opacity: .5;
 }
 
-.tender-table tbody tr.is-dropped > .cell-drop,
 .tender-table tbody tr.is-dropped:focus-within > td {
   opacity: 1;
 }
@@ -1405,39 +1416,6 @@ th.cell-value {
   align-items: flex-start;
   gap: 4px;
   min-width: 0;
-}
-
-.cell-drop {
-  display: grid;
-  place-items: center;
-}
-
-/* Rows: checkbox and drop button sit on the first line with the title, not on a baseline of their own */
-tbody .cell-drop {
-  align-self: start;
-  margin-top: -4px;
-}
-
-.row-drop {
-  display: grid;
-  place-items: center;
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--faint);
-  font-size: 18px;
-  line-height: 1;
-  cursor: pointer;
-  transition: background-color .12s var(--ease-out), border-color .12s var(--ease-out), color .12s var(--ease-out);
-}
-
-.row-drop:hover {
-  border-color: var(--control-line);
-  background: var(--surface);
-  color: var(--ink);
 }
 
 /* ---------- verdict pills ---------- */
@@ -2795,14 +2773,15 @@ select.select.status-select {
   border-top: 1px solid var(--line-2);
 }
 
-.deep-list {
+/* A short list of notes in a summary panel: the JV conditions, a deep analysis's points */
+.note-list {
   margin: 0;
   padding-left: 18px;
   font-size: 13px;
   line-height: 1.5;
 }
 
-.deep-list li + li {
+.note-list li + li {
   margin-top: 8px;
 }
 
@@ -3230,7 +3209,7 @@ input.watchlist-find {
 
 @media (max-width: 1199.98px) {
   .tender-table {
-    --cols: 44px minmax(0, 1fr) 112px 140px minmax(150px, 190px) 44px;
+    --cols: 44px minmax(0, 1fr) 112px 140px minmax(150px, 190px);
   }
 
   .cell-org {
@@ -3331,7 +3310,7 @@ input.watchlist-find {
   .tender-table tbody tr {
     grid-template-columns: 32px minmax(0, 1fr) auto;
     grid-template-areas:
-      "check tender drop"
+      "check tender tender"
       "check verdict verdict"
       "check closes value";
     gap: 12px 8px;
@@ -3344,7 +3323,6 @@ input.watchlist-find {
   .tender-table tbody .cell-closes { grid-area: closes; }
   /* Top-aligned, so its label shares a line with Closes and the amount sits level with the date */
   .tender-table tbody .cell-value { grid-area: value; align-self: start; padding-right: 0 !important; }
-  .tender-table tbody .cell-drop { grid-area: drop; align-self: start; }
 
   .cell-closes::before,
   .cell-value::before {
