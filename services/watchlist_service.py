@@ -12,8 +12,8 @@ department with a minimum value drops a tender TenderTiger gives no value for (0
 names of their own, such as West Bengal's "public works department||p.w. directorate||...", are found only on the
 pages of TenderTiger's list: no exact name finds them, and a location search with the bid-documents filter finds
 nothing at all. TenderTiger is asked once every TENDERTIGER_REQUEST_GAP seconds, so a refresh takes minutes: it runs
-in a thread, when asked or once the list is older than WATCHLIST_REFRESH_HOURS, and the list is saved in the
-database (the watchlist_tenders table; when it was refreshed, and last searched, in app_state).
+in a thread when Search again is pressed on the page, or in scripts/process_watchlist.py on a schedule, and the list
+is saved in the database (the watchlist_tenders table; when it was refreshed, in app_state).
 """
 import hashlib
 import json
@@ -32,20 +32,15 @@ from services import tender_service
 log = logging.getLogger(__name__)
 
 CRORE = 10_000_000
-# The names in app_state of when the list was refreshed ({'refreshed_at', 'rules': the fingerprint of the rules it
-# searched with}), and when the last refresh started ({'started_at'}), so a restart does not start another at once
+# The name in app_state of when the list was refreshed ({'refreshed_at', 'rules': the fingerprint of the rules it
+# searched with})
 REFRESHED = 'watchlist_refresh'
-SEARCHED = 'watchlist_search'
 SEARCH_PAGE = 500     # tenders asked for at once: the most TenderTiger sends
 SEARCH_CAP = 10_000   # the most tenders one TenderTiger search serves
 ANY_STATE = 'any'
 # How errors name the watchlist, and what to do without one
 SOURCE = 'the watchlist'
 MISSING = 'There is no watchlist yet: add its departments with Edit watchlist on the page.'
-# Seconds between the schedule's checks, and the least time between two refreshes it starts itself (so a refresh
-# that failed, say on TenderTiger's firewall, is not tried again at once)
-SCHEDULE_SECONDS = 15 * 60
-RETRY_SECONDS = 60 * 60
 
 # The states and union territories the watchlist may name, and TenderTiger's other names for some of them
 STATES = {
@@ -336,14 +331,12 @@ class WatchlistRunner:
     watchlist_tenders table, and the list shows that table as it is. An edit of the rules shows at the next search.
     """
 
-    def __init__(self, db, refresh_hours=24):
+    def __init__(self, db):
         self.db = db  # a services.database.Database: the rules and the list are in it
-        self.refresh_hours = refresh_hours
         self._lock = threading.Lock()
         self._refreshed_at = None   # when the last refresh finished (ISO, UTC)
         self._searched_rules = None  # the fingerprint of the rules it searched with
         self._run = None            # the refresh in progress, or the last one
-        self._attempted_at = self._load_attempt()  # when the last refresh started, in this process or one before
         self._load_cache()
 
     # ---------- the rules ----------
@@ -420,7 +413,7 @@ class WatchlistRunner:
         The watchlist's state: {status: idle | running | completed | failed, refreshed_at, tenders (saved by the last
         search), departments (with any), searched, searches, current (the organisation name being searched), found,
         started_at, finished_at, error, capped (names whose tenders did not all fit TenderTiger's search),
-        refresh_hours, changed (the rules changed since the last search)}.
+        changed (the rules changed since the last search)}.
         """
         self._sync()
         try:
@@ -437,7 +430,7 @@ class WatchlistRunner:
             'departments': departments, 'searched': run.get('searched', 0),
             'searches': run.get('searches', 0), 'current': run.get('current'), 'found': run.get('found', 0),
             'started_at': run.get('started_at'), 'finished_at': run.get('finished_at'), 'error': run.get('error'),
-            'capped': run.get('capped', []), 'refresh_hours': self.refresh_hours,
+            'capped': run.get('capped', []),
             'changed': bool(raw and searched_rules and fingerprint(raw) != searched_rules),
         }
 
@@ -458,13 +451,11 @@ class WatchlistRunner:
         with self._lock:
             running = bool(self._run and self._run['status'] == 'running')
             if not running:
-                self._attempted_at = datetime.now(timezone.utc)
                 self._run = {'status': 'running', 'searched': 0, 'searches': len(names), 'current': None, 'found': 0,
-                             'started_at': self._attempted_at.isoformat(timespec='seconds'),
+                             'started_at': _now(),
                              'started': time.monotonic(), 'finished_at': None, 'error': None, 'capped': []}
         if running:
             return self.status()
-        self._save_attempt()
         log.info('Watchlist refresh started: %d organisations to search', len(names))
         if wait:
             self._refresh(rules, filters, names)
@@ -542,49 +533,6 @@ class WatchlistRunner:
                 return list(tenders.values())
             start = reached
 
-    # ---------- the schedule ----------
-
-    def schedule(self, first_delay=60, every=SCHEDULE_SECONDS):
-        """
-        Refreshes in the background whenever the list is older than refresh_hours (or was never refreshed): checks
-        after first_delay seconds, then every `every` seconds. Not with refresh_hours 0.
-        """
-        if not self.refresh_hours or self.refresh_hours <= 0:
-            return None
-        thread = threading.Thread(target=self._scheduled, args=(first_delay, every), name='watchlist-schedule',
-                                  daemon=True)
-        thread.start()
-        return thread
-
-    def due(self):
-        """
-        Whether the schedule would refresh now: the list is old or missing, and no refresh started in the last
-        RETRY_SECONDS, in this process or another (a restart in the middle of a refresh does not start another, nor
-        does a refresh scripts/process_watchlist.py made).
-        """
-        self._sync()
-        with self._lock:
-            refreshed_at, attempted_at = self._refreshed_at, self._attempted_at
-            running = bool(self._run and self._run['status'] == 'running')
-        now = datetime.now(timezone.utc)
-        if running or (attempted_at and (now - attempted_at).total_seconds() < RETRY_SECONDS):
-            return False
-        return refreshed_at is None or (now - datetime.fromisoformat(refreshed_at)).total_seconds() >= \
-            self.refresh_hours * 3600
-
-    def _scheduled(self, first_delay, every):
-        wait = first_delay
-        while True:
-            time.sleep(wait)
-            wait = every
-            if self.due():
-                try:
-                    self.start()
-                except WatchlistMissing:
-                    pass
-                except WatchlistError as exc:
-                    log.warning('The watchlist is not refreshed: %s', exc)
-
     # ---------- the saved list ----------
 
     def _load_cache(self):
@@ -601,30 +549,15 @@ class WatchlistRunner:
     def _sync(self):
         """
         Takes up, from the database, a refresh another process made (scripts/process_watchlist.py, say): when the
-        saved list was refreshed and with which rules, and when the last refresh started.
+        saved list was refreshed, and with which rules.
         """
         try:
-            refreshed, searched = self.db.value(REFRESHED), self.db.value(SEARCHED)
+            refreshed = self.db.value(REFRESHED)
         except psycopg.Error:
             return
-        with self._lock:
-            if refreshed:
+        if refreshed:
+            with self._lock:
                 self._refreshed_at, self._searched_rules = refreshed['refreshed_at'], refreshed.get('rules')
-            if searched:
-                self._attempted_at = datetime.fromisoformat(searched['started_at'])
-
-    def _load_attempt(self):
-        try:
-            searched = self.db.value(SEARCHED)
-        except psycopg.Error:
-            return None
-        return datetime.fromisoformat(searched['started_at']) if searched else None
-
-    def _save_attempt(self):
-        try:
-            self.db.set_value(SEARCHED, {'started_at': self._attempted_at.isoformat()})
-        except psycopg.Error:
-            log.warning('Could not save when the watchlist refresh started', exc_info=True)
 
 
 def load_list(db):

@@ -69,7 +69,7 @@ def process_watchlist(config, threads=1, vector_store=None):
 
     log.info("Searching TenderTiger for the watchlist's tenders")
     try:
-        status = WatchlistRunner(db, refresh_hours=0).start(wait=True)
+        status = WatchlistRunner(db).start(wait=True)
     except WatchlistError as exc:  # no watchlist, or one that cannot be searched
         log.error('The watchlist could not be searched: %s', exc)
         return 1

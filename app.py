@@ -42,9 +42,8 @@ def create_app(config_object=Config, vector_store=None):
     app.state.tender_processor.start_workers()
     app.state.decisions = DecisionStore(db)
     app.state.deep_analyses = DeepAnalysisRunner(app.state.tender_processor, db, app.state.decisions)
-    app.state.watchlist = WatchlistRunner(db, config_object.WATCHLIST_REFRESH_HOURS)
-    # Refreshes the watchlist in the background once it is older than WATCHLIST_REFRESH_HOURS
-    app.state.watchlist.schedule()
+    # Searched when Search again is pressed; on a schedule, by scripts/process_watchlist.py
+    app.state.watchlist = WatchlistRunner(db)
     app.mount('/static', StaticFiles(directory=BASE_DIR / 'static'), name='static')
     app.include_router(pages)
     app.include_router(api)

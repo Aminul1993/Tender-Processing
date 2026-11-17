@@ -3,7 +3,7 @@ import json
 import tempfile
 import time
 import unittest
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -175,7 +175,7 @@ class WatchlistRunnerTest(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def runner(self):
-        return WatchlistRunner(self.db, refresh_hours=24)
+        return WatchlistRunner(self.db)
 
     def refresh(self, runner):
         runner.start()
@@ -303,46 +303,17 @@ class WatchlistRunnerTest(unittest.TestCase):
         self.assertEqual((status['tenders'], status['refreshed_at'], status['changed']),
                          (5, before['refreshed_at'], True))
 
-    def age(self, refreshed_hours=None):
-        """As if the last refresh started RETRY_SECONDS ago, and, given refreshed_hours, finished that long ago."""
-        started = datetime.now(timezone.utc) - timedelta(seconds=watchlist_service.RETRY_SECONDS + 1)
-        self.db.set_value(watchlist_service.SEARCHED, {'started_at': started.isoformat()})
-        if refreshed_hours is not None:
-            refreshed = self.db.value(watchlist_service.REFRESHED)
-            refreshed['refreshed_at'] = (datetime.now(timezone.utc) - timedelta(hours=refreshed_hours)).isoformat()
-            self.db.set_value(watchlist_service.REFRESHED, refreshed)
-
-    def test_the_schedule_refreshes_an_old_or_missing_list_and_waits_after_a_failure(self):
-        runner = self.runner()
-        self.assertTrue(runner.due())  # never refreshed
-        self.refresh(runner)
-        self.assertFalse(runner.due())
-        self.age(refreshed_hours=25)
-        self.assertTrue(runner.due())
-        self.assertIsNone(WatchlistRunner(self.db, refresh_hours=0).schedule())
-
-    def test_a_refresh_another_process_made_is_taken_up(self):
-        app = self.runner()  # the web app, its list 25 hours old
-        self.refresh(app)
-        self.age(refreshed_hours=25)
-        self.assertTrue(app.due())
-        before = app.status()['refreshed_at']
+    def test_a_refresh_another_process_made_is_shown(self):
+        app = self.runner()  # the web app
+        before = self.refresh(app)['refreshed_at']
+        time.sleep(1.1)  # so the next search finishes a second later
         script = self.runner()  # scripts/process_watchlist.py, searching meanwhile
         self.assertEqual(script.start(wait=True)['status'], 'completed')
 
-        # The app shows when the script refreshed the list, and its schedule does not search again
+        # The app shows when the script refreshed the list
         self.assertNotEqual(app.status()['refreshed_at'], before)
         self.assertEqual(app.status()['refreshed_at'], script.status()['refreshed_at'])
-        self.assertFalse(app.due())
-
-    def test_a_restart_during_a_refresh_does_not_start_another_at_once(self):
-        with mock.patch('services.tender_service.tender_list', side_effect=RuntimeError('the app was stopped')):
-            status = self.refresh(self.runner())  # nothing saved, as when the app stops in the middle
-        self.assertEqual(status['refreshed_at'], None)
-        restarted = self.runner()
-        self.assertFalse(restarted.due())
-        self.age()
-        self.assertTrue(restarted.due())
+        self.assertFalse(hasattr(app, 'schedule'))  # the web app never searches on its own
 
 
 class WatchlistApiTest(unittest.TestCase):
@@ -357,7 +328,6 @@ class WatchlistApiTest(unittest.TestCase):
             LOG_LEVEL = 'WARNING'
             DATABASE_URL, DATABASE_SCHEMA = db.url, db.schema
             JOB_WORKERS = 1
-            WATCHLIST_REFRESH_HOURS = 0
 
         CompanyStore(db).save('# Company\n\n| Item | Value |\n|---|---|\n| Company Name | ABC |')
         self.config = TestConfig

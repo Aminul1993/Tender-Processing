@@ -30,9 +30,6 @@ class Config:
     # several installs).
     DATABASE_URL = os.getenv('DATABASE_URL') or None
     DATABASE_SCHEMA = os.getenv('DATABASE_SCHEMA', 'public')
-    # Hours before the watchlist's tenders are searched for again in the background (a refresh takes about 15
-    # minutes of TenderTiger requests); 0 refreshes only when Refresh is pressed
-    WATCHLIST_REFRESH_HOURS = float(os.getenv('WATCHLIST_REFRESH_HOURS', '24'))
 
     # Pinecone: every tender's documents are chunked, embedded and stored in a namespace of its own,
     # PINECONE_NAMESPACE_PREFIX + TCNO (tcno-12345678), in one shared index, PINECONE_INDEX_NAME (made on first use).

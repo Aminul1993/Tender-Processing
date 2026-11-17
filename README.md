@@ -238,8 +238,9 @@ the page. Before searching, it checks that the TenderTiger login, `GROQ_API_KEY`
 profile are there. The tenders join the web app's job when one is running, so the page shows them, and worker
 processes may take some. The script also checks the tenders the team queued meanwhile, and exits once none is
 queued. The requests to TenderTiger are spaced out by `TENDERTIGER_REQUEST_GAP` across the script, the web app and
-the workers together. The web app takes up the refreshed list, so its own schedule (`WATCHLIST_REFRESH_HOURS`) does
-not search again. Logs go to `process-watchlist.log`.
+the workers together. The web app shows the refreshed list, and when it was searched. Logs go to
+`process-watchlist.log`. The web app has no schedule of its own: this script is how the watchlist is searched
+without anyone pressing **Search again**.
 
 **remove_closed_tenders.py** removes every checked tender whose bid submission (closing) date was 7 days ago or more,
 as **Delete** does in **Closed tenders**: its Pinecone namespace, its downloaded documents, and its result, deep
@@ -298,7 +299,6 @@ schtasks /Create /TN "Tender cleanup" /SC DAILY /ST 05:30 /TR "cmd /c cd /d C:\p
 | `OCR_BUDGET_USD` | `0.5` | The most that OCR could cost a tender, in US dollars, every page at `OCR_PAGE_COST`, before the team is asked; 0 is no limit |
 | `OCR_PAGE_COST` | `0.0056` | The most one page sent to `OCR_MODEL` costs, in US dollars (2,644 input and 882 output tokens at qwen3.8-27b's $0.80 / $4.00 per million); update it when the model or its price changes |
 | `MAX_FILE_CHARS` | `300000` | A tender file with more text is not indexed and is listed as not checked. A scanned PDF is judged from its page count before OCR, at about 2,000 characters a page (150 pages at the default), and its OCR stops at the page where the text passes the limit |
-| `WATCHLIST_REFRESH_HOURS` | `24` | Hours before the watchlist's tenders are searched for again in the background (checked every 15 minutes, and a minute after the app starts); `0` searches only when **Search again** is pressed |
 | `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, ... |
 | `LOG_DIRECTORY` | `./logs` | `app.log` is written here, rotated at 5 MB |
 | `PORT` | `5000` | Port for `python app.py` |
@@ -387,10 +387,11 @@ bid documents close on a single day, so the whole list can never be read. The or
 name, not a list, and finds nothing at all when a location is added. So a search ("refresh") asks TenderTiger for
 each organisation name of the departments, one at a time, closing from today, and keeps the tenders a department
 claims.
-Paced by `TENDERTIGER_REQUEST_GAP`, its 126 searches take 10 to 15 minutes; it runs in a thread of the web app,
-once the list is older than `WATCHLIST_REFRESH_HOURS` or when asked, and the list is saved in the database (the
-`watchlist_tenders` table), so a restart keeps it. A restart never starts another search within an hour of the last
-one starting (`app_state` says when). The tenders on it can be checked like any other.
+Paced by `TENDERTIGER_REQUEST_GAP`, its 126 searches take 10 to 15 minutes. The web app searches only when
+**Search again** is pressed, in a thread of its own; to search on a schedule, run `scripts/process_watchlist.py`
+from the system's scheduler (see **Scheduled scripts**), which also checks the new tenders. The list is saved in the
+database (the `watchlist_tenders` table), so a restart keeps it, and the page shows a search the script made. The
+tenders on it can be checked like any other.
 
 What it misses: on the 10,000 tenders that closed on 13 Nov 2026, the departments claimed 813, and exact names find
 93% of them. The rest are offices TenderTiger lists under names of their own, almost all West Bengal PWD
@@ -832,8 +833,7 @@ whole. Unlike TenderTiger's list it has a `total`, so `has_more` is exact, and `
 {
   "status": "running", "refreshed_at": "2026-11-13T06:10:42+00:00", "tenders": 1212, "departments": 61,
   "searched": 45, "searches": 126, "current": "military engineer services", "found": 503,
-  "started_at": "2026-11-14T06:11:00+00:00", "finished_at": null, "error": null, "capped": [],
-  "refresh_hours": 24.0, "changed": false
+  "started_at": "2026-11-14T06:11:00+00:00", "finished_at": null, "error": null, "capped": [], "changed": false
 }
 ```
 

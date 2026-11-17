@@ -1435,7 +1435,6 @@ class ApiTest(unittest.TestCase):
             LOG_LEVEL = 'WARNING'
             DATABASE_URL, DATABASE_SCHEMA = db.url, db.schema  # a database of its own, whatever .env says
             JOB_WORKERS = 1
-            WATCHLIST_REFRESH_HOURS = 0  # refreshed only when a test asks
 
         CompanyStore(db).save(COMPANY)
 
