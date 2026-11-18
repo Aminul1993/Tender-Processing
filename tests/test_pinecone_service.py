@@ -460,7 +460,7 @@ class HierarchicalRetrievalTest(unittest.TestCase):
                                                                'Average annual turnover', 'Similar works'))]
         self.assertEqual(retrieval.whole_sections, [{
             'source_file': 'NIT.pdf', 'title': 'SECTION 3: QUALIFICATION CRITERIA',
-            'chunks': f'{min(section)}-{max(section)}', 'label': 'qualification section'}])
+            'chunks': f'{min(section)}-{max(section)}', 'label': 'qualification section', 'picked_by': 'search'}])
         taken = {chunk['chunk_index'] for chunk in retrieval.chunks if 'qualification section' in chunk['queries']}
         self.assertEqual(taken, set(range(min(section), max(section) + 1)))
         self.assertIn('scope', {label for chunk in retrieval.chunks for label in chunk['queries']})
@@ -488,6 +488,86 @@ class HierarchicalRetrievalTest(unittest.TestCase):
         retrieval = index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION)
         self.assertEqual(retrieval.whole_sections, [])
         self.assertTrue(retrieval.chunks)
+
+
+class ChosenSectionsTest(unittest.TestCase):
+    """A model chooses the sections to take whole by their headings; the searches choose when it cannot."""
+
+    def setUp(self):
+        self.client = FakePinecone(dimension=512)
+        self.index = service(self.client, dimension=512, chunk_size=300, chunk_overlap=40, top_k=4, max_chars=4000)
+        self.index.rebuild_namespace('1', [
+            Document('TenderTiger Pre-Qualification', 'Turnover of Rs 25 lakh.', 'prequalification'),
+            Document('NIT.pdf', SECTIONED_NIT, 'nit'),
+            Document('BOQ.xlsx', 'SCHEDULE OF QUANTITIES\n\n' + paragraphs('Earthwork', 2), 'boq')])
+        self.offered = None
+
+    def choose(self, *titles):
+        """A chooser that answers with the IDs of the sections with these titles, and keeps what it was offered."""
+        def choose(sections):
+            self.offered = sections
+            return [section['id'] for title in titles for section in sections if section['title'] == title]
+        return choose
+
+    def chunks_of(self, retrieval, title):
+        section = next(section for section in retrieval.whole_sections if section['title'] == title)
+        first, last = (int(part) for part in section['chunks'].split('-'))
+        return set(range(first, last + 1))
+
+    def test_the_headings_are_listed_in_the_manifest_but_not_for_the_tendertiger_texts(self):
+        sources = {source['name']: source for source in self.index.manifest('1')['sources']}
+        self.assertNotIn('contents', sources['TenderTiger Pre-Qualification'])
+        titles = [(tier, title) for tier, _, _, _, title in sources['NIT.pdf']['contents']]
+        self.assertEqual(titles, [(1, 'NOTICE INVITING TENDER'), (1, 'SECTION 3: QUALIFICATION CRITERIA'),
+                                  (2, '3.1 Financial Criteria'), (2, '3.2 Experience Criteria'),
+                                  (1, 'SECTION 4: SCOPE OF WORK'), (1, 'SECTION 5: SPECIAL CONDITIONS OF CONTRACT')])
+
+    def test_the_sections_the_model_chooses_are_taken_whole_in_its_order(self):
+        retrieval = self.index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION,
+                                        choose_sections=self.choose('3.2 Experience Criteria',
+                                                                    '3.1 Financial Criteria'))
+
+        self.assertEqual([(section['title'], section['picked_by'], section['label'])
+                          for section in retrieval.whole_sections],
+                         [('3.2 Experience Criteria', 'model', 'qualification section'),
+                          ('3.1 Financial Criteria', 'model', 'qualification section')])
+        taken = {chunk['chunk_index'] for chunk in retrieval.chunks if 'qualification section' in chunk['queries']}
+        self.assertEqual(taken, self.chunks_of(retrieval, '3.1 Financial Criteria')
+                         | self.chunks_of(retrieval, '3.2 Experience Criteria'))
+        self.assertIn('Similar works: one completed work', '\n'.join(retrieval.sections()))
+        # Neither the bill of quantities nor TenderTiger's texts (sent whole anyway) are offered
+        self.assertEqual({section['source_file'] for section in self.offered}, {'NIT.pdf'})
+
+    def test_a_section_too_long_to_take_whole_is_offered_without_an_id(self):
+        index = service(self.client, dimension=512, chunk_size=300, chunk_overlap=40, top_k=4, max_chars=4000,
+                        section_share=0.2)  # 800 characters: two chunks at most
+        retrieval = index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION,
+                                   choose_sections=self.choose('SECTION 4: SCOPE OF WORK', '3.1 Financial Criteria'))
+        ids = {section['title']: section['id'] for section in self.offered}
+        self.assertIsNone(ids['SECTION 4: SCOPE OF WORK'])
+        self.assertRegex(ids['3.1 Financial Criteria'], r'^S\d+$')
+        self.assertEqual([section['title'] for section in retrieval.whole_sections], ['3.1 Financial Criteria'])
+
+    def test_the_searches_choose_when_the_model_fails_chooses_none_or_names_no_listed_section(self):
+        def fails(sections):
+            raise ConnectionError('Groq is down')
+
+        for choose in (fails, lambda sections: [], lambda sections: ['S99', 'none']):
+            with self.assertLogs('services.pinecone_service', 'INFO'):
+                retrieval = self.index.retrieve('1', {'scope': ['drainage works']}, section_queries=QUALIFICATION,
+                                                choose_sections=choose)
+            self.assertEqual([(section['title'], section['picked_by']) for section in retrieval.whole_sections],
+                             [('SECTION 3: QUALIFICATION CRITERIA', 'search')])
+
+    def test_a_namespace_built_before_headings_were_listed_is_left_to_the_searches(self):
+        manifest = self.index.manifest('1')
+        for source in manifest['sources']:
+            source.pop('contents', None)
+        choose = mock.Mock(return_value=['S1'])
+        retrieval = self.index.retrieve('1', {'scope': ['drainage works']}, manifest=manifest,
+                                        section_queries=QUALIFICATION, choose_sections=choose)
+        choose.assert_not_called()
+        self.assertEqual([section['picked_by'] for section in retrieval.whole_sections], ['search'])
 
 
 class SectionTest(unittest.TestCase):

@@ -3,6 +3,7 @@ import copy
 import io
 import json
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -44,7 +45,8 @@ from services.pinecone_service import Document, NamespaceIncomplete, PineconeSer
 from services.processing_service import TenderProcessor, explain_error, result_brief
 from tests.test_database import scratch_database
 from tests.test_profile_gap_service import pdf_rows
-from utils.llm import EXCERPTS_END, EXCERPTS_START, AnswerCutOff, _whole_reply, make_model
+from utils.llm import (EXCERPTS_END, EXCERPTS_START, SECTION_MAX_OUTPUT_TOKENS, SECTION_MODEL, SECTIONS_START,
+                       AnswerCutOff, _whole_reply, make_model)
 from utils.tendertiger import TENDERTIGER_BLOCKED, TenderTigerBlocked, share_pacing
 
 SAMPLE_TENDERS = {
@@ -578,6 +580,66 @@ class IndexedCriteriaTest(AnalysisTestCase):
             self.process()
         read.assert_not_called()  # before any file is read, so no OCR is paid for
         self.assertEqual(explain_error(raised.exception)[0], 'The Pinecone namespace limit is reached')
+
+
+class SectionChoiceTest(AnalysisTestCase):
+    """SECTION_MODEL chooses, by the documents' headings, the sections the check reads whole."""
+
+    NIT = '\n\n'.join([
+        'NOTICE INVITING TENDER\n\n' + 'General terms of the tender for road works in the district. ' * 12,
+        'SECTION 3: QUALIFICATION CRITERIA\n\nThe bidder must meet every criterion below.',
+        '3.1 Financial Criteria\n\nAverage annual turnover of Rs. 25 lakh in the last three financial years.',
+        '3.2 Experience Criteria\n\nOne similar completed work of 2.5 crore in the last seven years.',
+        'SECTION 4: SCOPE OF WORK\n\n' + 'The contractor shall lay drains and keep records of materials. ' * 20,
+    ])
+
+    def setUp(self):
+        super().setUp()
+        (self.folder / 'NIT.txt').write_text(self.NIT, encoding='utf-8')
+        self.listings = []
+
+        def invoke(messages):
+            listing = messages[1]['content']
+            if not listing.startswith(SECTIONS_START):
+                return mock.Mock(content=ASSESSMENT)
+            self.listings.append(listing)
+            return mock.Mock(content=re.search(r'(S\d+) 3\.1 Financial Criteria', listing).group(1))
+
+        self.llm.invoke.side_effect = invoke
+
+    def test_the_check_and_a_recheck_read_the_section_the_model_chose_whole(self):
+        with mock.patch('services.analysis_service.make_model', return_value=self.llm) as make:
+            result = self.process(tender=SAMPLE_TENDERS['TenderList'][0])
+
+        make.assert_any_call(SECTION_MODEL, SECTION_MAX_OUTPUT_TOKENS, 'low')
+        self.assertEqual([(section['title'], section['picked_by']) for section in result['index']['whole_sections']],
+                         [('3.1 Financial Criteria', 'model')])
+        self.assertIn('Average annual turnover of Rs. 25 lakh', self.sources_sent())
+        # The TenderTiger data is sent whole anyway, so its headings are not offered
+        self.assertIn('## NIT.txt', self.listings[0])
+        self.assertNotIn('TenderTiger', self.listings[0])
+
+        result = self.recheck()
+        self.assertEqual(len(self.listings), 2)
+        self.assertEqual([section['picked_by'] for section in result['index']['whole_sections']], ['model'])
+
+        # The deep analysis reads the same section, without asking the model again
+        knowledge = deep.load_knowledge(self.index, '100091540', result)
+        self.assertEqual(len(self.listings), 2)
+        self.assertIn("The documents' qualification section, given whole", knowledge['text'])
+        self.assertIn('Average annual turnover of Rs. 25 lakh', knowledge['text'])
+
+    def test_the_searches_choose_the_section_when_the_model_cannot(self):
+        def invoke(messages):
+            if messages[1]['content'].startswith(SECTIONS_START):
+                raise ConnectionError('timed out')
+            return mock.Mock(content=ASSESSMENT)
+
+        self.llm.invoke.side_effect = invoke
+        with self.assertLogs('services.pinecone_service', 'WARNING'):
+            result = self.process()
+        self.assertEqual(result['verdict'], 'Not Eligible')
+        self.assertEqual({section['picked_by'] for section in result['index']['whole_sections']}, {'search'})
 
 
 class FileSelectionTest(AnalysisTestCase):

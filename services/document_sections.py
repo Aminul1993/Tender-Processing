@@ -16,6 +16,9 @@ smallest first: a chunk holding the end of one section and the heading of the ne
 two chunks or more is listed, as one within a chunk adds nothing to finding that chunk. A search's matches can then
 vote for the sections they are in: every match in a minor section is in its major one too, so the major section
 gathers the votes of all of them.
+
+The sections of each document are also listed whole (contents()), with their headings, for a model to choose the
+ones that state the qualification criteria from (utils/llm.py choose_sections()).
 """
 import re
 from collections import Counter
@@ -69,6 +72,24 @@ def chunk_sections(text, spans):
             place['section_titles'] = [title for *_, title in ranges]
         places.append(place)
     return places
+
+
+def contents(text, spans):
+    """
+    The table of contents of text, for a model to choose sections from by their headings: [[tier, first chunk, last
+    chunk, characters, title]] of each section with a title, in document order (a major section before the minor
+    ones in it), where first and last are the chunks of spans (as in chunk_sections()) the section overlaps.
+    """
+    majors, minors = _sections(text)
+    found = sorted((start, tier, end, title) for tier, sections in ((1, majors), (2, minors))
+                   for start, end, title in sections if title)
+    entries = []
+    for start, tier, end, title in found:
+        chunks = [number for number, (piece_start, piece_end) in enumerate(spans)
+                  if piece_start < end and piece_end > start]
+        if chunks:
+            entries.append([tier, chunks[0], chunks[-1], end - start, title[:TITLE_CHARS]])
+    return entries
 
 
 def headings(text):

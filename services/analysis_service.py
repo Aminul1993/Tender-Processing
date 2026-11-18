@@ -23,7 +23,8 @@ from services.cache_service import file_sha256
 from services.ocr_service import OCR_PAGE_COST, OCR_SETTINGS, ScanTooLong, add_ocr, ocr_parts
 from services.pinecone_service import Document, Retrieval, document_type
 from services.tender_service import to_row
-from utils.llm import ASSESSMENT_MODEL, OCR_MODEL, assess_eligibility, make_model
+from utils.llm import (ASSESSMENT_MODEL, OCR_MODEL, SECTION_MAX_OUTPUT_TOKENS, SECTION_MODEL, assess_eligibility,
+                       choose_sections, make_model)
 from utils.tendertiger import TenderTigerBlocked, prequalification_criteria
 
 log = logging.getLogger(__name__)
@@ -84,9 +85,6 @@ ASSESSMENT_QUERIES = {
         'Exemptions and relaxations for MSE, MSME, Udyam or startup bidders; blacklisting and debarment conditions',
     ],
 }
-# The section of the documents that states the qualification criteria, taken whole before the searches above fill
-# the rest of the budget (hierarchical retrieval, see PineconeService.retrieve()): its matches vote for the section
-# they are in
 # A check too large for one request on the Groq plan (its 413, "request too large ... tokens per minute") is tried
 # again with its excerpts split in two batches, a batch still too large split in two again, up to MAX_BATCHES. A
 # batch that reaches the plan's per-minute limit (its 429, "rate limit reached ... try again in 12.3s") waits as long
@@ -94,6 +92,9 @@ ASSESSMENT_QUERIES = {
 MAX_BATCHES = 3
 RATE_LIMIT_WAITS = 4
 RATE_LIMIT_MAX_SECONDS = 90
+# The section of the documents that states the qualification criteria, taken whole before the searches above fill
+# the rest of the budget (hierarchical retrieval, see PineconeService.retrieve()), under this label. SECTION_MODEL
+# chooses it by the documents' headings; when it cannot, these searches' matches vote for the section they are in
 QUALIFICATION_SECTION = {
     'qualification section': [
         'Eligibility criteria and qualification requirements the bidder must meet to qualify',
@@ -146,8 +147,8 @@ def over_budget(estimate, budget):
 class TokenUsage:
     """
     Counts the LLM tokens spent on one tender, by step: 'criteria' (reading the documents: the pages of scanned PDFs
-    sent to the vision model)
-    and 'assessment' (checking the company against the criteria retrieved, for the final result). Given to
+    sent to the vision model) and 'assessment' (choosing the sections to send whole by their headings, and checking
+    the company against the criteria retrieved, for the final result). Given to
     process_tender_files() or recheck_saved_criteria(), it still holds the tokens spent before a failure. Other steps
     can be named instead, such as the agents of a deep analysis. Embedding tokens are Pinecone's, not counted here.
     """
@@ -404,14 +405,22 @@ def recheck_saved_criteria(tcno, *, index, company_store, on_progress=None, usag
 
 def _assess_from_index(index, tcno, usage, company, nothing_found, manifest=None, tender=None, on_progress=None):
     """
-    Retrieves the QUALIFICATION_SECTION and the chunks of ASSESSMENT_QUERIES from the tender's namespace and makes
-    the final check on them: in one request, or in batches when that is too large for the Groq plan (see
+    Retrieves the qualification section and the chunks of ASSESSMENT_QUERIES from the tender's namespace and makes
+    the final check on them. The sections to send whole are chosen by SECTION_MODEL from the documents' headings
+    (choose_sections()), or, failing that, by the QUALIFICATION_SECTION searches. The check is made in one request,
+    or in batches when that is too large for the Groq plan (see
     _assess_in_batches()). manifest is the one the namespace was just built with, if it was. tender, the raw
     TenderTiger list row, if given, goes to the model as the tender's details (tender value, organisation, closing
     date, ...), and its copy in the namespace is left out of the excerpts. on_progress(message), if given, is told
     of the batches and of waits for the plan's per-minute limit.
     """
-    retrieval = index.retrieve(tcno, ASSESSMENT_QUERIES, manifest=manifest, section_queries=QUALIFICATION_SECTION)
+    def choose(sections):
+        # Called only when there are headings to choose from; its tokens count under 'assessment', the step it serves
+        return choose_sections(usage.track(make_model(SECTION_MODEL, SECTION_MAX_OUTPUT_TOKENS, 'low'), 'assessment'),
+                               sections)
+
+    retrieval = index.retrieve(tcno, ASSESSMENT_QUERIES, manifest=manifest, section_queries=QUALIFICATION_SECTION,
+                               choose_sections=choose)
     details = tender_data_text(tender) if tender else None
     llm = usage.track(make_model(ASSESSMENT_MODEL), 'assessment')
     try:

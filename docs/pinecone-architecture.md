@@ -57,7 +57,7 @@ all use that name.
 | Record | ID | Metadata |
 |---|---|---|
 | chunk | `<sha1(source)[:16]>-<position>` | `record_type: chunk`, `tcno`, `source_file`, `document_type`, `chunk_id`, `chunk_index`, `overlap`, `created_at`, `text`; `section`, `sections` and `section_titles` (the document sections it is in); sparse values on a `dotproduct` index |
-| manifest | `__manifest__` | `record_type: manifest`, `status: building` or `complete`, `kept` (building, its chunks kept for a regenerate), `schema_version` (3), `embed_model`, `dimension`, `chunk_size`, `chunk_overlap`, `hybrid` (the chunks hold sparse values), `chunks`, `parts`, `payload` (sources with their chunk counts and SHA-256s, and unreadable sources, as JSON), `created_at` |
+| manifest | `__manifest__` | `record_type: manifest`, `status: building` or `complete`, `kept` (building, its chunks kept for a regenerate), `schema_version` (3), `embed_model`, `dimension`, `chunk_size`, `chunk_overlap`, `hybrid` (the chunks hold sparse values), `chunks`, `parts`, `payload` (sources with their chunk counts, SHA-256s and section headings, and unreadable sources, as JSON), `created_at` |
 | manifest part | `__manifest__-000`, ... | `record_type: manifest_part`, `payload`. Used only when the source list exceeds 30,000 characters, because Pinecone allows 40 KB of metadata per record |
 
 Chunk IDs are derived from the source name and position, so the manifest alone gives every ID. `knowledge()`
@@ -106,7 +106,8 @@ sequenceDiagram
 
 Retrieval runs 2 section searches and 13 searches over six kinds of requirement: eligibility, financial,
 technical, experience, JV and compliance. The TenderTiger pre-qualification text and tender data are always sent in
-full. The qualification section comes next, whole (hierarchical retrieval, below). The searches then take turns,
+full. The qualification sections come next, whole, chosen by a model from the documents' headings or else by the
+section searches (hierarchical retrieval, below). The searches then take turns,
 each adding its next best chunk, until `RETRIEVAL_MAX_CHARS` is reached (60,000 characters, about 20k tokens). The
 chunks are sent in document order. Neighbouring chunks are joined without their overlap, and `[…]` marks a gap.
 
@@ -121,12 +122,34 @@ replayed through the round robin): 24% less text at the defaults (8 per query, 6
 `document_sections.py`: a major section (a part, section, annexure, or a short line in capitals) runs to the next
 major heading and holds the minor ones (numbered or lettered clause headings in capitals or title case) after it;
 running headers and footers (lines on three pages or more), table rows, contents lines and OCR's `## Page n` are
-never headings. The two `QUALIFICATION_SECTION` searches vote, with their matches' scores, for every section a match
-is in that fits `RETRIEVAL_SECTION_SHARE` (half) of the budget, so a major section gathers the votes of its minor
-ones. The winner is fetched by its chunk IDs and sent whole, and a second, non-overlapping section too if its votes
-are within the score floor of the first's. On the LIC Suri NIT (112,772 characters), the major section holding
-"A. WORKS EXPERIENCE" to "D. DISQUALIFICATION" is 7,587 characters. Namespaces built before (schema 2) have no
-sections, so retrieval skips this step for them.
+never headings.
+
+The sections to take whole are chosen in one of two ways, within `RETRIEVAL_SECTION_SHARE` (half) of the budget:
+
+1. **By their headings.** The manifest lists every source's sections (`contents`: tier, first and last chunk,
+   characters, title; not for the TenderTiger texts). The check sends `SECTION_MODEL` (`openai/gpt-oss-20b`,
+   reasoning `low`) the headings of every source but the BOQ, one line each, minor ones indented under their major
+   one, with an ID (`S12`) on each section that fits the share and none on one too long to take whole. The model
+   answers with up to 6 IDs, best first, or `none` when no heading names qualification criteria
+   (`choose_sections()` in `utils/llm.py`). Each section it chose is fetched by its chunk IDs and taken while it
+   fits. `whole_sections` marks them `picked_by: model`.
+2. **By search votes**, when the model chose none, failed, or the namespace was built before headings were listed:
+   the two `QUALIFICATION_SECTION` searches vote, with their matches' scores, for every section a match is in that
+   fits, so a major section gathers the votes of its minor ones. The winner is fetched and sent whole, and a second,
+   non-overlapping section too if its votes are within the score floor of the first's (`picked_by: search`).
+
+The headings listing is small: on the 38 tenders in `downloads/` on 18 Nov 2026 (text layers only), a median of
+about 220 tokens, 1,400 at the 90th percentile and 3,200 at most (a tender with 214 sections). A listing over
+`SECTION_LIST_MAX_CHARS` (16,000 characters) is sent with its major sections only, and not at all if still over.
+Groq limits tokens per minute per model, so the call to `gpt-oss-20b` leaves `ASSESSMENT_MODEL`'s budget to the
+check. Its tokens are counted under `assessment`. Live on 8 of those tenders, the model chose the qualification
+clauses on 5 (for example `(A) QUALIFYING CRITERIA`, `(i) Financial Eligibility`, `(ii) Technical Eligibility`,
+`(B) JOINT VENTURE BID`) and answered `none` on 3 whose headings name no criteria, leaving those to the votes.
+
+A deep analysis takes again the sections the check took on the model's word (matched by source and chunks), without
+asking the model, so the agents read what the check read. On the LIC Suri NIT (112,772 characters), the major
+section holding "A. WORKS EXPERIENCE" to "D. DISQUALIFICATION" is 7,587 characters. Namespaces built before (schema
+2) have no sections, so retrieval skips this step for them.
 
 **Hybrid retrieval.** On a `dotproduct` index, every chunk also holds sparse values (`sparse_encoder.py`): the
 hashed terms of its section title and text, weighted 1 + ln(count) and twice that for a figure, at unit length.

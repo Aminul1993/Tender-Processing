@@ -284,6 +284,7 @@ schtasks /Create /TN "Tender cleanup" /SC DAILY /ST 05:30 /TR "cmd /c cd /d C:\p
 | `JOB_WORKERS` | `1` | Tenders the web app processes at the same time itself; `0` leaves them to `worker.py` processes |
 | `OCR_CONCURRENCY` | `8` | Scanned pages and images sent to `OCR_MODEL` at the same time in a process, while PaddleOCR reads on, one page at a time |
 | `ASSESSMENT_MODEL` | `openai/gpt-oss-120b` | Groq model that checks the company against the criteria, also on a re-check |
+| `SECTION_MODEL` | `openai/gpt-oss-20b` | Groq model that chooses, from the documents' headings, the qualification sections the check reads whole |
 | `OCR_MODEL` | `qwen/qwen3.8-27b` | Groq model that reads the pages of scanned PDFs that PaddleOCR is unsure of or that hold a table; it must accept images (vision) |
 | `PADDLEOCR_MODEL` | `PP-OCRv6_small` | PaddleOCR models that read scanned pages locally (`<name>_det` and `<name>_rec`). `PP-OCRv6_tiny` is about three times faster on a CPU but makes more mistakes |
 | `OCR_MIN_CONFIDENCE` | `0.9` | A scanned page PaddleOCR is less sure of (its mean score per character, 0 to 1) is sent to `OCR_MODEL`; raise it to send more pages |
@@ -540,15 +541,18 @@ own tenders.
    **Retrieval.** Before the LLM is called, the chunks on each kind of requirement are retrieved from the
    namespace, within `RETRIEVAL_MAX_CHARS` of text, in three steps:
    1. The TenderTiger sources, always in full.
-   2. *Hierarchical:* the qualification section, whole. Two searches for the qualification criteria
-      (`QUALIFICATION_SECTION` in [analysis_service.py](services/analysis_service.py)) vote, with their matches'
-      scores, for the sections those matches are in, so a section holding several matches (its sub-sections' votes
-      add up in it) wins. The best section that fits `RETRIEVAL_SECTION_SHARE` of the budget is fetched by its chunk
-      IDs and sent whole, and a second one that does not overlap it, if its votes are within the score floor of the
-      first's. A section is told from the document's headings: a part, section, annexure or line in capitals
+   2. *Hierarchical:* the qualification sections, whole, within `RETRIEVAL_SECTION_SHARE` of the budget. A section
+      is told from the document's headings: a part, section, annexure or line in capitals
       (`NOTICE INVITING E-TENDER (NIT)`) holds the numbered or lettered clause headings after it
-      (`B. AVERAGE ANNUAL TURNOVER:`), while running headers, table rows and contents lines are ignored. The result's
-      `index.whole_sections` names the sections taken.
+      (`B. AVERAGE ANNUAL TURNOVER:`), while running headers, table rows and contents lines are ignored.
+      `SECTION_MODEL` reads the documents' headings (a few hundred tokens for most tenders) and chooses up to 6
+      sections that state the qualification criteria, which are fetched by their chunk IDs and sent whole. When it
+      chooses none, or cannot be reached, two searches for the qualification criteria (`QUALIFICATION_SECTION` in
+      [analysis_service.py](services/analysis_service.py)) vote, with their matches' scores, for the sections those
+      matches are in, so a section holding several matches (its sub-sections' votes add up in it) wins; the best one
+      that fits is sent whole, and a second one that does not overlap it, if its votes are within the score floor
+      of the first's. The result's `index.whole_sections` names the sections taken, and `picked_by` says how
+      (`model` or `search`). A deep analysis reads the sections the check's model chose, without asking it again.
    3. The searches for each kind of requirement: eligibility, financial, technical, experience, JV and compliance,
       two or three searches each (`ASSESSMENT_QUERIES`), take turns, best match first, until the budget is spent.
 
@@ -1000,7 +1004,7 @@ in the saved results, an earlier one), and `average_recheck_seconds` that of the
             "upserted": 41, "kept_sources": 3, "deleted": 2, "embedding_tokens": 15230, "retrieved_chunks": 24,
             "retrieved_characters": 35880,
             "whole_sections": [{"source_file": "NIT.pdf", "title": "SECTION 3: QUALIFICATION CRITERIA",
-                                "chunks": "14-19", "label": "qualification section"}]},
+                                "chunks": "14-19", "label": "qualification section", "picked_by": "model"}]},
   "tokens": {
     "criteria": {"input": 312480, "output": 18342, "total": 330822},
     "assessment": {"input": 9120, "output": 2654, "total": 11774},

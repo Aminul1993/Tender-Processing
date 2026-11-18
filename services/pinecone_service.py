@@ -32,9 +32,11 @@ Retrieval (retrieve()) is hybrid, hierarchical and adaptive:
   hybrid        on an index with the dotproduct metric, each chunk also holds a sparse vector of its words and
                 figures (sparse_encoder.py), and a search scores dense and sparse together, so clause numbers and
                 rupee figures match exactly; dense alone on a cosine index
-  hierarchical  each chunk knows the chunks of the document sections it is in (document_sections.py): the searches
-                for the qualification section vote for the section their best matches are in, and that section is
-                taken whole, before the other searches fill what budget is left
+  hierarchical  each chunk knows the chunks of the document sections it is in (document_sections.py), and the
+                manifest lists every source's sections by their headings: a model reads the headings and chooses the
+                sections that state the qualification criteria (or, failing that, the searches for the qualification
+                section vote for the section their best matches are in), and those are taken whole, before the
+                other searches fill what budget is left
   adaptive      a search keeps its matches only down to a score floor, a share of its best match's score, instead
                 of always its top_k
 
@@ -60,7 +62,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from services import sparse_encoder
-from services.document_sections import VERSION as SECTIONS_VERSION, chunk_sections
+from services.document_sections import VERSION as SECTIONS_VERSION, chunk_sections, contents
 
 log = logging.getLogger(__name__)
 
@@ -78,8 +80,10 @@ DELETE_BATCH = 1000
 # A search keeps at least this many matches, whatever their score, so a score floor never leaves a kind of
 # requirement with nothing
 MIN_MATCHES = 2
-# The most sections one retrieval takes whole
+# The most sections one retrieval takes whole when the searches choose them (see _pick_sections())
 MAX_SECTIONS = 2
+# The label of the sections taken whole when retrieve() is given no section_queries to name them
+SECTION_LABEL = 'qualification section'
 # Pinecone's limits on index and namespace names
 INDEX_NAME_LIMIT = 45
 NAMESPACE_NAME_LIMIT = 512
@@ -136,7 +140,8 @@ class Retrieval:
     'section', 'sections', 'section_titles'}, where queries are the labels of the queries that found it and score
     the best of their scores (1.0 for a pinned chunk), section the title of the document section it is in, and
     sections and section_titles the chunk ranges and titles of the sections it is in (see document_sections.py).
-    whole_sections are the sections taken whole, each {'source_file', 'title', 'chunks' ('first-last'), 'label'}.
+    whole_sections are the sections taken whole, each {'source_file', 'title', 'chunks' ('first-last'), 'label',
+    'picked_by'}, picked_by 'model' (chosen by its heading) or 'search' (by the votes of the section searches).
     """
     namespace: str
     manifest: dict
@@ -682,11 +687,13 @@ class PineconeService:
     def chunk_documents(self, tcno, documents):
         """
         The records to store for the tender's documents, and the manifest's list of sources ({'name', 'type',
-        'chunks', 'sha256'}, sha256 of the source's text and of everything else its records depend on, so a source
-        with the same name and SHA-256 has the same records). Each record is {'id', 'text', 'metadata'}, the
-        metadata {'record_type', 'tcno', 'source_file', 'document_type', 'chunk_id', 'chunk_index', 'overlap',
-        'created_at'}, with 'section', 'sections' and 'section_titles' when the chunk is in a section of the
-        document (see document_sections.chunk_sections()). Sources with the same name are kept once (the first).
+        'chunks', 'sha256', 'contents'}, sha256 of the source's text and of everything else its records depend on, so
+        a source with the same name and SHA-256 has the same records, and contents its sections' headings, see
+        document_sections.contents(), except for the TenderTiger texts, sent whole anyway). Each record is {'id',
+        'text', 'metadata'}, the metadata {'record_type', 'tcno', 'source_file', 'document_type', 'chunk_id',
+        'chunk_index', 'overlap', 'created_at'}, with 'section', 'sections' and 'section_titles' when the chunk is in
+        a section of the document (see document_sections.chunk_sections()). Sources with the same name are kept once
+        (the first).
         """
         created_at = _now()
         records, sources, seen = [], [], set()
@@ -697,9 +704,14 @@ class PineconeService:
             seen.add(document.name)
             text = (document.text or '').strip()
             pieces = _chunks(text, self.chunk_size, self.chunk_overlap)
-            places = chunk_sections(text, [span for _, _, span in pieces])
-            sources.append({'name': document.name, 'type': document.document_type, 'chunks': len(pieces),
-                            'sha256': self._source_digest(document)})
+            spans = [span for _, _, span in pieces]
+            places = chunk_sections(text, spans)
+            source = {'name': document.name, 'type': document.document_type, 'chunks': len(pieces),
+                      'sha256': self._source_digest(document)}
+            if document.document_type not in PINNED_TYPES:
+                # Its headings, for a model to choose the sections to take whole from (see retrieve())
+                source['contents'] = contents(text, spans)
+            sources.append(source)
             for position, ((chunk, overlap, _), place) in enumerate(zip(pieces, places)):
                 identifier = chunk_id(document.name, position)
                 records.append({'id': identifier, 'text': chunk, 'metadata': {
@@ -903,15 +915,21 @@ class PineconeService:
         response = self._call(f'query {namespace}', lambda: self._index().query(**request))
         return [_chunk(match.metadata or {}, match.id, match.score) for match in response.matches or []]
 
-    def retrieve(self, tcno, queries, top_k=None, max_chars=None, manifest=None, section_queries=None):
+    def retrieve(self, tcno, queries, top_k=None, max_chars=None, manifest=None, section_queries=None,
+                 choose_sections=None):
         """
         The chunks of the tender's namespace that answer queries, {label: [query text, ...]}, within max_chars of
         text, in three steps:
           1. every chunk of the short TenderTiger sources (PINNED_TYPES), budget or not
-          2. the sections section_queries ({label: [query text, ...]}, if given) are about, whole: their matches vote
-             (with their scores) for each section they are in that fits section_share of the budget, and the best
-             MAX_SECTIONS sections that do not overlap, within the score floor of the best one, are taken (see
-             _pick_sections())
+          2. the sections that state the qualification criteria, whole, within section_share of the budget, under
+             the first label of section_queries:
+             - chosen by their headings, when choose_sections is given: it is called with the sections of the
+               documents' contents (see _chosen_sections()) and returns the IDs of those to take, best first;
+               each is taken while it fits
+             - else, or when it took none, the sections section_queries ({label: [query text, ...]}, if given) are
+               about: their matches vote (with their scores) for each section they are in that fits, and the best
+               MAX_SECTIONS sections that do not overlap, within the score floor of the best one, are taken (see
+               _pick_sections())
           3. each query's matches, in turn, best first, one query after another, so every query gets its share
              before the budget runs out
         A search keeps its top_k matches only down to its score floor (score_floor times its best score, and not
@@ -970,19 +988,30 @@ class PineconeService:
         for chunk in pinned:
             chosen[chunk['id']] = chunk
             used += len(chunk['text'])
-        if sectioned:
+
+        def take_section(label, source, first, last, title, score, picked_by):
+            """Takes the section whole when it fits within limit and adds something not taken yet."""
+            section = self._fetch(tcno, [chunk_id(source, position) for position in range(first, last + 1)])
+            new = [chunk for chunk in section if chunk['id'] not in chosen]
+            if not new or used + sum(len(chunk['text']) for chunk in new) > limit:
+                return
+            for chunk in section:
+                take({**chunk, 'score': score}, label)
+            retrieval.whole_sections.append({'source_file': source, 'title': title, 'chunks': f'{first}-{last}',
+                                             'label': label, 'picked_by': picked_by})
+
+        if self.section_share and (sectioned or choose_sections):
             limit = min(budget, used + int(budget * self.section_share))
             chunk_size = manifest.get('chunk_size') or self.chunk_size
-            for label, source, first, last, title, score in self._pick_sections(sectioned, section_matches,
-                                                                                 limit - used, chunk_size):
-                ids = [chunk_id(source, position) for position in range(first, last + 1)]
-                section = self._fetch(tcno, ids)
-                if used + sum(len(chunk['text']) for chunk in section if chunk['id'] not in chosen) > limit:
-                    continue
-                for chunk in section:
-                    take({**chunk, 'score': score}, label)
-                retrieval.whole_sections.append({'source_file': source, 'title': title, 'chunks': f'{first}-{last}',
-                                                 'label': label})
+            label = next(iter(section_queries or {}), SECTION_LABEL)
+            if choose_sections:
+                for source, first, last, title in self._chosen_sections(choose_sections, manifest, limit - used,
+                                                                        chunk_size):
+                    take_section(label, source, first, last, title, 0.0, 'model')
+            if not retrieval.whole_sections and sectioned:
+                for label, source, first, last, title, score in self._pick_sections(sectioned, section_matches,
+                                                                                     limit - used, chunk_size):
+                    take_section(label, source, first, last, title, score, 'search')
         for label, match in _round_robin(labelled, matches):
             take(match, label)
 
@@ -993,7 +1022,8 @@ class PineconeService:
                  retrieval.characters, manifest['namespace'], len(labelled) + len(sectioned),
                  ', hybrid' if hybrid else '',
                  ''.join(f"; section {section['title'] or '(untitled)'!r} of {section['source_file']} whole "
-                         f"(chunks {section['chunks']})" for section in retrieval.whole_sections))
+                         f"(chunks {section['chunks']}, chosen by {section['picked_by']})"
+                         for section in retrieval.whole_sections))
         return retrieval
 
     def _search(self, tcno, texts, top_k, hybrid):
@@ -1018,6 +1048,39 @@ class PineconeService:
             return matches
         floor = max(self.min_score * (self.hybrid_alpha if hybrid else 1.0), self.score_floor * matches[0]['score'])
         return [match for rank, match in enumerate(matches) if rank < MIN_MATCHES or match['score'] >= floor]
+
+    def _chosen_sections(self, choose, manifest, room, chunk_size):
+        """
+        The sections a model chose by their headings: [(source, first chunk, last chunk, title)], in the order it gave
+        them. choose(sections) is given the sections of every source's contents (document_sections.contents()) in
+        document order, each {'id', 'source_file', 'tier', 'first', 'last', 'characters', 'title'}, where id is
+        'S<n>' for a section that can fit room characters (at chunk_size a chunk) and None for one too long to take
+        whole, there to show where the others are; it returns the IDs of the sections to take. The bill of quantities
+        and the TenderTiger texts are not listed. Empty when no section has a heading, or choose() chose none or
+        failed (logged): the searches choose instead.
+        """
+        sections = []
+        for source in manifest['sources']:
+            if source['type'] in PINNED_TYPES or source['type'] == 'boq':
+                continue
+            for tier, first, last, characters, title in source.get('contents') or []:
+                fits = (last - first + 1) * chunk_size <= room
+                sections.append({'id': f'S{len(sections) + 1}' if fits else None, 'source_file': source['name'],
+                                 'tier': tier, 'first': first, 'last': last, 'characters': characters, 'title': title})
+        listed = {section['id']: section for section in sections if section['id']}
+        if not listed:
+            return []
+        try:
+            ids = choose(sections) or []
+        except Exception:
+            log.warning('Could not choose the sections to take whole by their headings in %s; the searches choose '
+                        'them instead', manifest['namespace'], exc_info=True)
+            return []
+        picked = [listed[identifier] for identifier in dict.fromkeys(ids) if identifier in listed]
+        log.info('Sections chosen by their headings in %s: %s', manifest['namespace'],
+                 '; '.join(f"{section['id']} {section['title']!r} of {section['source_file']}" for section in picked)
+                 or 'none')
+        return [(section['source_file'], section['first'], section['last'], section['title']) for section in picked]
 
     def _pick_sections(self, sectioned, section_matches, room, chunk_size):
         """

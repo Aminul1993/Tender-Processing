@@ -264,10 +264,31 @@ def date_checks(facts, today):
     return flags
 
 
+def _sections_checked(result):
+    """
+    A choose_sections for PineconeService.retrieve() that chooses again the sections the check of result took whole
+    on the model's word (analysis_service: SECTION_MODEL), so the agents read the sections the check read, without
+    asking the model again; None when the check took none that way (the searches then choose them).
+    """
+    sections = (result.get('index') or {}).get('whole_sections') or []
+    taken = [(section.get('source_file'), section.get('chunks')) for section in sections
+             if section.get('picked_by') == 'model']
+    if not taken:
+        return None
+
+    def choose(sections):
+        ids = {(section['source_file'], f"{section['first']}-{section['last']}"): section['id']
+               for section in sections if section['id']}
+        return [ids[key] for key in taken if key in ids]
+
+    return choose
+
+
 def load_knowledge(index, tcno, result):
     """
     What the agents read of the tender's documents, retrieved from its Pinecone namespace (index, a PineconeService):
-    the qualification section whole (QUALIFICATION_SECTION), the excerpts for each kind of requirement in
+    the qualification section whole (the sections the check took whole, see _sections_checked(), else the one
+    QUALIFICATION_SECTION points to), the excerpts for each kind of requirement in
     KNOWLEDGE_QUERIES, and for each criterion of the result the excerpts nearest its name and requirement (Supporting
     Evidence; a hybrid search, where the index has sparse values, so its figures and clause numbers match exactly).
     Each excerpt is given once, numbered [E1], [E2], ... in document order, followed by which excerpts answer each
@@ -289,7 +310,8 @@ def load_knowledge(index, tcno, result):
     try:
         index.require()
         # Within the index's RETRIEVAL_MAX_CHARS, like the eligibility check, so one setting sizes every prompt
-        retrieval = index.retrieve(tcno, queries, section_queries=QUALIFICATION_SECTION)
+        retrieval = index.retrieve(tcno, queries, section_queries=QUALIFICATION_SECTION,
+                                   choose_sections=_sections_checked(result))
     except NamespaceIncomplete:
         return {'text': '', 'source': None, 'excerpts': 0,
                 'warning': f'The Pinecone namespace {name} is missing or incomplete'}
